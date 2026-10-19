@@ -28,30 +28,39 @@ TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "MASUKKAN_CHAT_ID_TELEGRAM"
 API_KEY = os.getenv("API_KEY", "MASUKKAN_API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY", "MASUKKAN_SECRET_KEY")
 
-# Mode Entry: "retrace" (Retrace 50% - SL Tipis) atau "market" (Market Close - Agresif)
-ENTRY_MODE = "retrace"
+ENTRY_MODE = "retrace"  # "retrace" (Retrace 50% - SL Tipis) atau "market" (Market Close)
 
-# Parameter Crypto (BingX)
+# Parameter Trading Crypto (BingX)
 CRYPTO_MARGIN_USDT = 2.0
 CRYPTO_LEVERAGE = 50
 TOP_CRYPTO_COUNT = 50
 
-# Parameter Forex (MT5)
+# Parameter Trading Forex (MT5)
 FOREX_PAIRS = ["XAUUSD", "GBPUSD", "EURUSD"]
 FOREX_LOT = 0.01
 MAX_SPREAD_PIPS = 0.2
 FOREX_LEVERAGE_INFO = 2000
 
+# Manajemen Risiko Saldo & Floating
+MAX_TOTAL_FLOATING_LOSS = -1.5  # Batas maks total floating minus (USDT)
+
 # Parameter Logika SMC Alchemist
 TIMEFRAME_HTF = "1h"
 TIMEFRAME_LTF = "15m"
 SL_BUFFER_TICKS = 15
+MAX_PENDING_BARS = 30  # Batas maksimal 30 candle M15 (7.5 jam)
 
 # Sesi Market (Kill Zone) - Jam WIB (UTC+7)
 LON_START, LON_END = 14, 17
 NY_START, NY_END = 19, 22
 
+# State Bot
+IS_BOT_PAUSED = False
 last_trade_times = {}
+
+# Tracking Order Pending Aktif (Sama dengan state Pine Script)
+# Format: {symbol: {'order_id': id, 'action': 'sell'/'buy', 'entry': p, 'sl': p, 'tp': p, 'created_at_time': t, 'bars_count': 0, 'is_forex': bool}}
+pending_orders_tracker = {}
 
 # =================================================================
 # DATABASE & TELEGRAM
@@ -89,10 +98,10 @@ def send_telegram(msg):
     try:
         requests.post(url, data=payload, timeout=5)
     except Exception as e:
-        print(f"Gagal kirim notifikasi Telegram: {e}")
+        print(f"Gagal kirim Telegram: {e}")
 
 # =================================================================
-# HELPER & DATA FETCHING
+# HELPER DATA & MANAJEMEN RISIKO OTOMATIS
 # =================================================================
 def get_exchange():
     return ccxt.bingx({
@@ -101,6 +110,27 @@ def get_exchange():
         'enableRateLimit': True,
         'options': {'defaultType': 'swap'}
     })
+
+def check_dynamic_position_limit(exchange):
+    try:
+        balance = exchange.fetch_balance()
+        free_usdt = float(balance['USDT']['free'])
+        positions = exchange.fetch_positions()
+        
+        open_positions = [p for p in positions if float(p.get('contracts', 0)) > 0]
+        open_pos_count = len(open_positions)
+        
+        total_unrealized_pnl = sum([float(p.get('unrealizedPnl', 0)) for p in open_positions])
+        if total_unrealized_pnl < MAX_TOTAL_FLOATING_LOSS:
+            return False, open_pos_count, 0, free_usdt
+
+        max_allowed_positions = max(1, int(free_usdt // 5.0))
+        if open_pos_count >= max_allowed_positions:
+            return False, open_pos_count, max_allowed_positions, free_usdt
+            
+        return True, open_pos_count, max_allowed_positions, free_usdt
+    except Exception:
+        return True, 0, 2, 0.0
 
 def calculate_ema(series, period=50):
     return series.ewm(span=period, adjust=False).mean()
@@ -130,7 +160,7 @@ def fetch_ohlcv_forex(symbol, timeframe_str, limit=100):
     return df
 
 # =================================================================
-# EKSEKUSI ORDER SAMA PRESISI DENGAN SL & TP
+# EKSEKUSI ORDER (PENDING & MARKET)
 # =================================================================
 def execute_crypto_order(exchange, symbol, action, entry_price, sl_price, tp_price):
     try:
@@ -140,7 +170,6 @@ def execute_crypto_order(exchange, symbol, action, entry_price, sl_price, tp_pri
     
     position_size_usdt = CRYPTO_MARGIN_USDT * CRYPTO_LEVERAGE
     amount = position_size_usdt / entry_price
-    
     order_type = 'limit' if ENTRY_MODE == "retrace" else 'market'
     params = {
         'stopLoss': {'triggerPrice': float(sl_price)},
@@ -161,23 +190,18 @@ def execute_forex_order(symbol, action, entry_price, sl_price, tp_price):
     tick = mt5.symbol_info_tick(symbol)
     if not symbol_info or not tick: return None
 
-    # Spread Filter Check
     point_size = symbol_info.point
     current_spread_pips = (tick.ask - tick.bid) / (point_size * 10)
-    if current_spread_pips > MAX_SPREAD_PIPS:
-        print(f"Skipped {symbol}: Spread {current_spread_pips:.2f} pips > {MAX_SPREAD_PIPS} pips")
-        return None
+    if current_spread_pips > MAX_SPREAD_PIPS: return None
 
     deviation_points = int(MAX_SPREAD_PIPS * 10)
-    
-    if ENTRY_MODE == "retrace":
-        order_type = mt5.ORDER_TYPE_BUY_LIMIT if action == 'buy' else mt5.ORDER_TYPE_SELL_LIMIT
-        trade_action = mt5.TRADE_ACTION_PENDING
-        price = entry_price
-    else:
-        order_type = mt5.ORDER_TYPE_BUY if action == 'buy' else mt5.ORDER_TYPE_SELL
-        trade_action = mt5.TRADE_ACTION_DEAL
-        price = tick.ask if action == 'buy' else tick.bid
+    order_type = mt5.ORDER_TYPE_BUY_LIMIT if (ENTRY_MODE == "retrace" and action == 'buy') else (
+        mt5.ORDER_TYPE_SELL_LIMIT if (ENTRY_MODE == "retrace" and action == 'sell') else (
+            mt5.ORDER_TYPE_BUY if action == 'buy' else mt5.ORDER_TYPE_SELL
+        )
+    )
+    trade_action = mt5.TRADE_ACTION_PENDING if ENTRY_MODE == "retrace" else mt5.TRADE_ACTION_DEAL
+    price = entry_price if ENTRY_MODE == "retrace" else (tick.ask if action == 'buy' else tick.bid)
 
     request_data = {
         "action": trade_action,
@@ -201,11 +225,122 @@ def execute_forex_order(symbol, action, entry_price, sl_price, tp_price):
     return None
 
 # =================================================================
-# CORE LOGIC: ALCHEMIST PRO HYBRID V2 ENGINE
+# MESIN PENGELOLA ORDER PENDING (AUTO-CANCEL PRESISI PINE SCRIPT)
+# =================================================================
+def manage_pending_orders(exchange):
+    """
+    Memeriksa semua Limit Order pending dan mengeksekusi pembatalan otomatis
+    jika terdeteksi: MISSED (TP Hit First), CANCELLED (SL Hit First), atau INVALID (> 30 Bars)
+    """
+    global pending_orders_tracker
+    
+    symbols_to_remove = []
+    
+    for symbol, order_info in list(pending_orders_tracker.items()):
+        try:
+            is_forex = order_info['is_forex']
+            order_id = order_info['order_id']
+            action = order_info['action']
+            t_ep = order_info['entry']
+            t_sl = order_info['sl']
+            t_tp = order_info['tp']
+            
+            # Ambil data candle M15 terbaru
+            if is_forex:
+                df_ltf = fetch_ohlcv_forex(symbol, TIMEFRAME_LTF, limit=5)
+            else:
+                df_ltf = fetch_ohlcv_crypto(exchange, symbol, TIMEFRAME_LTF, limit=5)
+                
+            if df_ltf is None or len(df_ltf) == 0:
+                continue
+                
+            latest_bar = df_ltf.iloc[-1]
+            c_high, c_low, c_time = latest_bar['high'], latest_bar['low'], latest_bar['timestamp']
+            
+            # Tambahkan perhitungan bar jika candle M15 baru terbentuk
+            if order_info.get('last_bar_time') != c_time:
+                order_info['bars_count'] += 1
+                order_info['last_bar_time'] = c_time
+                
+            b_cnt = order_info['bars_count']
+            
+            # 1. KASUS SELL PENDING
+            if action == 'sell':
+                if c_high >= t_ep:
+                    # Order Terjemput -> Berubah jadi LIVE Position (Dikelola oleh exchange)
+                    symbols_to_remove.append(symbol)
+                    send_telegram(f"🟡 *[ORDER TERISI / LIVE]*\n• *Pair:* `{symbol}` (SELL)\n• *Entry:* `{t_ep:.5f}`")
+                elif c_low <= t_tp:
+                    # MISSED: Harga capai TP 1R duluan tanpa jemput entry
+                    cancel_and_cleanup(exchange, symbol, order_id, is_forex, "MISSED ⚪ (TP 1R Hit First)")
+                    symbols_to_remove.append(symbol)
+                elif c_high >= t_sl:
+                    # CANCELLED: Harga nembus SL duluan sebelum jemput entry
+                    cancel_and_cleanup(exchange, symbol, order_id, is_forex, "CANCELLED ⚪ (SL Hit First)")
+                    symbols_to_remove.append(symbol)
+                elif b_cnt > MAX_PENDING_BARS:
+                    # INVALID: Melewati batas 30 candle M15
+                    cancel_and_cleanup(exchange, symbol, order_id, is_forex, f"INVALID ⚪ (Exceeded {MAX_PENDING_BARS} Bars)")
+                    symbols_to_remove.append(symbol)
+
+            # 2. KASUS BUY PENDING
+            elif action == 'buy':
+                if c_low <= t_ep:
+                    # Order Terjemput -> Berubah jadi LIVE Position
+                    symbols_to_remove.append(symbol)
+                    send_telegram(f"🟡 *[ORDER TERISI / LIVE]*\n• *Pair:* `{symbol}` (BUY)\n• *Entry:* `{t_ep:.5f}`")
+                elif c_high >= t_tp:
+                    # MISSED: Harga capai TP 1R duluan tanpa jemput entry
+                    cancel_and_cleanup(exchange, symbol, order_id, is_forex, "MISSED ⚪ (TP 1R Hit First)")
+                    symbols_to_remove.append(symbol)
+                elif c_low <= t_sl:
+                    # CANCELLED: Harga nembus SL duluan sebelum jemput entry
+                    cancel_and_cleanup(exchange, symbol, order_id, is_forex, "CANCELLED ⚪ (SL Hit First)")
+                    symbols_to_remove.append(symbol)
+                elif b_cnt > MAX_PENDING_BARS:
+                    # INVALID: Melewati batas 30 candle M15
+                    cancel_and_cleanup(exchange, symbol, order_id, is_forex, f"INVALID ⚪ (Exceeded {MAX_PENDING_BARS} Bars)")
+                    symbols_to_remove.append(symbol)
+
+        except Exception as e:
+            print(f"Error pada manage_pending_orders [{symbol}]: {e}")
+
+    # Bersihkan dari tracking lokal
+    for sym in symbols_to_remove:
+        if sym in pending_orders_tracker:
+            del pending_orders_tracker[sym]
+
+def cancel_and_cleanup(exchange, symbol, order_id, is_forex, reason):
+    """Membatalkan order di Exchange/MT5 dan mengirim notifikasi"""
+    try:
+        if is_forex and MT5_AVAILABLE:
+            request_data = {
+                "action": mt5.TRADE_ACTION_REMOVE,
+                "order": order_id
+            }
+            mt5.order_send(request_data)
+        elif exchange:
+            exchange.cancel_order(order_id, symbol)
+            
+        send_telegram(f"🗑 *[ORDER CANCELLED]*\n• *Pair:* `{symbol}`\n• *Status:* `{reason}`")
+        log_trade(symbol, "CANCEL", 0, 0, 0, 0, 0, reason)
+    except Exception as e:
+        print(f"Gagal cancel order {symbol}: {e}")
+
+# =================================================================
+# ENGINE UTAMA: ALCHEMIST PRO HYBRID V2
 # =================================================================
 def process_asset(symbol, is_forex, exchange=None):
-    global last_trade_times
+    global last_trade_times, IS_BOT_PAUSED, pending_orders_tracker
+    
+    if IS_BOT_PAUSED: return
+
     try:
+        # Cek Batas Posisi + Floating Loss (Khusus Crypto)
+        if not is_forex and exchange:
+            can_trade, curr_pos, max_pos, free_usdt = check_dynamic_position_limit(exchange)
+            if not can_trade: return
+
         if is_forex:
             df_htf = fetch_ohlcv_forex(symbol, TIMEFRAME_HTF, limit=100)
             df_ltf = fetch_ohlcv_forex(symbol, TIMEFRAME_LTF, limit=100)
@@ -219,76 +354,82 @@ def process_asset(symbol, is_forex, exchange=None):
 
         if df_htf is None or df_ltf is None or df_daily is None: return
 
-        # High & Low HTF (H1 Candle Sebelumnya)
+        # High & Low HTF (H1 Candle Sebelumnya / iloc[-2])
         h_htf = df_htf.iloc[-2]['high']
         l_htf = df_htf.iloc[-2]['low']
 
-        # Hitung EMA 50 pada Timeframe HTF (1 Jam)
+        # Hitung EMA 50 HTF (H1) & Daily Open
         df_htf['ema50'] = calculate_ema(df_htf['close'], 50)
         ema50_htf = df_htf.iloc[-2]['ema50']
-
-        # Daily Open
         daily_open = df_daily.iloc[-1]['open']
 
-        # Candle LTF Saat Ini (M15 Baru Tutup)
+        # Candle M15 Saat Ini
         current_bar = df_ltf.iloc[-1]
         c_close, c_high, c_low, c_open, c_time = current_bar['close'], current_bar['high'], current_bar['low'], current_bar['open'], current_bar['timestamp']
 
-        # Tren Filter Alchemist (Berdasarkan HTF EMA 50 & Daily Open)
+        # Filter Tren Alchemist (Sama Persis Pine Script)
         is_bull = (c_close > ema50_htf) and (c_close > daily_open)
         is_bear = (c_close < ema50_htf) and (c_close < daily_open)
 
-        # Cek Kill Zone
         current_hour = datetime.now().hour
         in_kz = (LON_START <= current_hour < LON_END) or (NY_START <= current_hour < NY_END)
 
-        # Syarat Sinyal SMC Alchemist
         s_cond = in_kz and (c_high > h_htf) and (c_close < h_htf) and (c_close < c_open) and is_bear
         b_cond = in_kz and (c_low < l_htf) and (c_close > l_htf) and (c_close > c_open) and is_bull
 
         last_time = last_trade_times.get(symbol)
 
-        if (s_cond or b_cond) and (last_time != c_time):
+        # Mencegah duplikasi sinyal & memastikan tidak ada pending order ganda di pair yang sama
+        if (s_cond or b_cond) and (last_time != c_time) and (symbol not in pending_orders_tracker):
             action = 'sell' if s_cond else 'buy'
-
-            # Perhitungan Entry, SL, dan TP 1R Sesuai Pine Script
-            if ENTRY_MODE == "retrace":
-                entry_price = (c_high + c_low) / 2.0
-            else:
-                entry_price = c_close
+            entry_price = (c_high + c_low) / 2.0 if ENTRY_MODE == "retrace" else c_close
 
             if action == 'sell':
                 sl_price = c_high + (SL_BUFFER_TICKS * tick_size)
-                r_risk = sl_price - entry_price
-                tp_price = entry_price - r_risk
+                tp_price = entry_price - (sl_price - entry_price)  # TP 1R (100% Persis)
             else:
                 sl_price = c_low - (SL_BUFFER_TICKS * tick_size)
-                r_risk = entry_price - sl_price
-                tp_price = entry_price + r_risk
+                tp_price = entry_price + (entry_price - sl_price)  # TP 1R (100% Persis)
 
-            # Eksekusi Order
+            order_res = None
             if is_forex:
-                result = execute_forex_order(symbol, action, entry_price, sl_price, tp_price)
-                if result is None: return
-                tipe_market = "FOREX"
-                margin_str = f"Lot {FOREX_LOT} (Lev 1:{FOREX_LEVERAGE_INFO})"
+                order_res = execute_forex_order(symbol, action, entry_price, sl_price, tp_price)
+                order_id = order_res.order if order_res else None
+                tipe_mkt = "FOREX"
+                size_str = f"Lot {FOREX_LOT}"
             else:
-                execute_crypto_order(exchange, symbol, action, entry_price, sl_price, tp_price)
-                tipe_market = "CRYPTO"
-                margin_str = f"${CRYPTO_MARGIN_USDT} (Lev {CRYPTO_LEVERAGE}x)"
+                order_res = execute_crypto_order(exchange, symbol, action, entry_price, sl_price, tp_price)
+                order_id = order_res.get('id') if order_res else None
+                tipe_mkt = "CRYPTO"
+                size_str = f"${CRYPTO_MARGIN_USDT} (Lev {CRYPTO_LEVERAGE}x)"
 
-            last_trade_times[symbol] = c_time
-            
-            msg = (
-                f"🚀 *[ALCHEMIST HYBRID V2 - {tipe_market}]*\n\n"
-                f"• *Pair:* `{symbol}`\n"
-                f"• *Aksi:* `{action.upper()}` ({'Retrace 50%' if ENTRY_MODE == 'retrace' else 'Market Close'})\n"
-                f"• *Harga Entry:* `{entry_price:.5f}`\n"
-                f"• *Stop Loss:* `{sl_price:.5f}`\n"
-                f"• *Take Profit (1R):* `{tp_price:.5f}`\n"
-                f"• *Size:* `{margin_str}`"
-            )
-            send_telegram(msg)
+            if order_res:
+                last_trade_times[symbol] = c_time
+                
+                # Masukkan ke Tracker Pending jika menggunakan mode Retrace 50%
+                if ENTRY_MODE == "retrace" and order_id:
+                    pending_orders_tracker[symbol] = {
+                        'order_id': order_id,
+                        'action': action,
+                        'entry': entry_price,
+                        'sl': sl_price,
+                        'tp': tp_price,
+                        'created_at_time': c_time,
+                        'last_bar_time': c_time,
+                        'bars_count': 0,
+                        'is_forex': is_forex
+                    }
+
+                msg = (
+                    f"🚀 *[ALCHEMIST AUTO-ENTRY - {tipe_mkt}]*\n\n"
+                    f"• *Pair:* `{symbol}`\n"
+                    f"• *Aksi:* `{action.upper()}` ({'Retrace 50%' if ENTRY_MODE == 'retrace' else 'Market'})\n"
+                    f"• *Harga Entry:* `{entry_price:.5f}`\n"
+                    f"• *Stop Loss:* `{sl_price:.5f}`\n"
+                    f"• *Take Profit (1R):* `{tp_price:.5f}`\n"
+                    f"• *Size:* `{size_str}`"
+                )
+                send_telegram(msg)
 
     except Exception:
         pass
@@ -300,26 +441,55 @@ def multi_asset_scanner():
     
     while True:
         try:
-            crypto_pairs = get_top_crypto_pairs(exchange, TOP_CRYPTO_COUNT)
-            
-            if MT5_AVAILABLE and mt5.terminal_info():
-                for fx in FOREX_PAIRS:
-                    process_asset(fx, is_forex=True)
-            
-            for coin in crypto_pairs:
-                process_asset(coin, is_forex=False, exchange=exchange)
-                time.sleep(0.1)
+            if not IS_BOT_PAUSED:
+                # 1. Kelola dan periksa Auto-Cancel pada Pending Limit Orders
+                manage_pending_orders(exchange)
+                
+                # 2. Pindai Pasangan Mata Uang / Crypto
+                crypto_pairs = get_top_crypto_pairs(exchange, TOP_CRYPTO_COUNT)
+                
+                if MT5_AVAILABLE and mt5.terminal_info():
+                    for fx in FOREX_PAIRS:
+                        process_asset(fx, is_forex=True)
+                
+                for coin in crypto_pairs:
+                    process_asset(coin, is_forex=False, exchange=exchange)
+                    time.sleep(0.1)
 
-            time.sleep(30)
+            time.sleep(15)
         except Exception as e:
-            print(f"Error Scanner Utama: {e}")
-            time.sleep(30)
+            print(f"Error Scanner: {e}")
+            time.sleep(15)
+
+# =================================================================
+# AUTO DAILY REPORT SCHEDULER
+# =================================================================
+def daily_report_scheduler():
+    while True:
+        now = datetime.now()
+        if now.hour == 23 and now.minute == 59:
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT status FROM trades WHERE created_at >= datetime('now', '-1 day')")
+            rows = c.fetchall()
+            conn.close()
+            
+            msg = (
+                f"🌙 *[DAILY AUTO-REPORT]*\n\n"
+                f"• *Tanggal:* `{now.strftime('%Y-%m-%d')}`\n"
+                f"• *Total Trades Today:* `{len(rows)}x`\n\n"
+                f"Gunakan `/stat` untuk rekap mingguan."
+            )
+            send_telegram(msg)
+            time.sleep(70)
+        time.sleep(30)
 
 # =================================================================
 # TELEGRAM COMMAND LISTENER
 # =================================================================
 @app.route('/telegram_webhook', methods=['POST'])
 def telegram_webhook():
+    global IS_BOT_PAUSED
     update = request.get_json()
     if not update or 'message' not in update: return 'ok', 200
 
@@ -329,38 +499,58 @@ def telegram_webhook():
 
     if chat_id != TELEGRAM_CHAT_ID: return 'ok', 200
 
-    if text == '/posisi':
+    if text == '/pause':
+        IS_BOT_PAUSED = True
+        send_telegram("⏸ *BOT DI-PAUSE!* Scanner dihentikan sementara.")
+
+    elif text == '/resume':
+        IS_BOT_PAUSED = False
+        send_telegram("▶️ *BOT AKTIF KEMBALI!* Scanner mencari sinyal.")
+
+    elif text == '/posisi':
         try:
             exchange = get_exchange()
             positions = exchange.fetch_positions()
             open_pos = [p for p in positions if float(p.get('contracts', 0)) > 0]
+            
+            can_tr, curr_pos, max_pos, free_usdt = check_dynamic_position_limit(exchange)
+            
+            msg = f"📊 *STATUS POSISI & SALDO*\n\n"
+            msg += f"• *Saldo Free USDT:* `${free_usdt:.2f}`\n"
+            msg += f"• *Batas Max Posisi:* `{curr_pos} / {max_pos}`\n"
+            msg += f"• *Pending Orders:* `{len(pending_orders_tracker)}`\n"
+            msg += f"• *Status Bot:* `{'PAUSED ⏸' if IS_BOT_PAUSED else 'RUNNING ▶️'}`\n\n"
+            
             if not open_pos:
-                send_telegram("📭 Tidak ada posisi Crypto aktif saat ini.")
+                msg += "📭 Tidak ada posisi Crypto aktif saat ini."
             else:
-                msg = "📊 *POSISI RUNNING BINGX*\n\n"
+                msg += "*Detail Posisi Running:*\n"
                 for p in open_pos:
-                    msg += f"• `{p['symbol']}` ({p.get('side', '').upper()})\n  PnL: `{float(p.get('unrealizedPnl', 0)):+.2f} USDT`\n"
-                send_telegram(msg)
-        except:
-            send_telegram("❌ Gagal mengambil posisi aktif.")
+                    msg += f"• `{p['symbol']}` ({p.get('side', '').upper()}) | PnL: `{float(p.get('unrealizedPnl', 0)):+.2f} USDT`\n"
+            
+            send_telegram(msg)
+        except Exception as e:
+            send_telegram(f"❌ Gagal cek posisi: `{str(e)}`")
 
     elif text in ['/stat', '/mingguan']:
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT status FROM trades")
+        c.execute("SELECT status FROM trades WHERE created_at >= datetime('now', '-7 days')")
         rows = c.fetchall()
         conn.close()
-        
-        total = len(rows)
-        msg = f"📈 *REKAP TRADING (7 HARI)*\n\n• *Total Executed Signals:* `{total}`\n"
-        send_telegram(msg)
+        send_telegram(f"📈 *REKAP TRADING (7 HARI)*\n\n• *Total Signal Executed:* `{len(rows)}x`")
 
     return 'ok', 200
 
 if __name__ == '__main__':
     init_db()
+    
     scanner_thread = threading.Thread(target=multi_asset_scanner)
     scanner_thread.daemon = True
     scanner_thread.start()
+    
+    report_thread = threading.Thread(target=daily_report_scheduler)
+    report_thread.daemon = True
+    report_thread.start()
     
     app.run(host='0.0.0.0', port=5000)
