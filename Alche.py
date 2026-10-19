@@ -20,14 +20,13 @@ WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "ALCHEMIST_SMC_SECRET_123")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "MASUKKAN_TOKEN_BOT_TELEGRAM")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "MASUKKAN_CHAT_ID_TELEGRAM")
 
-# Konfigurasi CEX (Default: Bitget. Bisa diganti 'bingx' atau 'binance')
-EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "bitget")
+EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "bingx")
 API_KEY = os.getenv("API_KEY", "MASUKKAN_API_KEY")
 SECRET_KEY = os.getenv("SECRET_KEY", "MASUKKAN_SECRET_KEY")
 PASSPHRASE = os.getenv("PASSPHRASE", "MASUKKAN_PASSPHRASE_API")
 
 # =================================================================
-# INISIALISASI DATABASE SQLITE UNTUK STATISTIK
+# DATABASE SQLITE & AUTO-PURGE MINGGUAN
 # =================================================================
 DB_FILE = "trades.db"
 
@@ -51,7 +50,19 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Fungsi Otomatis Menghapus Data Lebih dari 7 Hari
+def cleanup_old_trades():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM trades WHERE created_at < datetime('now', '-7 days')")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Gagal cleanup DB: {e}")
+
 def log_open_trade(symbol, action, entry_price, margin, leverage):
+    cleanup_old_trades() # Bersihkan data tua sebelum simpan data baru
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
@@ -77,12 +88,12 @@ def log_close_trade(symbol, exit_price, pnl, status_type):
     conn.close()
 
 def get_weekly_stats():
+    cleanup_old_trades() # Pastikan data tua terhapus sebelum hitung stat
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute('''
         SELECT status, pnl FROM trades
         WHERE status IN ('TP', 'SL', 'CLOSED')
-          AND created_at >= datetime('now', '-7 days')
     ''')
     rows = c.fetchall()
     conn.close()
@@ -148,10 +159,10 @@ def set_safe_leverage(exchange, symbol, target_leverage=50):
 # =================================================================
 def execute_crypto(data):
     symbol = data.get('symbol')
-    action = data.get('action').lower()  # "buy", "sell", "close", "tp", "sl"
+    action = data.get('action').lower()
     margin_usdt = float(data.get('margin_usdt', 2.0))
     target_leverage = int(data.get('leverage', 50))
-    pnl = data.get('pnl', None)  # PnL opsional dari TV jika ada
+    pnl = data.get('pnl', None)
 
     if "/" not in symbol and "USDT" in symbol:
         base = symbol.replace("USDT", "")
@@ -164,7 +175,7 @@ def execute_crypto(data):
         ticker = exchange.fetch_ticker(symbol_formatted)
         current_price = ticker['last']
 
-        # LOGIKA TUTO/CLOSE (TP / SL)
+        # LOGIKA CLOSE / TP / SL
         if action in ['close', 'tp', 'sl']:
             status_tag = action.upper()
             log_close_trade(symbol_formatted, current_price, pnl, status_tag)
@@ -186,7 +197,6 @@ def execute_crypto(data):
         side = 'buy' if action == 'buy' else 'sell'
         order = exchange.create_order(symbol_formatted, 'market', side, amount)
 
-        # Simpan ke Database local
         log_open_trade(symbol_formatted, action.upper(), current_price, margin_usdt, active_lev)
 
         msg = (
@@ -222,7 +232,6 @@ def telegram_webhook():
     if chat_id != TELEGRAM_CHAT_ID:
         return 'ok', 200
 
-    # Command /posisi
     if text == '/posisi':
         try:
             exchange = get_exchange()
@@ -244,11 +253,10 @@ def telegram_webhook():
         except Exception as e:
             send_telegram(f"❌ Gagal mengambil posisi: `{str(e)}`")
 
-    # Command /stat /mingguan
     elif text in ['/stat', '/mingguan']:
         stats = get_weekly_stats()
         if not stats:
-            send_telegram("📭 Belum ada riwayat trade yang selesai dalam 7 hari terakhir.")
+            send_telegram("📭 Belum ada riwayat trade minggu ini.")
         else:
             msg = (
                 f"📈 *REKAP STATISTIK TRADING (7 HARI)*\n\n"
