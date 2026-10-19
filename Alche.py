@@ -1,179 +1,284 @@
-import yfinance as yf
-import ccxt
-import time
+import os
+import sqlite3
 import requests
-import datetime
+from flask import Flask, request, jsonify
+import ccxt
+
+# Modul MT5 untuk Forex (Opsional / Siap Pakai Nanti)
+try:
+    import MetaTrader5 as mt5
+    MT5_AVAILABLE = True
+except ImportError:
+    MT5_AVAILABLE = False
+
+app = Flask(__name__)
 
 # =================================================================
-# PENGATURAN BOT ALCHEMIST (EXNESS EDITION)
+# KONFIGURASI BOT & AKUN (ALCHEMIST SMC)
 # =================================================================
+WEBHOOK_PASSPHRASE = os.getenv("WEBHOOK_PASSPHRASE", "ALCHEMIST_SMC_SECRET_123")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "MASUKKAN_TOKEN_BOT_TELEGRAM")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "MASUKKAN_CHAT_ID_TELEGRAM")
 
-# 1. Konfigurasi Bot Telegram (Ganti dengan token dan chat id milikmu)
-TELEGRAM_BOT_TOKEN = "MASUKKAN_TOKEN_BOT_TELEGRAM_KAMU_DISINI"
-TELEGRAM_CHAT_ID = "MASUKKAN_CHAT_ID_KAMU_DISINI"
+# Konfigurasi CEX (Default: Bitget. Bisa diganti 'bingx' atau 'binance')
+EXCHANGE_NAME = os.getenv("EXCHANGE_NAME", "bitget")
+API_KEY = os.getenv("API_KEY", "MASUKKAN_API_KEY")
+SECRET_KEY = os.getenv("SECRET_KEY", "MASUKKAN_SECRET_KEY")
+PASSPHRASE = os.getenv("PASSPHRASE", "MASUKKAN_PASSPHRASE_API")
 
-# 2. Daftar Pair Crypto Top 50 Pilihan dengan Likuiditas Tinggi
-CRYPTO_PAIRS = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
-    'DOGE/USDT', 'ADA/USDT', 'TRX/USDT', 'AVAX/USDT', 'LINK/USDT',
-    'DOT/USDT', 'TON/USDT', 'SHIB/USDT', 'BCH/USDT', 'LTC/USDT',
-    'NEAR/USDT', 'APT/USDT', 'SUI/USDT', 'UNI/USDT', 'PEPE/USDT',
-    'ICP/USDT', 'FET/USDT', 'RNDR/USDT', 'INJ/USDT', 'ARB/USDT',
-    'OP/USDT', 'FIL/USDT', 'STX/USDT', 'WIF/USDT', 'MKR/USDT',
-    'GRT/USDT', 'VET/USDT', 'THETA/USDT', 'AAVE/USDT', 'FTM/USDT',
-    'ALGO/USDT', 'SAND/USDT', 'SNX/USDT', 'LDO/USDT', 'GALA/USDT',
-    'MANA/USDT', 'AXS/USDT', 'CHZ/USDT', 'CRV/USDT', 'DYDX/USDT',
-    'SEI/USDT', 'TIA/USDT', 'ROSE/USDT', 'ENJ/USDT', 'COMP/USDT'
-]
+# =================================================================
+# INISIALISASI DATABASE SQLITE UNTUK STATISTIK
+# =================================================================
+DB_FILE = "trades.db"
 
-# 3. Daftar Forex & Komoditas (Exness Equivalent via Yahoo Finance)
-FOREX_PAIRS = ['GC=F', 'EURUSD=X', 'GBPUSD=X', 'CL=F'] # GC=F = XAUUSD (Gold), CL=F = USOIL
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            action TEXT,
+            entry_price REAL,
+            exit_price REAL,
+            margin REAL,
+            leverage INTEGER,
+            pnl REAL,
+            status TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-# 4. Pengaturan Strategi Timeframe
-TF_HTF_CRYPTO = '1h'    
-TF_EXEC_CRYPTO = '15m'  
-EMA_PERIOD = 50
+def log_open_trade(symbol, action, entry_price, margin, leverage):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO trades (symbol, action, entry_price, margin, leverage, status)
+        VALUES (?, ?, ?, ?, ?, 'OPEN')
+    ''', (symbol, action, entry_price, margin, leverage))
+    conn.commit()
+    conn.close()
 
-TF_HTF_FOREX = '60m'
-TF_EXEC_FOREX = '15m'
+def log_close_trade(symbol, exit_price, pnl, status_type):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        UPDATE trades
+        SET exit_price = ?, pnl = ?, status = ?
+        WHERE id = (
+            SELECT id FROM trades
+            WHERE symbol = ? AND status = 'OPEN'
+            ORDER BY id DESC LIMIT 1
+        )
+    ''', (exit_price, pnl, status_type, symbol))
+    conn.commit()
+    conn.close()
 
-# Kamus Ukuran Tick Presisi
-TICK_SIZES = {
-    'GC=F': 0.1,        # Gold 
-    'EURUSD=X': 0.00001, # Forex 5 digit
-    'GBPUSD=X': 0.00001,
-    'CL=F': 0.01
-}
+def get_weekly_stats():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''
+        SELECT status, pnl FROM trades
+        WHERE status IN ('TP', 'SL', 'CLOSED')
+          AND created_at >= datetime('now', '-7 days')
+    ''')
+    rows = c.fetchall()
+    conn.close()
 
-# Logika Stop Loss (Buffer SMC + Spread Ekstra Exness Zero/Raw ~0.2 pips)
-SL_BUFFER_TICKS = 15  
-SPREAD_TICKS_FOREX = 2  
-SPREAD_TICKS_GOLD = 2   
-
-# Kill Zone (Waktu Server UTC - Sesi London & New York)
-LON_START, LON_END = 7, 10
-NY_START, NY_END = 12, 15
-
-exchange = ccxt.binance()
-
-def send_telegram_msg(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'}
-    try:
-        requests.post(url, data=payload)
-    except Exception as e:
-        print(f"Gagal kirim Telegram: {e}")
-
-def check_kill_zone():
-    current_hour = datetime.datetime.utcnow().hour
-    return (LON_START <= current_hour < LON_END) or (NY_START <= current_hour < NY_END)
-
-def calculate_ema(prices, period=50):
-    if len(prices) < period:
+    if not rows:
         return None
-    k = 2 / (period + 1)
-    ema = sum(prices[:period]) / period
-    for price in prices[period:]:
-        ema = price * k + ema * (1 - k)
-    return ema
 
-def scan_pair_crypto(symbol):
+    total_trades = len(rows)
+    wins = sum(1 for r in rows if (r[1] is not None and r[1] > 0) or r[0] == 'TP')
+    losses = sum(1 for r in rows if (r[1] is not None and r[1] < 0) or r[0] == 'SL')
+    total_pnl = sum(r[1] for r in rows if r[1] is not None)
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0.0
+
+    return {
+        'total': total_trades,
+        'wins': wins,
+        'losses': losses,
+        'win_rate': win_rate,
+        'pnl': total_pnl
+    }
+
+# Setup CCXT Exchange Client
+def get_exchange():
+    exchange_class = getattr(ccxt, EXCHANGE_NAME)
+    config = {
+        'apiKey': API_KEY,
+        'secret': SECRET_KEY,
+        'enableRateLimit': True,
+        'options': {'defaultType': 'swap'}
+    }
+    if PASSPHRASE and EXCHANGE_NAME in ['bitget', 'kucoin']:
+        config['password'] = PASSPHRASE
+    return exchange_class(config)
+
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        'chat_id': TELEGRAM_CHAT_ID,
+        'text': msg,
+        'parse_mode': 'Markdown'
+    }
     try:
-        ohlcv_1h = exchange.fetch_ohlcv(symbol, TF_HTF_CRYPTO, limit=60)
-        ohlcv_15m = exchange.fetch_ohlcv(symbol, TF_EXEC_CRYPTO, limit=3)
-        if not ohlcv_1h or not ohlcv_15m: return
-
-        htf_high, htf_low = ohlcv_1h[-2][2], ohlcv_1h[-2][3]
-        ema_50 = calculate_ema([x[4] for x in ohlcv_1h], EMA_PERIOD)
-        if not ema_50: return
-        
-        cur_open, cur_high, cur_low, cur_close = ohlcv_15m[-2][1:5]
-        is_bullish = cur_close > ema_50
-        is_bearish = cur_close < ema_50
-        
-        tick = 0.001 # Default crypto tick
-        sl_buffer = tick * SL_BUFFER_TICKS
-
-        if cur_high > htf_high and cur_close < htf_high and cur_close < cur_open and is_bearish:
-            entry = (cur_high + cur_low) / 2
-            sl = cur_high + sl_buffer
-            tp = entry - (sl - entry)
-            msg = f"🔴 *SELL {symbol}*\nTF: {TF_EXEC_CRYPTO}\nEntry (50%): {entry:.5f}\nSL: {sl:.5f}\nTP (1R): {tp:.5f}"
-            send_telegram_msg(msg)
-
-        elif cur_low < htf_low and cur_close > htf_low and cur_close > cur_open and is_bullish:
-            entry = (cur_high + cur_low) / 2
-            sl = cur_low - sl_buffer
-            tp = entry + (entry - sl)
-            msg = f"🟢 *BUY {symbol}*\nTF: {TF_EXEC_CRYPTO}\nEntry (50%): {entry:.5f}\nSL: {sl:.5f}\nTP (1R): {tp:.5f}"
-            send_telegram_msg(msg)
+        requests.post(url, data=payload, timeout=5)
     except Exception as e:
-        pass
+        print(f"Gagal kirim notifikasi Telegram: {e}")
 
-def scan_pair_forex(symbol):
-    try:
-        ticker = yf.Ticker(symbol)
-        df_1h = ticker.history(interval=TF_HTF_FOREX, period="5d")
-        df_15m = ticker.history(interval=TF_EXEC_FOREX, period="2d")
-        if len(df_1h) < 50 or len(df_15m) < 3: return
-            
-        htf_candle = df_1h.iloc[-2]
-        htf_high, htf_low = htf_candle['High'], htf_candle['Low']
-        ema_50 = calculate_ema(df_1h['Close'].tolist(), EMA_PERIOD)
-        if not ema_50: return
-        
-        cur_candle = df_15m.iloc[-2]
-        cur_open, cur_high, cur_low, cur_close = cur_candle['Open'], cur_candle['High'], cur_candle['Low'], cur_candle['Close']
-
-        is_bullish = cur_close > ema_50
-        is_bearish = cur_close < ema_50
-        
-        tick = TICK_SIZES.get(symbol, 0.00001)
-        if symbol == 'GC=F': 
-             sl_buffer = tick * (SL_BUFFER_TICKS + SPREAD_TICKS_GOLD)
-        else: 
-             sl_buffer = tick * (SL_BUFFER_TICKS + SPREAD_TICKS_FOREX)
-
-        clean_name = "XAUUSD" if symbol == 'GC=F' else symbol.replace('=X', '')
-
-        if cur_high > htf_high and cur_close < htf_high and cur_close < cur_open and is_bearish:
-            entry = (cur_high + cur_low) / 2
-            sl = cur_high + sl_buffer
-            tp = entry - (sl - entry)
-            msg = f"🔴 *SELL {clean_name} (Forex)*\nTF: {TF_EXEC_FOREX}\nEntry (50%): {entry:.5f}\nSL: {sl:.5f}\nTP (1R): {tp:.5f}"
-            send_telegram_msg(msg)
-
-        elif cur_low < htf_low and cur_close > htf_low and cur_close > cur_open and is_bullish:
-            entry = (cur_high + cur_low) / 2
-            sl = cur_low - sl_buffer
-            tp = entry + (entry - sl)
-            msg = f"🟢 *BUY {clean_name} (Forex)*\nTF: {TF_EXEC_FOREX}\nEntry (50%): {entry:.5f}\nSL: {sl:.5f}\nTP (1R): {tp:.5f}"
-            send_telegram_msg(msg)
-    except Exception as e:
-        pass
+def set_safe_leverage(exchange, symbol, target_leverage=50):
+    fallback_leverages = [50, 25, 20, 10, 5]
+    active_lev = 1
+    for lev in fallback_leverages:
+        if lev > target_leverage:
+            continue
+        try:
+            exchange.set_leverage(lev, symbol)
+            active_lev = lev
+            break
+        except Exception:
+            continue
+    return active_lev
 
 # =================================================================
-# LOOP UTAMA BOT
+# LOGIKA EKSEKUSI CRYPTO
 # =================================================================
-print("🚀 Bot Alchemist (Multi-Pair Top 50 + Forex) Berjalan...")
+def execute_crypto(data):
+    symbol = data.get('symbol')
+    action = data.get('action').lower()  # "buy", "sell", "close", "tp", "sl"
+    margin_usdt = float(data.get('margin_usdt', 2.0))
+    target_leverage = int(data.get('leverage', 50))
+    pnl = data.get('pnl', None)  # PnL opsional dari TV jika ada
 
-while True:
+    if "/" not in symbol and "USDT" in symbol:
+        base = symbol.replace("USDT", "")
+        symbol_formatted = f"{base}/USDT:USDT"
+    else:
+        symbol_formatted = symbol
+
     try:
-        if check_kill_zone():
-            # Scan 50 Crypto
-            for pair in CRYPTO_PAIRS:
-                scan_pair_crypto(pair)
-                time.sleep(1) # Jeda aman anti-ban API Binance
+        exchange = get_exchange()
+        ticker = exchange.fetch_ticker(symbol_formatted)
+        current_price = ticker['last']
+
+        # LOGIKA TUTO/CLOSE (TP / SL)
+        if action in ['close', 'tp', 'sl']:
+            status_tag = action.upper()
+            log_close_trade(symbol_formatted, current_price, pnl, status_tag)
             
-            # Scan Forex & Komoditas
-            for pair in FOREX_PAIRS:
-                scan_pair_forex(pair)
-                time.sleep(1)
-                
-        # Siklus periksa ulang setiap 15 menit
-        time.sleep(900) 
-    except KeyboardInterrupt:
-        print("Bot dihentikan manual.")
-        break
+            msg = (
+                f"🏁 *[TRADE CLOSED - {status_tag}]*\n\n"
+                f"• *Pair:* `{symbol_formatted}`\n"
+                f"• *Harga Exit:* `${current_price}`\n"
+                f"• *Est. PnL:* `{f'{pnl:+.2f} USDT' if pnl is not None else 'N/A'}`"
+            )
+            send_telegram(msg)
+            return True, "Trade Closed"
+
+        # LOGIKA ENTRY (BUY / SELL)
+        active_lev = set_safe_leverage(exchange, symbol_formatted, target_leverage)
+        position_size_usdt = margin_usdt * active_lev
+        amount = position_size_usdt / current_price
+
+        side = 'buy' if action == 'buy' else 'sell'
+        order = exchange.create_order(symbol_formatted, 'market', side, amount)
+
+        # Simpan ke Database local
+        log_open_trade(symbol_formatted, action.upper(), current_price, margin_usdt, active_lev)
+
+        msg = (
+            f"🚀 *[AUTO-TRADE ENTRY]*\n\n"
+            f"• *Exchange:* `{EXCHANGE_NAME.upper()}`\n"
+            f"• *Pair:* `{symbol_formatted}`\n"
+            f"• *Aksi:* `{action.upper()}`\n"
+            f"• *Margin:* `${margin_usdt}` (Leverage `{active_lev}x`)\n"
+            f"• *Total Posisi:* `${position_size_usdt:.2f}`\n"
+            f"• *Harga Entry:* `${current_price}`"
+        )
+        send_telegram(msg)
+        return True, order
+
     except Exception as e:
-        time.sleep(60)
+        err_msg = f"❌ *[AUTO-TRADE EROR]*\n\n• *Pair:* `{symbol}`\n• *Eror:* `{str(e)}`"
+        send_telegram(err_msg)
+        return False, str(e)
+
+# =================================================================
+# ENDPOINT TELEGRAM COMMAND LISTENER (/posisi & /stat)
+# =================================================================
+@app.route('/telegram_webhook', methods=['POST'])
+def telegram_webhook():
+    update = request.get_json()
+    if not update or 'message' not in update:
+        return 'ok', 200
+
+    message = update['message']
+    text = message.get('text', '').strip()
+    chat_id = str(message['chat']['id'])
+
+    if chat_id != TELEGRAM_CHAT_ID:
+        return 'ok', 200
+
+    # Command /posisi
+    if text == '/posisi':
+        try:
+            exchange = get_exchange()
+            positions = exchange.fetch_positions()
+            open_pos = [p for p in positions if float(p.get('contracts', 0)) > 0]
+
+            if not open_pos:
+                send_telegram("📭 Nggak ada posisi yang lagi open saat ini.")
+            else:
+                msg = "📊 *POSISI RUNNING SAAT INI*\n\n"
+                for p in open_pos:
+                    side = p.get('side', '').upper()
+                    pnl = float(p.get('unrealizedPnl', 0.0))
+                    msg += (
+                        f"• `{p['symbol']}` ({side})\n"
+                        f"  Entry: `${p.get('entryPrice')}` | PnL: `{pnl:+.2f} USDT`\n"
+                    )
+                send_telegram(msg)
+        except Exception as e:
+            send_telegram(f"❌ Gagal mengambil posisi: `{str(e)}`")
+
+    # Command /stat /mingguan
+    elif text in ['/stat', '/mingguan']:
+        stats = get_weekly_stats()
+        if not stats:
+            send_telegram("📭 Belum ada riwayat trade yang selesai dalam 7 hari terakhir.")
+        else:
+            msg = (
+                f"📈 *REKAP STATISTIK TRADING (7 HARI)*\n\n"
+                f"• *Total Trade:* `{stats['total']}`\n"
+                f"• *Win / Loss:* `{stats['wins']} W` / `{stats['losses']} L`\n"
+                f"• *Win Rate:* `{stats['win_rate']:.1f}%`\n"
+                f"• *Net PnL:* `{stats['pnl']:+.2f} USDT`"
+            )
+            send_telegram(msg)
+
+    return 'ok', 200
+
+# =================================================================
+# ENDPOINT WEBHOOK PENERIMA ALERT TRADINGVIEW
+# =================================================================
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    data = request.get_json()
+
+    if not data or data.get('passphrase') != WEBHOOK_PASSPHRASE:
+        return jsonify({'status': 'error', 'message': 'Akses Ditolak'}), 401
+
+    market_type = data.get('market', 'crypto').lower()
+
+    if market_type == 'crypto':
+        success, res = execute_crypto(data)
+        return jsonify({'status': 'success' if success else 'error', 'message': res}), 200 if success else 500
+    else:
+        return jsonify({'status': 'error', 'message': 'Market type tidak dikenal'}), 400
+
+if __name__ == '__main__':
+    init_db()
+    app.run(host='0.0.0.0', port=5000)
