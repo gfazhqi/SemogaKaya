@@ -1,25 +1,35 @@
-def update_bot_spread_logic():
-    code = """import yfinance as yf
+import yfinance as yf
 import ccxt
 import time
 import requests
 import datetime
 
 # =================================================================
-# PENGATURAN BOT
+# PENGATURAN BOT ALCHEMIST (EXNESS EDITION)
 # =================================================================
 
-# 1. Konfigurasi Bot Telegram
+# 1. Konfigurasi Bot Telegram (Ganti dengan token dan chat id milikmu)
 TELEGRAM_BOT_TOKEN = "MASUKKAN_TOKEN_BOT_TELEGRAM_KAMU_DISINI"
 TELEGRAM_CHAT_ID = "MASUKKAN_CHAT_ID_KAMU_DISINI"
 
-# 2. Daftar Pair yang Dipantau
-CRYPTO_PAIRS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
-FOREX_PAIRS = ['GC=F', 'EURUSD=X', 'GBPUSD=X', 'CL=F']
+# 2. Daftar Pair Crypto Top 50 Pilihan dengan Likuiditas Tinggi
+CRYPTO_PAIRS = [
+    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT',
+    'DOGE/USDT', 'ADA/USDT', 'TRX/USDT', 'AVAX/USDT', 'LINK/USDT',
+    'DOT/USDT', 'TON/USDT', 'SHIB/USDT', 'BCH/USDT', 'LTC/USDT',
+    'NEAR/USDT', 'APT/USDT', 'SUI/USDT', 'UNI/USDT', 'PEPE/USDT',
+    'ICP/USDT', 'FET/USDT', 'RNDR/USDT', 'INJ/USDT', 'ARB/USDT',
+    'OP/USDT', 'FIL/USDT', 'STX/USDT', 'WIF/USDT', 'MKR/USDT',
+    'GRT/USDT', 'VET/USDT', 'THETA/USDT', 'AAVE/USDT', 'FTM/USDT',
+    'ALGO/USDT', 'SAND/USDT', 'SNX/USDT', 'LDO/USDT', 'GALA/USDT',
+    'MANA/USDT', 'AXS/USDT', 'CHZ/USDT', 'CRV/USDT', 'DYDX/USDT',
+    'SEI/USDT', 'TIA/USDT', 'ROSE/USDT', 'ENJ/USDT', 'COMP/USDT'
+]
 
-ALL_PAIRS = CRYPTO_PAIRS + FOREX_PAIRS
+# 3. Daftar Forex & Komoditas (Exness Equivalent via Yahoo Finance)
+FOREX_PAIRS = ['GC=F', 'EURUSD=X', 'GBPUSD=X', 'CL=F'] # GC=F = XAUUSD (Gold), CL=F = USOIL
 
-# 3. Pengaturan Strategi Alchemist
+# 4. Pengaturan Strategi Timeframe
 TF_HTF_CRYPTO = '1h'    
 TF_EXEC_CRYPTO = '15m'  
 EMA_PERIOD = 50
@@ -27,30 +37,22 @@ EMA_PERIOD = 50
 TF_HTF_FOREX = '60m'
 TF_EXEC_FOREX = '15m'
 
-# Kumpulan Ukuran Tick (Desimal)
+# Kamus Ukuran Tick Presisi
 TICK_SIZES = {
-    'BTC/USDT': 0.1, 'ETH/USDT': 0.01, 'SOL/USDT': 0.001, 'BNB/USDT': 0.01, 'XRP/USDT': 0.0001,
-    'GC=F': 0.1,        # Gold (1 tick = 0.1)
-    'EURUSD=X': 0.00001, # Forex 5 digit (1 pipette/tick = 0.00001)
+    'GC=F': 0.1,        # Gold 
+    'EURUSD=X': 0.00001, # Forex 5 digit
     'GBPUSD=X': 0.00001,
     'CL=F': 0.01
 }
 
-# =================================================================
-# LOGIKA STOP LOSS (BUFFER + SPREAD EXNESS)
-# =================================================================
-# Sesuai logika asli Pine Script: SL ditaruh di ujung ekor candle + Buffer
-SL_BUFFER_TICKS = 15  # Buffer bawaan SMC (15 ticks = 1.5 pips)
-
-# Tambahan Spread Khusus Exness (Zero/Raw ~0.2 pips = 2 ticks)
+# Logika Stop Loss (Buffer SMC + Spread Ekstra Exness Zero/Raw ~0.2 pips)
+SL_BUFFER_TICKS = 15  
 SPREAD_TICKS_FOREX = 2  
 SPREAD_TICKS_GOLD = 2   
 
-# Kill Zone (Waktu Server/UTC)
-LON_START = 7
-LON_END = 10
-NY_START = 12
-NY_END = 15
+# Kill Zone (Waktu Server UTC - Sesi London & New York)
+LON_START, LON_END = 7, 10
+NY_START, NY_END = 12, 15
 
 exchange = ccxt.binance()
 
@@ -59,8 +61,8 @@ def send_telegram_msg(msg):
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': msg, 'parse_mode': 'Markdown'}
     try:
         requests.post(url, data=payload)
-    except:
-        pass
+    except Exception as e:
+        print(f"Gagal kirim Telegram: {e}")
 
 def check_kill_zone():
     current_hour = datetime.datetime.utcnow().hour
@@ -83,14 +85,14 @@ def scan_pair_crypto(symbol):
 
         htf_high, htf_low = ohlcv_1h[-2][2], ohlcv_1h[-2][3]
         ema_50 = calculate_ema([x[4] for x in ohlcv_1h], EMA_PERIOD)
+        if not ema_50: return
         
         cur_open, cur_high, cur_low, cur_close = ohlcv_15m[-2][1:5]
-        
         is_bullish = cur_close > ema_50
         is_bearish = cur_close < ema_50
         
-        tick = TICK_SIZES.get(symbol, 0.001)
-        sl_buffer = tick * SL_BUFFER_TICKS # Crypto hanya pakai buffer bawaan
+        tick = 0.001 # Default crypto tick
+        sl_buffer = tick * SL_BUFFER_TICKS
 
         if cur_high > htf_high and cur_close < htf_high and cur_close < cur_open and is_bearish:
             entry = (cur_high + cur_low) / 2
@@ -105,9 +107,8 @@ def scan_pair_crypto(symbol):
             tp = entry + (entry - sl)
             msg = f"🟢 *BUY {symbol}*\nTF: {TF_EXEC_CRYPTO}\nEntry (50%): {entry:.5f}\nSL: {sl:.5f}\nTP (1R): {tp:.5f}"
             send_telegram_msg(msg)
-
     except Exception as e:
-        print(f"Error Crypto {symbol}: {e}")
+        pass
 
 def scan_pair_forex(symbol):
     try:
@@ -119,6 +120,7 @@ def scan_pair_forex(symbol):
         htf_candle = df_1h.iloc[-2]
         htf_high, htf_low = htf_candle['High'], htf_candle['Low']
         ema_50 = calculate_ema(df_1h['Close'].tolist(), EMA_PERIOD)
+        if not ema_50: return
         
         cur_candle = df_15m.iloc[-2]
         cur_open, cur_high, cur_low, cur_close = cur_candle['Open'], cur_candle['High'], cur_candle['Low'], cur_candle['Close']
@@ -127,18 +129,17 @@ def scan_pair_forex(symbol):
         is_bearish = cur_close < ema_50
         
         tick = TICK_SIZES.get(symbol, 0.00001)
-        
-        # LOGIKA SL: Buffer SMC (15) + Spread Exness (2) = 17 Ticks
         if symbol == 'GC=F': 
              sl_buffer = tick * (SL_BUFFER_TICKS + SPREAD_TICKS_GOLD)
         else: 
              sl_buffer = tick * (SL_BUFFER_TICKS + SPREAD_TICKS_FOREX)
 
+        clean_name = "XAUUSD" if symbol == 'GC=F' else symbol.replace('=X', '')
+
         if cur_high > htf_high and cur_close < htf_high and cur_close < cur_open and is_bearish:
             entry = (cur_high + cur_low) / 2
             sl = cur_high + sl_buffer
             tp = entry - (sl - entry)
-            clean_name = "XAUUSD" if symbol == 'GC=F' else symbol.replace('=X', '')
             msg = f"🔴 *SELL {clean_name} (Forex)*\nTF: {TF_EXEC_FOREX}\nEntry (50%): {entry:.5f}\nSL: {sl:.5f}\nTP (1R): {tp:.5f}"
             send_telegram_msg(msg)
 
@@ -146,34 +147,33 @@ def scan_pair_forex(symbol):
             entry = (cur_high + cur_low) / 2
             sl = cur_low - sl_buffer
             tp = entry + (entry - sl)
-            clean_name = "XAUUSD" if symbol == 'GC=F' else symbol.replace('=X', '')
             msg = f"🟢 *BUY {clean_name} (Forex)*\nTF: {TF_EXEC_FOREX}\nEntry (50%): {entry:.5f}\nSL: {sl:.5f}\nTP (1R): {tp:.5f}"
             send_telegram_msg(msg)
-
     except Exception as e:
-        print(f"Error Forex {symbol}: {e}")
+        pass
 
-print("🚀 Bot Alchemist Python (Crypto + Forex) Berjalan...")
+# =================================================================
+# LOOP UTAMA BOT
+# =================================================================
+print("🚀 Bot Alchemist (Multi-Pair Top 50 + Forex) Berjalan...")
 
 while True:
     try:
         if check_kill_zone():
+            # Scan 50 Crypto
             for pair in CRYPTO_PAIRS:
                 scan_pair_crypto(pair)
-                time.sleep(1)
+                time.sleep(1) # Jeda aman anti-ban API Binance
+            
+            # Scan Forex & Komoditas
             for pair in FOREX_PAIRS:
                 scan_pair_forex(pair)
                 time.sleep(1)
+                
+        # Siklus periksa ulang setiap 15 menit
         time.sleep(900) 
     except KeyboardInterrupt:
+        print("Bot dihentikan manual.")
         break
-    except:
+    except Exception as e:
         time.sleep(60)
-"""
-    return code
-
-code = update_bot_spread_logic()
-with open("/mnt/data/alchemist_bot_exness_v2.py", "w") as f:
-    f.write(code)
-print("[file-tag: code-generated-file-alchemist-bot-exness-v2]")
-
