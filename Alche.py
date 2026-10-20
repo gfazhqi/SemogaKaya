@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 import ccxt
 from datetime import datetime, timedelta, timezone
-from flask import Flask
+from flask import Flask, render_template, jsonify
 
 # =================================================================
 # CONFIGURATION & PARAMETERS
@@ -38,7 +38,7 @@ CONFIG = {
     'LEVERAGE': {ex: 50 for ex in DEFAULT_CEX.keys()},
     'DRY_RUN': True,
     'MIN_TRADES': 5,     
-    'MIN_WR': 40.0       # Default di bawah 50% (40%)
+    'MIN_WR': 40.0       
 }
 
 IS_BOT_PAUSED = False
@@ -218,14 +218,12 @@ def scan_markets():
 
                 if act_count >= CONFIG['MAX_CONCURRENT_POSITIONS']: continue
 
-                # =======================================
-                # FILTER: AUTO-BLACKLIST BAD PAIRS (Pengecualian BTC/ETH)
-                # =======================================
+                # FILTER AUTO-BLACKLIST (Pengecualian BTC/ETH)
                 if sym in pair_perf and sym not in CORE_PAIRS:
                     tot_trades = pair_perf[sym]['w'] + pair_perf[sym]['l']
                     if tot_trades >= CONFIG['MIN_TRADES']:
                         wr = (pair_perf[sym]['w'] / tot_trades) * 100
-                        if wr < CONFIG['MIN_WR']: continue  # SKIP koin jelek
+                        if wr < CONFIG['MIN_WR']: continue
 
                 m15, h1, d1 = ex.fetch_ohlcv(sym,'15m',limit=50), ex.fetch_ohlcv(sym,'1h',limit=60), ex.fetch_ohlcv(sym,'1d',limit=2)
                 if not m15 or not h1 or not d1: continue
@@ -315,14 +313,11 @@ def telegram_polling():
                             elif is_core or wr >= CONFIG['MIN_WR']: gacor += line
                             else: blist += line
                         
-                        msg = f"🏆 *[PERFORMA KOIN]*\nSyarat: Min {CONFIG['MIN_TRADES']} Trade, WR {CONFIG['MIN_WR']}%\n\n"
-                        msg += f"🔥 *AKTIF TRADING (Aman)*\n{gacor if gacor else 'Belum ada'}\n\n"
-                        msg += f"⏳ *EVALUASI (<{CONFIG['MIN_TRADES']} trade)*\n{eval_wait if eval_wait else 'Belum ada'}\n\n"
-                        msg += f"🗑️ *BLACKLIST (Otomatis Skip)*\n{blist if blist else 'Belum ada'}"
+                        msg = f"🏆 *[PERFORMA KOIN]*\nSyarat: Min {CONFIG['MIN_TRADES']} Trade, WR {CONFIG['MIN_WR']}%\n\n🔥 *AKTIF TRADING*\n{gacor if gacor else 'Belum ada'}\n\n⏳ *EVALUASI*\n{eval_wait if eval_wait else 'Belum ada'}\n\n🗑️ *BLACKLIST*\n{blist if blist else 'Belum ada'}"
                         send_telegram(msg)
 
                     elif text in ["/start", "/help"]:
-                        send_telegram("🤖 *[COMMANDS]*\n• `/cex on` | `/cex off`\n• `/setapi <cex> <api> <secret>`\n• `/dryrun on` | `/dryrun off`\n• `/posisi` | `/stat` | `/pairperf`\n• `/setmargin` | `/setlev` | `/setmaxpos`\n• `/setminwr` | `/setmintrades`\n• `/cancelall` | `/pause` | `/resume`")
+                        send_telegram("🤖 *[COMMANDS]*\n• `/cex on/off` | `/setapi <cex> <api> <secret>`\n• `/dryrun on/off`\n• `/posisi` | `/stat` | `/pairperf`\n• `/setmargin` | `/setlev` | `/setmaxpos`\n• `/setminwr` | `/setmintrades`\n• `/cancelall` | `/pause` | `/resume`")
                     elif text == "/posisi":
                         conn = sqlite3.connect(DB_FILE); c = conn.cursor()
                         trades = c.execute("SELECT exchange_id, symbol, side, status, order_id FROM trades WHERE status IN ('PENDING', 'OPEN')").fetchall()
@@ -334,9 +329,7 @@ def telegram_polling():
                         lev = "\n".join([f"• {k.upper()}: `{v}x`" for k,v in CONFIG['LEVERAGE'].items() if any(e[0]==k and e[2]==1 for e in cex_db)])
                         mode = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL MONEY"
                         
-                        m = (f"📊 *[STATUS & POSISI]*\nBot: `{'PAUSED 🛑' if IS_BOT_PAUSED else 'RUNNING 🟢'}`\nMode: `{mode}`\nSL Harian: `{daily_sl_count}/{MAX_DAILY_SL}`\n\n"
-                             f"🔌 *CEX:*\n{cex_stat}\n⚙️ *Setting:*\n• Margin: `${CONFIG['MARGIN_PER_TRADE']}`\n• Max Pos: `{CONFIG['MAX_CONCURRENT_POSITIONS']}`\n*Leverage:*\n{lev}\n\n"
-                             f"💰 *Saldo:*\n{bal}\n\n📋 *Antrean:* {len(trades)}\n")
+                        m = (f"📊 *[STATUS & POSISI]*\nBot: `{'PAUSED 🛑' if IS_BOT_PAUSED else 'RUNNING 🟢'}`\nMode: `{mode}`\nSL Harian: `{daily_sl_count}/{MAX_DAILY_SL}`\n\n🔌 *CEX:*\n{cex_stat}\n⚙️ *Setting:*\n• Margin: `${CONFIG['MARGIN_PER_TRADE']}`\n• Max Pos: `{CONFIG['MAX_CONCURRENT_POSITIONS']}`\n*Leverage:*\n{lev}\n\n💰 *Saldo:*\n{bal}\n\n📋 *Antrean:* {len(trades)}\n")
                         for t in trades: m += f"• `[{t[0].upper()}]` `{t[1]}` {'[SIM]' if str(t[4]).startswith('sim_') else ''} | `{t[2]}` | `{t[3]}`\n"
                         send_telegram(m)
                     elif text == "/pause": IS_BOT_PAUSED = True; send_telegram("⏸️ Bot PAUSED")
@@ -351,11 +344,35 @@ def telegram_polling():
         time.sleep(1)
 
 # =================================================================
-# MAIN
+# WEB DASHBOARD & FLASK SERVER
 # =================================================================
-app = Flask(__name__)
+app = Flask(__name__, template_folder='templates')
+
 @app.route('/')
-def home(): return "Alchemist Pro v2 Running!"
+def dashboard():
+    return render_template('index.html')
+
+@app.route('/api/stats')
+def api_stats():
+    conn = sqlite3.connect(DB_FILE)
+    df = pd.read_sql_query("SELECT symbol, side, status, created_at FROM trades WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)') ORDER BY id ASC", conn)
+    conn.close()
+
+    if df.empty:
+        return jsonify({'dates': [], 'pnl': [], 'win_rate': 0, 'wins': 0, 'losses': 0, 'net_pnl': 0, 'recent': []})
+
+    margin = CONFIG.get('MARGIN_PER_TRADE', 2.0)
+    df['pnl_value'] = df['status'].apply(lambda x: margin if 'TP' in x else -margin)
+    df['cum_pnl'] = df['pnl_value'].cumsum()
+    df['date_only'] = pd.to_datetime(df['created_at']).dt.strftime('%d %b %H:%M')
+
+    wins, losses = len(df[df['status'] == 'CLOSED (TP)']), len(df[df['status'] == 'CLOSED (SL)'])
+    total = wins + losses
+    win_rate = round((wins / total) * 100, 1) if total > 0 else 0
+    net_pnl = round(df['cum_pnl'].iloc[-1], 2) if not df.empty else 0
+    recent = df.tail(10)[::-1].to_dict('records')
+
+    return jsonify({'dates': df['date_only'].tolist(), 'pnl': df['cum_pnl'].tolist(), 'win_rate': win_rate, 'wins': wins, 'losses': losses, 'net_pnl': net_pnl, 'recent': recent})
 
 def main_loop():
     last_hb = time.time()
