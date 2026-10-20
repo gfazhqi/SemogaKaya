@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Alchemist Trade Journal</title>
+    <!-- Tailwind CSS (Desain Dark Mode) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js (Grafik PnL) -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { background-color: #0f0f0f; color: #e5e5e5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+        .card-bg { background-color: #1a1a1a; border: 1px solid #2d2d2d; border-radius: 8px; }
+    </style>
+</head>
+<body class="p-4 md:p-8">
+
+    <div class="max-w-7xl mx-auto">
+        <div class="flex justify-between items-center mb-8">
+            <h1 class="text-2xl font-bold text-white tracking-wide">Alchemist <span class="text-gray-500">Dashboard</span></h1>
+            <span class="px-3 py-1 bg-green-900 text-green-400 text-xs font-bold rounded-full border border-green-700">BOT ONLINE</span>
+        </div>
+
+        <!-- 3 Kartu Metrik Utama -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+            <div class="card-bg p-6">
+                <h3 class="text-gray-400 text-xs font-semibold mb-2 tracking-widest">NET P&L</h3>
+                <p id="net-pnl" class="text-4xl font-bold text-white">$0.00</p>
+            </div>
+            <div class="card-bg p-6">
+                <h3 class="text-gray-400 text-xs font-semibold mb-2 tracking-widest">TRADE WIN %</h3>
+                <div class="flex items-end gap-3">
+                    <p id="win-rate" class="text-4xl font-bold text-blue-500">0%</p>
+                    <p id="wl-count" class="text-sm text-gray-500 pb-1">0 W / 0 L</p>
+                </div>
+            </div>
+            <div class="card-bg p-6">
+                <h3 class="text-gray-400 text-xs font-semibold mb-2 tracking-widest">PROFIT FACTOR</h3>
+                <p id="profit-factor" class="text-4xl font-bold text-white">0.00</p>
+            </div>
+        </div>
+
+        <!-- Grafik Daily Cumulative PnL -->
+        <div class="card-bg p-6 mb-6">
+            <h3 class="text-gray-400 text-xs font-semibold mb-4 tracking-widest">DAILY NET CUMULATIVE P&L</h3>
+            <div class="relative h-72 w-full">
+                <canvas id="pnlChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Tabel Riwayat Transaksi -->
+        <div class="card-bg p-6">
+            <h3 class="text-gray-400 text-xs font-semibold mb-4 tracking-widest">RECENT TRADES</h3>
+            <div class="overflow-x-auto">
+                <table class="w-full text-left border-collapse">
+                    <thead>
+                        <tr class="border-b border-gray-700 text-xs text-gray-500">
+                            <th class="pb-3 pr-4 font-medium">PAIR</th>
+                            <th class="pb-3 pr-4 font-medium">SIDE</th>
+                            <th class="pb-3 pr-4 font-medium">DATE</th>
+                            <th class="pb-3 font-medium text-right">RESULT</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trade-list" class="text-sm">
+                        <!-- Data injeksi via JS -->
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Logika Penarikan Data dari Python (API) -->
+    <script>
+        async function fetchStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const data = await response.json();
+
+                // Update Angka di Kartu Atas
+                const isProfit = data.net_pnl >= 0;
+                document.getElementById('net-pnl').innerText = `${isProfit ? '+' : '-'}$${Math.abs(data.net_pnl).toFixed(2)}`;
+                document.getElementById('net-pnl').className = `text-4xl font-bold ${isProfit ? 'text-green-500' : 'text-red-500'}`;
+                
+                document.getElementById('win-rate').innerText = `${data.win_rate}%`;
+                document.getElementById('wl-count').innerText = `${data.wins} W / ${data.losses} L`;
+                
+                // Kalkulasi kasar Profit Factor (Win/Loss ratio * 1) karena risk-reward 1:1
+                const pf = data.losses > 0 ? (data.wins / data.losses).toFixed(2) : (data.wins > 0 ? 'MAX' : '0.00');
+                document.getElementById('profit-factor').innerText = pf;
+
+                // Update Tabel Recent Trades
+                const tbody = document.getElementById('trade-list');
+                tbody.innerHTML = '';
+                data.recent.forEach(trade => {
+                    const isWin = trade.status.includes('TP');
+                    const badgeClass = isWin ? 'bg-green-900/40 text-green-500' : 'bg-red-900/40 text-red-500';
+                    const tr = document.createElement('tr');
+                    tr.className = 'border-b border-gray-800 last:border-0';
+                    tr.innerHTML = `
+                        <td class="py-3 pr-4 font-semibold">${trade.symbol}</td>
+                        <td class="py-3 pr-4">${trade.side}</td>
+                        <td class="py-3 pr-4 text-gray-400 text-xs">${trade.date_only}</td>
+                        <td class="py-3 text-right">
+                            <span class="px-2 py-1 rounded text-xs font-bold ${badgeClass}">${isWin ? 'WIN (+1R)' : 'LOSS (-1R)'}</span>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+
+                // Update Grafik Chart.js
+                const ctx = document.getElementById('pnlChart').getContext('2d');
+                new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: data.dates,
+                        datasets: [{
+                            label: 'Net P&L ($)',
+                            data: data.pnl,
+                            borderColor: '#3b82f6', // Warna biru elegan
+                            backgroundColor: 'rgba(59, 130, 246, 0.1)',
+                            borderWidth: 2,
+                            pointRadius: 1,
+                            pointHoverRadius: 5,
+                            fill: true,
+                            tension: 0.3 // Garis melengkung halus
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            y: { 
+                                grid: { color: '#2d2d2d' },
+                                ticks: { color: '#888' }
+                            },
+                            x: { 
+                                grid: { display: false },
+                                ticks: { color: '#888', maxTicksLimit: 10 }
+                            }
+                        }
+                    }
+                });
+
+            } catch (error) {
+                console.error('Error fetching data:', error);
+            }
+        }
+
+        // Tarik data saat halaman dibuka
+        window.onload = fetchStats;
+    </script>
+</body>
+</html>
