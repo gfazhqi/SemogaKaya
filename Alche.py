@@ -21,6 +21,7 @@ DB_FILE = "trades.db"
 WIB = timezone(timedelta(hours=7))
 
 MANUAL_ALERT_PAIRS = ['XAU/USDT', 'EUR/USDT', 'GBP/USDT', 'USOIL/USDT', 'WTI/USDT', 'USO/USDT']
+CORE_PAIRS = ['BTC/USDT', 'ETH/USDT']  # Koin Inti (KEBAL BLACKLIST)
 
 DEFAULT_CEX = {
     'bingx': {'type': 'swap'},
@@ -35,7 +36,9 @@ CONFIG = {
     'MARGIN_PER_TRADE': 2.0,
     'MAX_CONCURRENT_POSITIONS': 2,
     'LEVERAGE': {ex: 50 for ex in DEFAULT_CEX.keys()},
-    'DRY_RUN': True  # Default Simulasi
+    'DRY_RUN': True,
+    'MIN_TRADES': 5,     
+    'MIN_WR': 40.0       # Default di bawah 50% (40%)
 }
 
 IS_BOT_PAUSED = False
@@ -44,7 +47,7 @@ last_error_time = 0
 ERROR_COOLDOWN = 300
 
 # =================================================================
-# DATABASE & DYNAMIC SETTINGS INITIALIZATION
+# DATABASE & SETTINGS
 # =================================================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -56,18 +59,21 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('margin', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_pos', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dry_run', 1.0)")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_trades', 5.0)")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_wr', 40.0)")
     for ex in DEFAULT_CEX.keys(): 
         c.execute(f"INSERT OR IGNORE INTO settings (key, value) VALUES ('lev_{ex}', 50.0)")
         c.execute("INSERT OR IGNORE INTO cex_settings (ex_id, api_key, secret, enabled) VALUES (?, '', '', 0)", (ex,))
     conn.commit(); conn.close()
 
 def load_settings():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
     for row in c.execute("SELECT key, value FROM settings").fetchall():
         if row[0] == 'margin': CONFIG['MARGIN_PER_TRADE'] = float(row[1])
         elif row[0] == 'max_pos': CONFIG['MAX_CONCURRENT_POSITIONS'] = int(row[1])
         elif row[0] == 'dry_run': CONFIG['DRY_RUN'] = bool(row[1])
+        elif row[0] == 'min_trades': CONFIG['MIN_TRADES'] = int(row[1])
+        elif row[0] == 'min_wr': CONFIG['MIN_WR'] = float(row[1])
         elif row[0].startswith('lev_'): CONFIG['LEVERAGE'][row[0].split('_')[1]] = int(row[1])
     conn.close()
 
@@ -76,17 +82,10 @@ def reload_exchanges():
     conn = sqlite3.connect(DB_FILE)
     rows = conn.cursor().execute("SELECT ex_id, api_key, secret, enabled FROM cex_settings").fetchall()
     conn.close()
-    
     exchanges.clear()
     for ex_id, api, sec, en in rows:
         if en == 1:
-            try:
-                ex_class = getattr(ccxt, ex_id)
-                exchanges[ex_id] = ex_class({
-                    'apiKey': api if api else '', 'secret': sec if sec else '',
-                    'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
-                    'enableRateLimit': True
-                })
+            try: exchanges[ex_id] = getattr(ccxt, ex_id)({'apiKey': api if api else '', 'secret': sec if sec else '', 'options': {'defaultType': DEFAULT_CEX[ex_id]['type']}, 'enableRateLimit': True})
             except: pass
 
 def update_db_setting(key, value):
@@ -104,8 +103,7 @@ def send_telegram(message):
 def send_error_alert(err_msg):
     global last_error_time
     if time.time() - last_error_time > ERROR_COOLDOWN:
-        send_telegram(f"⚠️ *[ERROR ALERT]*\n\n`{err_msg}`")
-        last_error_time = time.time()
+        send_telegram(f"⚠️ *[ERROR ALERT]*\n\n`{err_msg}`"); last_error_time = time.time()
 
 def is_kill_zone():
     h = datetime.now(WIB).hour
@@ -120,8 +118,7 @@ def get_free_usdt_balance(ex_instance):
 
 def cancel_all_pending_orders_on_pause():
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
+        conn = sqlite3.connect(DB_FILE); c = conn.cursor()
         for t_id, ex_id, sym, ord_id in c.execute("SELECT id, exchange_id, symbol, order_id FROM trades WHERE status='PENDING'").fetchall():
             if ex_id in exchanges and not str(ord_id).startswith('sim_'):
                 try: exchanges[ex_id].cancel_order(ord_id, sym)
@@ -149,7 +146,6 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
     ema50 = df_h1['close'].ewm(span=50, adjust=False).mean().iloc[-2]
     h1_c, c_prev = df_h1['close'].iloc[-2], df_m15.iloc[-2]
     sig, en, sl, tp = None, 0.0, 0.0, 0.0
-
     if h1_c > ema50 and c_prev['close'] > daily_open:
         if c_prev['low'] < df_m15['low'].iloc[-7:-2].min() and c_prev['close'] > c_prev['open']:
             en = c_prev['high'] - (0.5 * (c_prev['high'] - c_prev['low']))
@@ -168,11 +164,9 @@ def update_orders_and_positions():
             curr_price = exchanges[ex_id].fetch_ticker(sym)['last']
             n_bars, is_sim = bars + 1, str(ord_id).startswith('sim_')
             tag = " (DRY RUN)" if is_sim else ""
-
             if status == 'PENDING':
                 n_stat = 'PENDING'
-                if (side == 'BUY' and curr_price <= en) or (side == 'SELL' and curr_price >= en):
-                    n_stat = 'OPEN'; send_telegram(f"🔔 *[ORDER FILLED{tag}]* `{sym}` di {ex_id.upper()}!")
+                if (side == 'BUY' and curr_price <= en) or (side == 'SELL' and curr_price >= en): n_stat = 'OPEN'; send_telegram(f"🔔 *[ORDER FILLED{tag}]* `{sym}` di {ex_id.upper()}!")
                 elif side == 'BUY':
                     if curr_price >= tp: n_stat = 'MISSED (TP First)'
                     elif curr_price <= sl: n_stat = 'CANCELLED (SL First)'
@@ -181,7 +175,6 @@ def update_orders_and_positions():
                     if curr_price <= tp: n_stat = 'MISSED (TP First)'
                     elif curr_price >= sl: n_stat = 'CANCELLED (SL First)'
                     elif n_bars > 30: n_stat = 'INVALID (>30 Bars)'
-
                 if n_stat != 'PENDING':
                     if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
                         try: exchanges[ex_id].cancel_order(ord_id, sym)
@@ -189,7 +182,6 @@ def update_orders_and_positions():
                     send_telegram(f"⚪ *[AUTO-CANCEL{tag}]* `{sym}`\nAlasan: `{n_stat}`")
                     c.execute("UPDATE trades SET status=?, bars_count=? WHERE id=?", (n_stat, n_bars, t_id))
                 else: c.execute("UPDATE trades SET bars_count=? WHERE id=?", (n_bars, t_id))
-
             elif status == 'OPEN':
                 if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
                     c.execute("UPDATE trades SET status='CLOSED (TP)' WHERE id=?", (t_id,))
@@ -201,11 +193,17 @@ def update_orders_and_positions():
     conn.commit(); conn.close()
 
 # =================================================================
-# MARKET SCANNER
+# MARKET SCANNER & DYNAMIC PAIR FILTERING
 # =================================================================
 def scan_markets():
-    conn = sqlite3.connect(DB_FILE)
-    act_count = conn.cursor().execute("SELECT COUNT(*) FROM trades WHERE status IN ('PENDING', 'OPEN')").fetchone()[0]
+    conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+    act_count = c.execute("SELECT COUNT(*) FROM trades WHERE status IN ('PENDING', 'OPEN')").fetchone()[0]
+    
+    pair_perf = {}
+    for sym, stat in c.execute("SELECT symbol, status FROM trades WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)')").fetchall():
+        if sym not in pair_perf: pair_perf[sym] = {'w':0, 'l':0}
+        if 'TP' in stat: pair_perf[sym]['w'] += 1
+        else: pair_perf[sym]['l'] += 1
     conn.close()
 
     for ex_id, ex in exchanges.items():
@@ -219,6 +217,15 @@ def scan_markets():
                     continue
 
                 if act_count >= CONFIG['MAX_CONCURRENT_POSITIONS']: continue
+
+                # =======================================
+                # FILTER: AUTO-BLACKLIST BAD PAIRS (Pengecualian BTC/ETH)
+                # =======================================
+                if sym in pair_perf and sym not in CORE_PAIRS:
+                    tot_trades = pair_perf[sym]['w'] + pair_perf[sym]['l']
+                    if tot_trades >= CONFIG['MIN_TRADES']:
+                        wr = (pair_perf[sym]['w'] / tot_trades) * 100
+                        if wr < CONFIG['MIN_WR']: continue  # SKIP koin jelek
 
                 m15, h1, d1 = ex.fetch_ohlcv(sym,'15m',limit=50), ex.fetch_ohlcv(sym,'1h',limit=60), ex.fetch_ohlcv(sym,'1d',limit=2)
                 if not m15 or not h1 or not d1: continue
@@ -265,9 +272,7 @@ def telegram_polling():
                             conn = sqlite3.connect(DB_FILE)
                             conn.cursor().execute("UPDATE cex_settings SET api_key=?, secret=? WHERE ex_id=?", (api, sec, ex_id))
                             conn.commit(); conn.close(); reload_exchanges()
-                            send_telegram(f"✅ API Key {ex_id.upper()} disimpan!\n\n⚠️ *PENTING:* Hapus pesan ini dari chat demi keamanan!")
-                        else: send_telegram("❌ Bursa tidak valid! (bingx/bybit/bitget/binance)")
-                    
+                            send_telegram(f"✅ API Key {ex_id.upper()} disimpan!\n⚠️ *Hapus pesan API kamu dari chat!*")
                     elif text.startswith("/cex ") and len(parts) == 3:
                         action, ex_id = parts[1].lower(), parts[2].lower()
                         if ex_id in DEFAULT_CEX and action in ['on', 'off']:
@@ -280,34 +285,57 @@ def telegram_polling():
                     elif text == "/dryrun off": CONFIG['DRY_RUN']=False; update_db_setting('dry_run',0.0); send_telegram("⚠️ *DRY RUN NONAKTIF* (Uang Asli!)")
                     elif text.startswith("/setmargin ") and len(parts)==2: CONFIG['MARGIN_PER_TRADE']=float(parts[1]); update_db_setting('margin',float(parts[1])); send_telegram(f"✅ Margin: `${parts[1]}`")
                     elif text.startswith("/setmaxpos ") and len(parts)==2: CONFIG['MAX_CONCURRENT_POSITIONS']=int(parts[1]); update_db_setting('max_pos',int(parts[1])); send_telegram(f"✅ Max Posisi: `{parts[1]}`")
+                    elif text.startswith("/setminwr ") and len(parts)==2: CONFIG['MIN_WR']=float(parts[1]); update_db_setting('min_wr',float(parts[1])); send_telegram(f"✅ Min WinRate: `{parts[1]}%`")
+                    elif text.startswith("/setmintrades ") and len(parts)==2: CONFIG['MIN_TRADES']=int(parts[1]); update_db_setting('min_trades',int(parts[1])); send_telegram(f"✅ Jatah Trade Penilaian: `{parts[1]}x`")
                     elif text.startswith("/setlev "):
                         if len(parts) == 2:
                             for ex in DEFAULT_CEX.keys(): CONFIG['LEVERAGE'][ex]=int(parts[1]); update_db_setting(f'lev_{ex}',int(parts[1]))
                             send_telegram(f"✅ Semua leverage: `{parts[1]}x`")
                         elif len(parts) == 3 and parts[1].lower() in DEFAULT_CEX:
-                            CONFIG['LEVERAGE'][parts[1].lower()]=int(parts[2]); update_db_setting(f'lev_{parts[1].lower()}',int(parts[2]))
-                            send_telegram(f"✅ Leverage {parts[1].upper()}: `{parts[2]}x`")
+                            CONFIG['LEVERAGE'][parts[1].lower()]=int(parts[2]); update_db_setting(f'lev_{parts[1].lower()}',int(parts[2])); send_telegram(f"✅ Lev {parts[1].upper()}: `{parts[2]}x`")
+                    
+                    elif text == "/pairperf":
+                        conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+                        pair_perf = {}
+                        for sym, stat in c.execute("SELECT symbol, status FROM trades WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)')").fetchall():
+                            if sym not in pair_perf: pair_perf[sym] = {'w':0, 'l':0}
+                            if 'TP' in stat: pair_perf[sym]['w'] += 1
+                            else: pair_perf[sym]['l'] += 1
+                        conn.close()
+                        
+                        gacor, blist, eval_wait = "", "", ""
+                        for sym, data in pair_perf.items():
+                            t = data['w'] + data['l']
+                            wr = (data['w'] / t) * 100
+                            is_core = sym in CORE_PAIRS
+                            core_tag = " *[CORE]*" if is_core else ""
+                            line = f"• `{sym}`{core_tag}: {data['w']}W/{data['l']}L (WR: {wr:.1f}%)\n"
+                            
+                            if t < CONFIG['MIN_TRADES']: eval_wait += line
+                            elif is_core or wr >= CONFIG['MIN_WR']: gacor += line
+                            else: blist += line
+                        
+                        msg = f"🏆 *[PERFORMA KOIN]*\nSyarat: Min {CONFIG['MIN_TRADES']} Trade, WR {CONFIG['MIN_WR']}%\n\n"
+                        msg += f"🔥 *AKTIF TRADING (Aman)*\n{gacor if gacor else 'Belum ada'}\n\n"
+                        msg += f"⏳ *EVALUASI (<{CONFIG['MIN_TRADES']} trade)*\n{eval_wait if eval_wait else 'Belum ada'}\n\n"
+                        msg += f"🗑️ *BLACKLIST (Otomatis Skip)*\n{blist if blist else 'Belum ada'}"
+                        send_telegram(msg)
+
                     elif text in ["/start", "/help"]:
-                        send_telegram("🤖 *[COMMANDS]*\n• `/setapi <cex> <api> <secret>`\n• `/cex on` | `/cex off`\n• `/dryrun on` | `/dryrun off`\n• `/posisi`\n• `/setmargin <angka>`\n• `/setlev <cex> <angka>`\n• `/setmaxpos <angka>`")
+                        send_telegram("🤖 *[COMMANDS]*\n• `/cex on` | `/cex off`\n• `/setapi <cex> <api> <secret>`\n• `/dryrun on` | `/dryrun off`\n• `/posisi` | `/stat` | `/pairperf`\n• `/setmargin` | `/setlev` | `/setmaxpos`\n• `/setminwr` | `/setmintrades`\n• `/cancelall` | `/pause` | `/resume`")
                     elif text == "/posisi":
                         conn = sqlite3.connect(DB_FILE); c = conn.cursor()
                         trades = c.execute("SELECT exchange_id, symbol, side, status, order_id FROM trades WHERE status IN ('PENDING', 'OPEN')").fetchall()
                         cex_db = c.execute("SELECT ex_id, api_key, enabled FROM cex_settings").fetchall()
                         conn.close()
                         
-                        cex_stat = ""
-                        for ex, api, en in cex_db:
-                            sts = "🟢 ON" if en else "🔴 OFF"
-                            key_sts = "✅ SET" if api else "❌ KOSONG"
-                            cex_stat += f"• {ex.upper()} [{sts}] | API: {key_sts}\n"
-
+                        cex_stat = "".join([f"• {ex.upper()} [{'🟢 ON' if en else '🔴 OFF'}] | API: {'✅ SET' if api else '❌ KOSONG'}\n" for ex, api, en in cex_db])
                         bal = "\n".join([f"• `{k.upper()}` Free: `${get_free_usdt_balance(v):.2f}`" for k,v in exchanges.items()])
                         lev = "\n".join([f"• {k.upper()}: `{v}x`" for k,v in CONFIG['LEVERAGE'].items() if any(e[0]==k and e[2]==1 for e in cex_db)])
                         mode = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL MONEY"
                         
                         m = (f"📊 *[STATUS & POSISI]*\nBot: `{'PAUSED 🛑' if IS_BOT_PAUSED else 'RUNNING 🟢'}`\nMode: `{mode}`\nSL Harian: `{daily_sl_count}/{MAX_DAILY_SL}`\n\n"
-                             f"🔌 *Status CEX:*\n{cex_stat}\n"
-                             f"⚙️ *Setting:*\n• Margin: `${CONFIG['MARGIN_PER_TRADE']}`\n• Max Pos: `{CONFIG['MAX_CONCURRENT_POSITIONS']}`\n*Leverage:*\n{lev}\n\n"
+                             f"🔌 *CEX:*\n{cex_stat}\n⚙️ *Setting:*\n• Margin: `${CONFIG['MARGIN_PER_TRADE']}`\n• Max Pos: `{CONFIG['MAX_CONCURRENT_POSITIONS']}`\n*Leverage:*\n{lev}\n\n"
                              f"💰 *Saldo:*\n{bal}\n\n📋 *Antrean:* {len(trades)}\n")
                         for t in trades: m += f"• `[{t[0].upper()}]` `{t[1]}` {'[SIM]' if str(t[4]).startswith('sim_') else ''} | `{t[2]}` | `{t[3]}`\n"
                         send_telegram(m)
