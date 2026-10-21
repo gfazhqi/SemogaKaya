@@ -65,6 +65,8 @@ daily_sl_count = 0
 last_error_time = 0
 ERROR_COOLDOWN = 300
 last_runtime_status = None
+ERROR_HISTORY = []
+ERROR_HISTORY_MAX = 50
 
 # =================================================================
 # DATABASE & SETTINGS
@@ -225,9 +227,15 @@ def send_telegram(message):
 
 
 def send_error_alert(err_msg):
-    global last_error_time
+    global last_error_time, ERROR_HISTORY
+    text = str(err_msg)[:3500]
+    ERROR_HISTORY.append({
+        'time': datetime.now(WIB).strftime('%d/%m/%Y %H:%M:%S'),
+        'message': text
+    })
+    ERROR_HISTORY = ERROR_HISTORY[-ERROR_HISTORY_MAX:]
     if time.time() - last_error_time > ERROR_COOLDOWN:
-        safe_err = html.escape(str(err_msg)[:3500])
+        safe_err = html.escape(text)
         send_telegram(f"⚠️ <b>ERROR ALERT</b>\n\n<code>{safe_err}</code>")
         last_error_time = time.time()
 
@@ -1988,77 +1996,147 @@ def api_cex_monitor():
 
 @app.route('/api/stats')
 def api_stats():
-    conn = sqlite3.connect(DB_FILE, timeout=10)
+    """Dashboard statistics from the same SQLite DB used by the bot."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        df = pd.read_sql_query(
+            "SELECT id, symbol, side, status, created_at "
+            "FROM trades WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)') "
+            "ORDER BY id ASC",
+            conn
+        )
+        conn.close()
 
-    df = pd.read_sql_query(
-        "SELECT symbol, side, status, created_at "
-        "FROM trades WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)') "
-        "ORDER BY id ASC",
-        conn
-    )
+        if df.empty:
+            return jsonify({
+                'ok': True,
+                'dates': [], 'pnl': [],
+                'win_rate': 0, 'wins': 0, 'losses': 0,
+                'total_trades': 0, 'profit_factor': 0,
+                'net_pnl': 0, 'avg_win': 0, 'avg_loss': 0,
+                'max_drawdown': 0, 'best_trade': 0, 'worst_trade': 0,
+                'recent': [], 'daily_pnl': {}, 'daily_trades': {}
+            })
 
-    conn.close()
+        margin = float(CONFIG.get('MARGIN_PER_TRADE', 2.0))
+        df['pnl_value'] = df['status'].apply(
+            lambda x: margin if x == 'CLOSED (TP)' else -margin
+        )
+        df['cum_pnl'] = df['pnl_value'].cumsum()
+        running_peak = df['cum_pnl'].cummax()
+        drawdown = running_peak - df['cum_pnl']
+        max_drawdown = float(drawdown.max()) if not drawdown.empty else 0.0
 
-    if df.empty:
+        dt = pd.to_datetime(df['created_at'], errors='coerce')
+        df['date_only'] = dt.dt.strftime('%d %b %H:%M')
+        df['day_key'] = dt.dt.strftime('%Y-%m-%d')
+
+        wins = int((df['status'] == 'CLOSED (TP)').sum())
+        losses = int((df['status'] == 'CLOSED (SL)').sum())
+        total = wins + losses
+        win_rate = round((wins / total) * 100, 1) if total else 0.0
+
+        gross_profit = float(df.loc[df['pnl_value'] > 0, 'pnl_value'].sum())
+        gross_loss = abs(float(df.loc[df['pnl_value'] < 0, 'pnl_value'].sum()))
+        profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+        avg_win = round(gross_profit / wins, 2) if wins else 0.0
+        avg_loss = round(gross_loss / losses, 2) if losses else 0.0
+        net_pnl = round(float(df['pnl_value'].sum()), 2)
+        best_trade = round(float(df['pnl_value'].max()), 2)
+        worst_trade = round(float(df['pnl_value'].min()), 2)
+
+        daily = (
+            df.dropna(subset=['day_key'])
+              .groupby('day_key', as_index=False)['pnl_value']
+              .sum()
+        )
+        daily_pnl = {
+            str(row['day_key']): round(float(row['pnl_value']), 2)
+            for _, row in daily.iterrows()
+        }
+        daily_trades = (
+            df.dropna(subset=['day_key'])
+              .groupby('day_key')
+              .size()
+              .to_dict()
+        )
+        daily_trades = {str(k): int(v) for k, v in daily_trades.items()}
+
+        recent = df.tail(10)[::-1].to_dict('records')
         return jsonify({
-            'dates': [],
-            'pnl': [],
-            'win_rate': 0,
-            'wins': 0,
-            'losses': 0,
-            'net_pnl': 0,
-            'recent': [],
-            'daily_pnl': {},
-            'daily_trades': {}
+            'ok': True,
+            'dates': df['date_only'].tolist(),
+            'pnl': df['cum_pnl'].tolist(),
+            'win_rate': win_rate,
+            'wins': wins,
+            'losses': losses,
+            'total_trades': total,
+            'profit_factor': profit_factor,
+            'net_pnl': net_pnl,
+            'avg_win': avg_win,
+            'avg_loss': avg_loss,
+            'max_drawdown': round(max_drawdown, 2),
+            'best_trade': best_trade,
+            'worst_trade': worst_trade,
+            'recent': recent,
+            'daily_pnl': daily_pnl,
+            'daily_trades': daily_trades
         })
+    except Exception as e:
+        return jsonify({
+            'ok': False,
+            'error': str(e),
+            'dates': [], 'pnl': [], 'win_rate': 0, 'wins': 0, 'losses': 0,
+            'total_trades': 0, 'profit_factor': 0, 'net_pnl': 0,
+            'avg_win': 0, 'avg_loss': 0, 'max_drawdown': 0,
+            'best_trade': 0, 'worst_trade': 0, 'recent': [],
+            'daily_pnl': {}, 'daily_trades': {}
+        }), 500
 
-    margin = CONFIG.get('MARGIN_PER_TRADE', 2.0)
-    df['pnl_value'] = df['status'].apply(
-        lambda x: margin if 'TP' in x else -margin
-    )
-    df['cum_pnl'] = df['pnl_value'].cumsum()
-    dt = pd.to_datetime(df['created_at'], errors='coerce')
-    df['date_only'] = dt.dt.strftime('%d %b %H:%M')
-    df['day_key'] = dt.dt.strftime('%Y-%m-%d')
 
-    # Daily PnL for the calendar heatmap.
-    daily = (
-        df.dropna(subset=['day_key'])
-          .groupby('day_key', as_index=False)['pnl_value']
-          .sum()
-    )
-    daily_pnl = {
-        str(row['day_key']): round(float(row['pnl_value']), 2)
-        for _, row in daily.iterrows()
-    }
-    daily_trades = (
-        df.dropna(subset=['day_key'])
-          .groupby('day_key')
-          .size()
-          .to_dict()
-    )
-    daily_trades = {str(k): int(v) for k, v in daily_trades.items()}
+@app.route('/api/trade-detail')
+def api_trade_detail():
+    """Return the latest 30 trades for the dashboard."""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        rows = conn.execute(
+            "SELECT id, exchange_id, symbol, side, entry_price, sl_price, "
+            "tp_price, order_id, bars_count, status, created_at "
+            "FROM trades ORDER BY id DESC LIMIT 30"
+        ).fetchall()
+        conn.close()
+        cols = [
+            'id', 'exchange', 'symbol', 'side', 'entry', 'sl', 'tp',
+            'order_id', 'bars', 'status', 'created_at'
+        ]
+        return jsonify({'ok': True, 'trades': [dict(zip(cols, row)) for row in rows]})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e), 'trades': []}), 500
 
-    wins = len(df[df['status'] == 'CLOSED (TP)'])
-    losses = len(df[df['status'] == 'CLOSED (SL)'])
-    total = wins + losses
 
-    win_rate = round((wins / total) * 100, 1) if total > 0 else 0
-    net_pnl = round(df['cum_pnl'].iloc[-1], 2) if not df.empty else 0
-    recent = df.tail(10)[::-1].to_dict('records')
+@app.route('/api/engine-status')
+def api_engine_status():
+    """Live engine state for the web dashboard."""
+    try:
+        return jsonify({
+            'ok': True,
+            'status': last_runtime_status or ('PAUSED' if IS_BOT_PAUSED else 'RUNNING'),
+            'paused': bool(IS_BOT_PAUSED),
+            'dry_run': bool(CONFIG.get('DRY_RUN', True)),
+            'kill_zone': bool(is_kill_zone()),
+            'active_cex': len(exchanges),
+            'daily_sl': int(daily_sl_count),
+            'max_daily_sl': int(MAX_DAILY_SL),
+            'updated': datetime.now(WIB).strftime('%d/%m/%Y %H:%M:%S')
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
-    return jsonify({
-        'dates': df['date_only'].tolist(),
-        'pnl': df['cum_pnl'].tolist(),
-        'win_rate': win_rate,
-        'wins': wins,
-        'losses': losses,
-        'net_pnl': net_pnl,
-        'recent': recent,
-        'daily_pnl': daily_pnl,
-        'daily_trades': daily_trades
-    })
 
+@app.route('/api/errors')
+def api_errors():
+    """Recent runtime errors for the dashboard Error Center."""
+    return jsonify({'ok': True, 'errors': list(reversed(ERROR_HISTORY[-20:]))})
 
 def notify_runtime_status(new_status, text):
     global last_runtime_status
