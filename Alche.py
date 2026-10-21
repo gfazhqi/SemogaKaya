@@ -9,12 +9,12 @@ import ccxt
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, jsonify
 
+# Ambil token dan chat ID dari file brankas (config.py)
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
 # =================================================================
 # CONFIGURATION & PARAMETERS
 # =================================================================
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
-
 SL_BUFFER_PERCENT = 0.0005
 MAX_DAILY_SL = 2
 DB_FILE = "trades.db"
@@ -106,7 +106,7 @@ def update_db_setting(key, value):
     conn.commit(); conn.close()
 
 # =================================================================
-# HELPERS (ANTI-BUNGKAM & AUTO DELETE)
+# HELPERS
 # =================================================================
 def send_telegram(message, reply_markup=None):
     try:
@@ -139,9 +139,6 @@ def is_kill_zone():
     h = datetime.now(WIB).hour
     return (14 <= h < 17) or (19 <= h < 22)
 
-def is_manual_alert_symbol(symbol):
-    return any(p in symbol.split(':')[0].upper() for p in MANUAL_ALERT_PAIRS)
-
 def get_free_usdt_balance(ex_instance):
     try:
         bal = ex_instance.fetch_balance()
@@ -149,6 +146,29 @@ def get_free_usdt_balance(ex_instance):
         if isinstance(usdt, dict): return float(usdt.get('free', 0.0))
         return 0.0
     except: return 0.0
+
+def get_account_identifier(ex_instance):
+    """Mencoba menarik informasi identitas akun dari bursa untuk verifikasi"""
+    try:
+        # Coba ambil data akun / profil via CCXT
+        if hasattr(ex_instance, 'private_get_account_info') or hasattr(ex_instance, 'fapiPrivateV2GetAccount'):
+            pass
+        # Cara universal di CCXT untuk beberapa bursa
+        fetch_acc = ex_instance.fetch_accounts()
+        if fetch_acc and len(fetch_acc) > 0:
+            acc_id = fetch_acc[0].get('id', 'Tersambung')
+            return f"UID/ID: {acc_id}"
+    except:
+        pass
+    
+    # Fallback: Jika endpoint akun tertutup, verifikasi via fetch_balance sukses
+    try:
+        bal = ex_instance.fetch_balance()
+        if 'info' in bal:
+            return "Terverifikasi (Akses Valid)"
+    except:
+        pass
+    return "Tersambung"
 
 def cancel_all_pending_orders_on_pause():
     try:
@@ -243,7 +263,7 @@ def scan_markets():
     for ex_id, ex in exchanges.items():
         try:
             for sym in [s for s in ex.fetch_tickers().keys() if s.endswith('/USDT:USDT') or s.endswith('/USDT')][:60]:
-                if is_manual_alert_symbol(sym):
+                if any(p in sym for p in MANUAL_ALERT_PAIRS):
                     m15, h1, d1 = ex.fetch_ohlcv(sym,'15m',limit=50), ex.fetch_ohlcv(sym,'1h',limit=60), ex.fetch_ohlcv(sym,'1d',limit=2)
                     if m15 and h1 and d1:
                         sig, en, sl, tp = analyze_smc_retrace(pd.DataFrame(m15, columns=['time','open','high','low','close','vol']), pd.DataFrame(h1, columns=['time','open','high','low','close','vol']), d1[-1][1])
@@ -330,10 +350,15 @@ def telegram_polling():
                         try:
                             test_ex = getattr(ccxt, ex_id)({'apiKey': api_key, 'secret': secret_key, 'options': {'defaultType': DEFAULT_CEX[ex_id]['type']}, 'enableRateLimit': False, 'timeout': 5000})
                             test_ex.fetch_balance()
+                            
+                            # Ambil info identitas akun untuk verifikasi validasi
+                            acc_info = get_account_identifier(test_ex)
+
                             conn = sqlite3.connect(DB_FILE)
                             conn.cursor().execute("UPDATE cex_settings SET api_key=?, secret=? WHERE ex_id=?", (api_key, secret_key, ex_id))
                             conn.commit(); conn.close(); reload_exchanges()
-                            send_telegram(f"✅ <b>SUKSES!</b>\nAPI Key {ex_id.upper()} tervalidasi dan berhasil ditautkan.")
+                            
+                            send_telegram(f"✅ <b>SUKSES TERTANAM!</b>\nAPI Key {ex_id.upper()} berhasil divalidasi.\n👤 <b>Status Akun:</b> <code>{acc_info}</code>")
                         except Exception as e: send_telegram(f"❌ <b>API INVALID</b>\nGagal menghubungkan.\nError: <code>{e}</code>")
                         continue
 
@@ -343,11 +368,10 @@ def telegram_polling():
                     if text.startswith("/"):
                         if not text.startswith("/setapi"): SETUP_STATE["status"] = "IDLE"
                             
-                        # MENU UTAMA
                         if text in ["/start", "/help", "/menu"]:
                             keyboard = {
                                 "inline_keyboard": [
-                                    [{"text": "📊 Posisi", "callback_data": "/posisi"}, {"text": "⚙️ Info Setting", "callback_data": "/setting"}],
+                                    [{"text": "📊 Posisi & Akun", "callback_data": "/posisi"}, {"text": "⚙️ Info Setting", "callback_data": "/setting"}],
                                     [{"text": "🔑 Setup API", "callback_data": "/menu_api"}, {"text": "🔌 Nyalakan CEX", "callback_data": "/menu_cex"}],
                                     [{"text": "📈 Statistik", "callback_data": "/stat"}, {"text": "🏆 Performa", "callback_data": "/pairperf"}],
                                     [{"text": "🎚️ Set Lev/Margin", "callback_data": "/menu_margin"}, {"text": "🔄 Simulasi/Real", "callback_data": "/dryrun_toggle"}],
@@ -356,7 +380,6 @@ def telegram_polling():
                             }
                             send_telegram("🤖 <b>ALCHEMIST CONTROL PANEL</b>\nPilih menu di bawah ini:", reply_markup=keyboard)
                             
-                        # SUB-MENU API
                         elif text == "/menu_api":
                             kb = {"inline_keyboard": [
                                 [{"text": "BingX", "callback_data": "/setapi bingx"}, {"text": "Bitget", "callback_data": "/setapi bitget"}],
@@ -364,7 +387,6 @@ def telegram_polling():
                             ]}
                             send_telegram("🔑 <b>Pilih Bursa untuk Setup API:</b>", reply_markup=kb)
 
-                        # SUB-MENU ON/OFF CEX
                         elif text == "/menu_cex":
                             kb = {"inline_keyboard": [
                                 [{"text": "🟢 ON BingX", "callback_data": "/cex on bingx"}, {"text": "🔴 OFF BingX", "callback_data": "/cex off bingx"}],
@@ -374,18 +396,8 @@ def telegram_polling():
                             ]}
                             send_telegram("🔌 <b>Pilih Bursa yang mau dinyalakan/dimatikan:</b>", reply_markup=kb)
 
-                        # SUB-MENU LEVERAGE & MARGIN
                         elif text == "/menu_margin":
-                            msg_text = ("🎚️ <b>PENGATURAN MARGIN & LEVERAGE</b>\n\n"
-                                   "Karena butuh angka spesifik, silakan balas dengan mengetik perintah ini:\n\n"
-                                   "<b>1. Ubah Leverage:</b>\n"
-                                   "<code>/setlev bingx 50</code> (khusus BingX)\n"
-                                   "<code>/setlev 50</code> (semua bursa)\n\n"
-                                   "<b>2. Ubah Margin per Trade:</b>\n"
-                                   "<code>/setmargin 5.0</code> (artinya $5)\n\n"
-                                   "<b>3. Ubah Max Posisi:</b>\n"
-                                   "<code>/setmaxpos 3</code> (maksimal 3 posisi bersamaan)")
-                            send_telegram(msg_text)
+                            send_telegram("🎚️ <b>PENGATURAN MARGIN & LEVERAGE</b>\n\n<b>1. Ubah Leverage:</b>\n<code>/setlev bingx 50</code> (khusus BingX)\n<code>/setlev 50</code> (semua bursa)\n\n<b>2. Ubah Margin:</b>\n<code>/setmargin 5.0</code> (artinya $5)\n\n<b>3. Ubah Max Posisi:</b>\n<code>/setmaxpos 3</code>")
 
                         elif text.startswith("/setapi"):
                             if "callback_query" in r: delete_telegram_message(msg_id)
@@ -462,17 +474,28 @@ def telegram_polling():
                                 cex_db = c.execute("SELECT ex_id, api_key, enabled FROM cex_settings").fetchall()
                                 conn.close()
                                 
-                                cex_stat = "".join([f"• {ex.upper()} {'🟢 ON' if en else '🔴 OFF'}\n" for ex, api, en in cex_db])
+                                cex_stat = ""
                                 bal = ""
-                                for k, v in exchanges.items():
-                                    try:
-                                        b = get_free_usdt_balance(v)
-                                        bal += f"• {k.upper()} Free: ${b:.2f}\n"
-                                    except: bal += f"• {k.upper()} Free: Error/Timeout\n"
-                                if not bal: bal = "• Saldo: Tidak ada CEX aktif"
+                                for ex_name, api_val, en_val in cex_db:
+                                    status_icon = "🟢 ON" if en_val else "🔴 OFF"
+                                    cex_stat += f"• {ex_name.upper()} {status_icon}\n"
+                                    
+                                    # Jika bursa aktif, cek identitas dan saldonya
+                                    if en_val and ex_name in exchanges:
+                                        try:
+                                            b = get_free_usdt_balance(exchanges[ex_name])
+                                            acc_tag = get_account_identifier(exchanges[ex_name])
+                                            bal += f"• <b>{ex_name.upper()}</b> (${b:.2f})\n  └ <code>{acc_tag}</code>\n"
+                                        except:
+                                            bal += f"• <b>{ex_name.upper()}</b>: Error/Timeout\n"
+
+                                if not bal: bal = "• Tidak ada CEX aktif"
+
+                                kz_status = "🔍 SCANNING (Kill Zone)" if is_kill_zone() else "💤 STANDBY (Luar jam)"
+                                if IS_BOT_PAUSED: kz_status = "🛑 PAUSED"
 
                                 mode = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL"
-                                m = f"📊 <b>STATUS & POSISI</b>\nBot: {'PAUSED' if IS_BOT_PAUSED else 'RUNNING'} | Mode: {mode}\n\n🔌 <b>CEX:</b>\n{cex_stat}\n💰 <b>SALDO:</b>\n{bal}\n📋 <b>ANTREAN:</b> {len(trades)}\n"
+                                m = f"📊 <b>STATUS & AKUN TERBIND</b>\nMesin: {'PAUSED 🛑' if IS_BOT_PAUSED else 'RUNNING 🟢'}\nAktivitas: {kz_status}\nMode: {mode}\n\n🔌 <b>STATUS CEX:</b>\n{cex_stat}\n👤 <b>DETAIL AKUN & SALDO:</b>\n{bal}\n📋 <b>ANTREAN TRADING:</b> {len(trades)}\n"
                                 for t in trades: m += f"• {t[0].upper()} | {t[1]} | {t[2]} | {t[3]}\n"
                                 send_telegram(m)
                             except Exception as e: send_telegram(f"⚠️ ERROR POSISI: {e}")
@@ -525,7 +548,13 @@ def main_loop():
                 global daily_sl_count, IS_BOT_PAUSED
                 daily_sl_count = 0
                 if IS_BOT_PAUSED: IS_BOT_PAUSED = False; send_telegram("🌅 <b>NEW DAY RESET</b>")
-            if time.time() - last_hb >= 21600: send_telegram("💓 <b>PING</b> Sistem normal."); last_hb = time.time()
+            
+            # PING JANTUNG OTOMATIS
+            if time.time() - last_hb >= 21600: 
+                act = "SCANNING" if is_kill_zone() else "STANDBY"
+                send_telegram(f"💓 <b>PING</b> Sistem normal. Aktivitas saat ini: {act}")
+                last_hb = time.time()
+
             check_and_update_daily_sl()
             update_orders_and_positions()
             if not IS_BOT_PAUSED and is_kill_zone(): scan_markets()
