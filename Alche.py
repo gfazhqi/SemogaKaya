@@ -814,21 +814,40 @@ def _fmt_uptime(seconds):
     return f"{h:02d}h {m:02d}m"
 
 
-def build_runtime_status_text():
+def build_runtime_status_text(user_id='OWNER'):
+    # VIP can see runtime/account status, but the internal strategy is Owner-only.
+    is_vip_view = str(user_id) != 'OWNER'
     mode = '🧪 DRY RUN' if CONFIG.get('DRY_RUN', True) else '⚠️ REAL'
     engine = '⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'
     kill = '🟢 ACTIVE' if is_kill_zone() else '🔴 INACTIVE'
-    pending = db_read("SELECT COUNT(*) FROM trades WHERE status='PENDING'")[0][0]
-    opened = db_read("SELECT COUNT(*) FROM trades WHERE status='OPEN'")[0][0]
-    total_today = db_read(
-        "SELECT COUNT(*) FROM trades WHERE created_at >= date('now','start of day')"
-    )[0][0]
+    if is_vip_view:
+        pending = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? AND status='PENDING'",
+            (str(user_id),)
+        )[0][0]
+        opened = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? AND status='OPEN'",
+            (str(user_id),)
+        )[0][0]
+        total_today = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? AND created_at >= date('now','start of day')",
+            (str(user_id),)
+        )[0][0]
+    else:
+        pending = db_read("SELECT COUNT(*) FROM trades WHERE status='PENDING'")[0][0]
+        opened = db_read("SELECT COUNT(*) FROM trades WHERE status='OPEN'")[0][0]
+        total_today = db_read(
+            "SELECT COUNT(*) FROM trades WHERE created_at >= date('now','start of day')"
+        )[0][0]
     lines = [
         "🤖 <b>ALCHEMIST — RUNTIME STATUS</b>",
         "",
         f"{engine} | {mode}",
         f"⏱ Uptime: {_fmt_uptime(time.time() - BOT_STARTED_AT)}",
-        f"🧠 Strategy: SMC M15 + H1 EMA50 + Daily Open",
+    ]
+    if not is_vip_view:
+        lines.append("🧠 Strategy: SMC M15 + H1 EMA50 + Daily Open")
+    lines += [
         f"🕐 Kill Zone: {kill}",
         "",
         "🔎 <b>SCANNER PER CEX</b>",
@@ -2220,7 +2239,7 @@ async def send_main_menu(message: Message, delete_trigger: bool = False):
     sent = await bot.send_message(
         chat_id=chat_id,
         text="🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:",
-        reply_markup=main_keyboard()
+        reply_markup=main_keyboard(message)
     )
     LAST_MENU_MESSAGE[chat_id] = sent.message_id
     return sent
@@ -3431,7 +3450,11 @@ async def cb_runtime_status(callback: CallbackQuery):
     if not is_allowed_chat(callback):
         return
     await safe_answer(callback)
-    await callback.message.edit_text(build_runtime_status_text(), reply_markup=runtime_status_keyboard())
+    user_id = _account_user_id(callback.message.chat.id)
+    await callback.message.edit_text(
+        build_runtime_status_text(user_id),
+        reply_markup=runtime_status_keyboard()
+    )
 
 
 @dp.callback_query(F.data == "bot_control")
