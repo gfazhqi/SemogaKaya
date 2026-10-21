@@ -6,6 +6,7 @@ import threading
 import pandas as pd
 import requests
 import ccxt
+import json
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, jsonify
 
@@ -13,7 +14,7 @@ from flask import Flask, render_template, jsonify
 # CONFIGURATION & PARAMETERS
 # =================================================================
 TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "8978274770"
+TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
 
 SL_BUFFER_PERCENT = 0.0005
 MAX_DAILY_SL = 2
@@ -106,21 +107,28 @@ def update_db_setting(key, value):
     conn.commit(); conn.close()
 
 # =================================================================
-# HELPERS (ANTI-BUNGKAM & AUTO DELETE)
+# HELPERS (DENGAN DUKUNGAN INLINE KEYBOARD)
 # =================================================================
-def send_telegram(message):
+def send_telegram(message, reply_markup=None):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
         r = requests.post(url, json=payload, timeout=5)
         if r.status_code != 200:
-            payload.pop("parse_mode")
+            payload.pop("parse_mode", None)
             requests.post(url, json=payload, timeout=5)
     except: pass
 
 def delete_telegram_message(message_id):
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteMessage", json={"chat_id": TELEGRAM_CHAT_ID, "message_id": message_id}, timeout=5)
+    except: pass
+
+def answer_callback(callback_id):
+    try:
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery?callback_query_id={callback_id}", timeout=3)
     except: pass
 
 def send_error_alert(err_msg):
@@ -277,79 +285,82 @@ def scan_markets():
         except Exception as e: send_error_alert(f"Scan Ex [{ex_id}]: {e}")
 
 # =================================================================
-# TELEGRAM POLLING & STATE MACHINE
+# TELEGRAM POLLING & CALLBACK QUERIES
 # =================================================================
 def telegram_polling():
+    global IS_BOT_PAUSED
     last_id = 0
     while True:
         try:
             res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={last_id+1}&timeout=5", timeout=10).json()
             if res.get("ok"):
                 for r in res.get("result", []):
-                    last_id, msg = r["update_id"], r.get("message", {})
-                    if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID): continue
+                    last_id = r["update_id"]
                     
-                    text = msg.get("text", "").strip()
-                    msg_id = msg.get("message_id")
+                    text, msg_id = "", ""
+                    
+                    # 1. TANGKAP TOMBOL YANG DIPENCET (CALLBACK QUERY)
+                    if "callback_query" in r:
+                        cb = r["callback_query"]
+                        msg = cb.get("message", {})
+                        if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID): continue
+                        
+                        text = cb.get("data", "") # Isi teks tersembunyi dari tombol (misal: /posisi)
+                        msg_id = msg.get("message_id")
+                        answer_callback(cb["id"]) # Matikan animasi loading di tombol
+                        
+                    # 2. TANGKAP PESAN KETIKAN BIASA
+                    elif "message" in r:
+                        msg = r["message"]
+                        if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID): continue
+                        text = msg.get("text", "").strip()
+                        msg_id = msg.get("message_id")
+                    
+                    else: continue
+                    
                     parts = text.split(" ")
 
                     # -------------------------------------------------------------
-                    # STATE MACHINE: INTERACTIVE API SETUP & AUTO DELETE
+                    # STATE MACHINE: INTERACTIVE API SETUP
                     # -------------------------------------------------------------
                     if SETUP_STATE["status"] == "AWAITING_API" and not text.startswith("/"):
-                        delete_telegram_message(msg_id) # Hapus balasan API dari layar
+                        delete_telegram_message(msg_id)
                         SETUP_STATE["api"] = text
                         SETUP_STATE["status"] = "AWAITING_SECRET"
-                        send_telegram(f"🔐 <b>API Key diterima!</b>\n\nSekarang, silakan ketik dan kirimkan <b>Secret Key</b> untuk {SETUP_STATE['cex'].upper()}:")
+                        send_telegram(f"🔐 <b>API Key diterima!</b>\n\nSekarang ketik dan kirimkan <b>Secret Key</b> untuk {SETUP_STATE['cex'].upper()}:")
                         continue
                         
                     elif SETUP_STATE["status"] == "AWAITING_SECRET" and not text.startswith("/"):
-                        delete_telegram_message(msg_id) # Hapus balasan Secret dari layar
-                        api_key = SETUP_STATE["api"]
-                        secret_key = text
-                        ex_id = SETUP_STATE["cex"]
-                        SETUP_STATE["status"] = "IDLE" # Reset State
-                        
-                        send_telegram(f"⏳ <b>Memvalidasi Koneksi ke {ex_id.upper()}...</b>\nMohon tunggu...")
-                        
+                        delete_telegram_message(msg_id)
+                        api_key, secret_key, ex_id = SETUP_STATE["api"], text, SETUP_STATE["cex"]
+                        SETUP_STATE["status"] = "IDLE"
+                        send_telegram(f"⏳ <b>Memvalidasi Koneksi ke {ex_id.upper()}...</b>")
                         try:
-                            # Strict Validation Check
-                            test_ex = getattr(ccxt, ex_id)({
-                                'apiKey': api_key, 'secret': secret_key, 
-                                'options': {'defaultType': DEFAULT_CEX[ex_id]['type']}, 
-                                'enableRateLimit': False, 'timeout': 5000
-                            })
-                            test_ex.fetch_balance() # Jika gagal tembus, auto lempar exception
-                            
-                            # Jika tembus, save ke DB
+                            test_ex = getattr(ccxt, ex_id)({'apiKey': api_key, 'secret': secret_key, 'options': {'defaultType': DEFAULT_CEX[ex_id]['type']}, 'enableRateLimit': False, 'timeout': 5000})
+                            test_ex.fetch_balance()
                             conn = sqlite3.connect(DB_FILE)
                             conn.cursor().execute("UPDATE cex_settings SET api_key=?, secret=? WHERE ex_id=?", (api_key, secret_key, ex_id))
                             conn.commit(); conn.close(); reload_exchanges()
-                            
-                            send_telegram(f"✅ <b>SUKSES!</b>\nAPI Key {ex_id.upper()} tervalidasi dan berhasil ditautkan ke Bot.\n\n<i>(Pesan API & Secret Key kamu telah otomatis dihapus oleh sistem)</i>")
-                        except Exception as e:
-                            send_telegram(f"❌ <b>API INVALID / DITOLAK</b>\nGagal menghubungkan ke server {ex_id.upper()}.\nPastikan ketikan benar dan izin 'Reading' & 'Trading' sudah dicentang.\n\nError Msg: <code>{e}</code>")
+                            send_telegram(f"✅ <b>SUKSES!</b>\nAPI Key {ex_id.upper()} tervalidasi dan berhasil ditautkan.")
+                        except Exception as e: send_telegram(f"❌ <b>API INVALID</b>\nGagal menghubungkan.\nError: <code>{e}</code>")
                         continue
 
                     # -------------------------------------------------------------
                     # NORMAL COMMANDS
                     # -------------------------------------------------------------
                     if text.startswith("/"):
-                        if not text.startswith("/setapi"):
-                            SETUP_STATE["status"] = "IDLE" # Reset jika user malah ketik command lain
+                        if not text.startswith("/setapi"): SETUP_STATE["status"] = "IDLE"
                             
                         if text.startswith("/setapi"):
-                            delete_telegram_message(msg_id) # Hapus command /setapi dari chat history
+                            delete_telegram_message(msg_id)
                             if len(parts) == 2:
                                 ex_id = parts[1].lower()
                                 if ex_id in DEFAULT_CEX:
                                     SETUP_STATE["status"] = "AWAITING_API"
                                     SETUP_STATE["cex"] = ex_id
-                                    send_telegram(f"🔧 <b>SETUP API UNTUK {ex_id.upper()}</b>\n\nSilakan ketik dan kirimkan <b>API Key</b> kamu sekarang:\n\n<i>(Tenang, pesan kamu akan dihancurkan secara otomatis setelah masuk)</i>")
-                                else:
-                                    send_telegram(f"⚠️ Bursa tidak didukung. Pilihan: {', '.join(DEFAULT_CEX.keys())}")
-                            else:
-                                send_telegram("⚠️ Gunakan format: <code>/setapi namabursa</code>\nContoh: <code>/setapi bingx</code>")
+                                    send_telegram(f"🔧 <b>SETUP API {ex_id.upper()}</b>\nKirimkan <b>API Key</b> kamu sekarang:")
+                                else: send_telegram(f"⚠️ Pilihan: {', '.join(DEFAULT_CEX.keys())}")
+                            else: send_telegram("⚠️ Gunakan format: <code>/setapi bingx</code>")
                         
                         elif text.startswith("/cex ") and len(parts) == 3:
                             action, ex_id = parts[1].lower(), parts[2].lower()
@@ -359,18 +370,14 @@ def telegram_polling():
                                 conn.commit(); conn.close(); reload_exchanges()
                                 send_telegram(f"✅ CEX {ex_id.upper()} di-{action.upper()}!")
 
-                        elif text == "/dryrun on": CONFIG['DRY_RUN']=True; update_db_setting('dry_run',1.0); send_telegram("✅ <b>DRY RUN AKTIF</b>")
-                        elif text == "/dryrun off": CONFIG['DRY_RUN']=False; update_db_setting('dry_run',0.0); send_telegram("⚠️ <b>REAL MONEY AKTIF</b>")
+                        elif text == "/dryrun_toggle": 
+                            CONFIG['DRY_RUN'] = not CONFIG['DRY_RUN']
+                            update_db_setting('dry_run', 1.0 if CONFIG['DRY_RUN'] else 0.0)
+                            send_telegram("✅ <b>DRY RUN AKTIF</b>" if CONFIG['DRY_RUN'] else "⚠️ <b>REAL MONEY AKTIF</b>")
+
                         elif text.startswith("/setmargin ") and len(parts)==2: CONFIG['MARGIN_PER_TRADE']=float(parts[1]); update_db_setting('margin',float(parts[1])); send_telegram(f"✅ Margin: ${parts[1]}")
                         elif text.startswith("/setmaxpos ") and len(parts)==2: CONFIG['MAX_CONCURRENT_POSITIONS']=int(parts[1]); update_db_setting('max_pos',int(parts[1])); send_telegram(f"✅ Max Posisi: {parts[1]}")
                         elif text.startswith("/setminwr ") and len(parts)==2: CONFIG['MIN_WR']=float(parts[1]); update_db_setting('min_wr',float(parts[1])); send_telegram(f"✅ Min WinRate: {parts[1]}%")
-                        elif text.startswith("/setmintrades ") and len(parts)==2: CONFIG['MIN_TRADES']=int(parts[1]); update_db_setting('min_trades',int(parts[1])); send_telegram(f"✅ Min Trade: {parts[1]}x")
-                        elif text.startswith("/setlev "):
-                            if len(parts) == 2:
-                                for ex in DEFAULT_CEX.keys(): CONFIG['LEVERAGE'][ex]=int(parts[1]); update_db_setting(f'lev_{ex}',int(parts[1]))
-                                send_telegram(f"✅ Semua leverage: {parts[1]}x")
-                            elif len(parts) == 3 and parts[1].lower() in DEFAULT_CEX:
-                                CONFIG['LEVERAGE'][parts[1].lower()]=int(parts[2]); update_db_setting(f'lev_{parts[1].lower()}',int(parts[2])); send_telegram(f"✅ Lev {parts[1].upper()}: {parts[2]}x")
                         
                         elif text == "/pairperf":
                             conn = sqlite3.connect(DB_FILE); c = conn.cursor()
@@ -404,11 +411,18 @@ def telegram_polling():
                                 cex_info = "".join([f"• {ex.upper()}: {'🟢 ON' if en else '🔴 OFF'} | Lev: {CONFIG['LEVERAGE'].get(ex, 50)}x | API: {'✅' if api else '❌'}\n" for ex, api, en in cex_db])
                                 msg = f"⚙️ <b>SETTING BOT</b>\n\nMode: {mode_text}\nMargin: ${CONFIG['MARGIN_PER_TRADE']}\nMax Pos: {CONFIG['MAX_CONCURRENT_POSITIONS']}\n\n<b>BURSA:</b>\n{cex_info or 'Belum ada'}"
                                 send_telegram(msg)
-                            except Exception as e:
-                                send_telegram(f"⚠️ ERROR: {e}")
+                            except Exception as e: send_telegram(f"⚠️ ERROR: {e}")
 
-                        elif text in ["/start", "/help"]:
-                            send_telegram("🤖 <b>COMMANDS</b>\n• /cex on/off | /setapi <namabursa>\n• /dryrun on/off\n• /posisi | /setting | /stat | /pairperf\n• /setmargin | /setlev | /setmaxpos")
+                        # FITUR UTAMA INLINE KEYBOARD (CONTROL PANEL)
+                        elif text in ["/start", "/help", "/menu"]:
+                            keyboard = {
+                                "inline_keyboard": [
+                                    [{"text": "📊 Posisi", "callback_data": "/posisi"}, {"text": "⚙️ Setting", "callback_data": "/setting"}],
+                                    [{"text": "📈 Statistik", "callback_data": "/stat"}, {"text": "🏆 Performa Koin", "callback_data": "/pairperf"}],
+                                    [{"text": "🔄 Mode Simulasi", "callback_data": "/dryrun_toggle"}, {"text": "⏸️ Pause/Resume", "callback_data": "/pause_toggle"}]
+                                ]
+                            }
+                            send_telegram("🤖 <b>ALCHEMIST CONTROL PANEL</b>\nPilih menu di bawah ini:", reply_markup=keyboard)
                         
                         elif text == "/posisi":
                             try:
@@ -418,27 +432,25 @@ def telegram_polling():
                                 conn.close()
                                 
                                 cex_stat = "".join([f"• {ex.upper()} {'🟢 ON' if en else '🔴 OFF'}\n" for ex, api, en in cex_db])
-                                
                                 bal = ""
                                 for k, v in exchanges.items():
                                     try:
                                         b = get_free_usdt_balance(v)
                                         bal += f"• {k.upper()} Free: ${b:.2f}\n"
-                                    except:
-                                        bal += f"• {k.upper()} Free: Error/Timeout\n"
+                                    except: bal += f"• {k.upper()} Free: Error/Timeout\n"
                                 if not bal: bal = "• Saldo: Tidak ada CEX aktif"
 
                                 mode = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL"
                                 m = f"📊 <b>STATUS & POSISI</b>\nBot: {'PAUSED' if IS_BOT_PAUSED else 'RUNNING'} | Mode: {mode}\n\n🔌 <b>CEX:</b>\n{cex_stat}\n💰 <b>SALDO:</b>\n{bal}\n📋 <b>ANTREAN:</b> {len(trades)}\n"
-                                for t in trades: 
-                                    m += f"• {t[0].upper()} | {t[1]} | {t[2]} | {t[3]}\n"
+                                for t in trades: m += f"• {t[0].upper()} | {t[1]} | {t[2]} | {t[3]}\n"
                                 send_telegram(m)
-                            except Exception as e:
-                                send_telegram(f"⚠️ ERROR POSISI: {e}")
+                            except Exception as e: send_telegram(f"⚠️ ERROR POSISI: {e}")
 
-                        elif text == "/pause": IS_BOT_PAUSED = True; send_telegram("⏸️ Paused")
-                        elif text == "/resume": IS_BOT_PAUSED = False; send_telegram("▶️ Resumed")
-                        elif text == "/cancelall": cancel_all_pending_orders_on_pause()
+                        elif text == "/pause_toggle":
+                            IS_BOT_PAUSED = not IS_BOT_PAUSED
+                            status = "⏸️ PAUSED" if IS_BOT_PAUSED else "▶️ RESUMED"
+                            send_telegram(f"Sistem sekarang: <b>{status}</b>")
+                        
                         elif text == "/stat":
                             conn = sqlite3.connect(DB_FILE)
                             stats = "\n".join([f"• {s[0]}: {s[1]}" for s in conn.cursor().execute("SELECT status, COUNT(*) FROM trades GROUP BY status").fetchall()])
@@ -453,8 +465,7 @@ def telegram_polling():
 app = Flask(__name__, template_folder='templates')
 
 @app.route('/')
-def dashboard():
-    return render_template('index.html')
+def dashboard(): return render_template('index.html')
 
 @app.route('/api/stats')
 def api_stats():
@@ -471,7 +482,7 @@ def api_stats():
     win_rate = round((wins / total) * 100, 1) if total > 0 else 0
     net_pnl = round(df['cum_pnl'].iloc[-1], 2) if not df.empty else 0
     recent = df.tail(10)[::-1].to_dict('records')
-    return jsonify({'dates': df['date_only'].tolist(), 'pnl': df['cum_pnl'].tolist(), 'win_rate': win_rate, 'wins': losses, 'losses': losses, 'net_pnl': net_pnl, 'recent': recent})
+    return jsonify({'dates': df['date_only'].tolist(), 'pnl': df['cum_pnl'].tolist(), 'win_rate': win_rate, 'wins': wins, 'losses': losses, 'net_pnl': net_pnl, 'recent': recent})
 
 def main_loop():
     last_hb = time.time()
