@@ -148,6 +148,15 @@ def init_db():
         key TEXT PRIMARY KEY,
         value REAL
     )''')
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS vip_members (
+            telegram_id TEXT PRIMARY KEY,
+            username TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            expires_at TEXT,
+            added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     c.execute('''CREATE TABLE IF NOT EXISTS cex_settings (
         ex_id TEXT PRIMARY KEY,
         api_key TEXT,
@@ -1481,28 +1490,95 @@ BACKUP_DIR = Path("backups")
 BACKUP_DIR.mkdir(exist_ok=True)
 
 
+def _chat_id(obj):
+    chat = obj.chat if hasattr(obj, 'chat') else obj.message.chat
+    return str(chat.id)
+
+def is_owner(obj):
+    return _chat_id(obj) == str(TELEGRAM_CHAT_ID)
+
+def get_vip_member(chat_id):
+    rows = db_read(
+        "SELECT telegram_id, username, status, expires_at FROM vip_members WHERE telegram_id=?",
+        (str(chat_id),)
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    if row[2] != 'ACTIVE':
+        return None
+    if row[3]:
+        try:
+            if datetime.fromisoformat(row[3]) <= datetime.now(WIB):
+                db_write("UPDATE vip_members SET status='EXPIRED' WHERE telegram_id=?", (str(chat_id),))
+                return None
+        except Exception:
+            pass
+    return {
+        'telegram_id': row[0],
+        'username': row[1] or '',
+        'status': row[2],
+        'expires_at': row[3]
+    }
+
+def is_vip(obj):
+    return get_vip_member(_chat_id(obj)) is not None
+
+def user_role(obj):
+    if is_owner(obj):
+        return 'OWNER'
+    if is_vip(obj):
+        return 'VIP'
+    return None
+
 def is_allowed_chat(message_or_callback):
-    chat = message_or_callback.chat if hasattr(message_or_callback, 'chat') else message_or_callback.message.chat
-    return str(chat.id) == str(TELEGRAM_CHAT_ID)
+    return user_role(message_or_callback) is not None
 
+def require_owner(obj):
+    return is_owner(obj)
 
-def main_keyboard():
-    # Tombol dibuat 1 baris penuh agar lebih besar dan mudah disentuh di HP.
-    # Telegram tidak menyediakan API untuk mengubah warna background inline button,
-    # jadi status/warna divisualisasikan dengan emoji.
+def owner_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions")],
-        [InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
-        [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings")],
-        [InlineKeyboardButton(text="🏆 PAIR PERFORMANCE", callback_data="pairperf")],
-        [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status")],
-        [InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
-        [InlineKeyboardButton(text="💾 BACKUP / RESTORE", callback_data="backup_menu")],
+        [InlineKeyboardButton(text="👥 MANAGE VIP", callback_data="owner_vip")],
+        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"),
+         InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
+        [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings"),
+         InlineKeyboardButton(text="🏦 CEX", callback_data="cex_status")],
         [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
-        [InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")],
+        [InlineKeyboardButton(text="⏯ BOT CONTROL", callback_data="bot_control")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
     ])
+
+def vip_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"),
+         InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
+        [InlineKeyboardButton(text="💎 VIP SETTINGS", callback_data="vip_settings")],
+        [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
+        [InlineKeyboardButton(text="⏯ AUTO TRADE", callback_data="vip_auto_trade")],
+        [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
+        [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
+    ])
+
+def role_keyboard(obj):
+    return owner_keyboard() if is_owner(obj) else vip_keyboard()
+
+def vip_management_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ ADD VIP", callback_data="vip_add")],
+        [InlineKeyboardButton(text="👤 LIST VIP", callback_data="vip_list")],
+        [InlineKeyboardButton(text="⏳ EXTEND VIP", callback_data="vip_extend")],
+        [InlineKeyboardButton(text="🚫 REMOVE VIP", callback_data="vip_remove")],
+        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
+    ])
+
+PENDING_VIP_ACTION = {}
+
+def main_keyboard(obj=None):
+    if obj is not None:
+        return role_keyboard(obj)
+    return owner_keyboard()
 
 
 def bot_control_keyboard():
@@ -2191,7 +2267,7 @@ async def cb_restore_cancel(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     PENDING_RESTORE.discard(callback.message.chat.id)
     await safe_answer(callback, "Restore dibatalkan")
-    await callback.message.edit_text("🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:", reply_markup=main_keyboard())
+    await callback.message.edit_text("🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:", reply_markup=role_keyboard(message))
 
 
 @dp.message(F.document)
@@ -2236,9 +2312,9 @@ async def handle_restore_document(message: Message):
                 reply_markup=main_keyboard()
             )
         else:
-            await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(detail))}</code>", reply_markup=main_keyboard())
+            await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(detail))}</code>", reply_markup=role_keyboard(callback))
     except Exception as e:
-        await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(e))}</code>", reply_markup=main_keyboard())
+        await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(e))}</code>", reply_markup=role_keyboard(callback))
     finally:
         for cleanup_path in (temp_path, downloaded_path):
             try: cleanup_path.unlink()
@@ -2299,7 +2375,7 @@ async def cmd_restore(message: Message):
 async def cmd_settings(message: Message):
     if not is_allowed_chat(message):
         return
-    await message.answer(build_settings_text(), reply_markup=main_keyboard())
+    await message.answer(build_settings_text(), reply_markup=role_keyboard(callback))
 
 
 @dp.message(Command("posisi"))
@@ -2313,14 +2389,14 @@ async def cmd_posisi(message: Message):
 async def cmd_stat(message: Message):
     if not is_allowed_chat(message):
         return
-    await message.answer(build_stats_text(), reply_markup=main_keyboard())
+    await message.answer(build_stats_text(), reply_markup=role_keyboard(callback))
 
 
 @dp.message(Command("pairperf"))
 async def cmd_pairperf(message: Message):
     if not is_allowed_chat(message):
         return
-    await message.answer(build_pairperf_text(), reply_markup=main_keyboard())
+    await message.answer(build_pairperf_text(), reply_markup=role_keyboard(callback))
 
 
 @dp.message(Command("pause"))
@@ -2329,7 +2405,7 @@ async def cmd_pause(message: Message):
     if not is_allowed_chat(message):
         return
     IS_BOT_PAUSED = True
-    await message.answer("⏸️ <b>Bot PAUSED</b>", reply_markup=main_keyboard())
+    await message.answer("⏸️ <b>Bot PAUSED</b>", reply_markup=role_keyboard(callback))
 
 
 @dp.message(Command("resume"))
@@ -2338,7 +2414,7 @@ async def cmd_resume(message: Message):
     if not is_allowed_chat(message):
         return
     IS_BOT_PAUSED = False
-    await message.answer("▶️ <b>Bot RESUMED</b>", reply_markup=main_keyboard())
+    await message.answer("▶️ <b>Bot RESUMED</b>", reply_markup=role_keyboard(callback))
 
 
 @dp.message(Command("cancelall"))
@@ -2346,7 +2422,7 @@ async def cmd_cancelall(message: Message):
     if not is_allowed_chat(message):
         return
     cancel_all_pending_orders_on_pause()
-    await message.answer(build_positions_text(), reply_markup=main_keyboard())
+    await message.answer(build_positions_text(), reply_markup=role_keyboard(callback))
 
 
 @dp.message(Command("dryrun"))
@@ -2360,7 +2436,7 @@ async def cmd_dryrun(message: Message):
     value = parts[1].lower() == 'on'
     CONFIG['DRY_RUN'] = value
     update_db_setting('dry_run', 1.0 if value else 0.0)
-    await message.answer("✅ DRY RUN AKTIF" if value else "⚠️ REAL MONEY AKTIF", reply_markup=main_keyboard())
+    await message.answer("✅ DRY RUN AKTIF" if value else "⚠️ REAL MONEY AKTIF", reply_markup=role_keyboard(callback))
 
 
 @dp.message(Command("setmargin"))
@@ -2370,7 +2446,7 @@ async def cmd_setmargin(message: Message):
         value = float((message.text or '').split()[1])
         CONFIG['MARGIN_PER_TRADE'] = value
         update_db_setting('margin', value)
-        await message.answer(f"✅ Margin: ${value}", reply_markup=main_keyboard())
+        await message.answer(f"✅ Margin: ${value}", reply_markup=role_keyboard(callback))
     except Exception:
         await message.answer("⚠️ Format: /setmargin 2")
 
@@ -2382,7 +2458,7 @@ async def cmd_setmaxpos(message: Message):
         value = int((message.text or '').split()[1])
         CONFIG['MAX_CONCURRENT_POSITIONS'] = value
         update_db_setting('max_pos', value)
-        await message.answer(f"✅ Max Posisi: {value}", reply_markup=main_keyboard())
+        await message.answer(f"✅ Max Posisi: {value}", reply_markup=role_keyboard(callback))
     except Exception:
         await message.answer("⚠️ Format: /setmaxpos 2")
 
@@ -2394,7 +2470,7 @@ async def cmd_setminwr(message: Message):
         value = float((message.text or '').split()[1])
         CONFIG['MIN_WR'] = value
         update_db_setting('min_wr', value)
-        await message.answer(f"✅ Min WinRate: {value}%", reply_markup=main_keyboard())
+        await message.answer(f"✅ Min WinRate: {value}%", reply_markup=role_keyboard(callback))
     except Exception:
         await message.answer("⚠️ Format: /setminwr 40")
 
@@ -2406,7 +2482,7 @@ async def cmd_setmintrades(message: Message):
         value = int((message.text or '').split()[1])
         CONFIG['MIN_TRADES'] = value
         update_db_setting('min_trades', value)
-        await message.answer(f"✅ Min Trade: {value}x", reply_markup=main_keyboard())
+        await message.answer(f"✅ Min Trade: {value}x", reply_markup=role_keyboard(callback))
     except Exception:
         await message.answer("⚠️ Format: /setmintrades 5")
 
@@ -2421,14 +2497,14 @@ async def cmd_setlev(message: Message):
             for ex_id in DEFAULT_CEX:
                 CONFIG['LEVERAGE'][ex_id] = value
                 update_db_setting(f'lev_{ex_id}', value)
-            await message.answer(f"✅ Semua leverage: {value}x", reply_markup=main_keyboard())
+            await message.answer(f"✅ Semua leverage: {value}x", reply_markup=role_keyboard(callback))
         elif len(parts) == 3:
             ex_id, value = parts[1].lower(), int(parts[2])
             if ex_id not in DEFAULT_CEX:
                 raise ValueError("CEX tidak dikenal")
             CONFIG['LEVERAGE'][ex_id] = value
             update_db_setting(f'lev_{ex_id}', value)
-            await message.answer(f"✅ Lev {ex_id.upper()}: {value}x", reply_markup=main_keyboard())
+            await message.answer(f"✅ Lev {ex_id.upper()}: {value}x", reply_markup=role_keyboard(callback))
         else:
             raise ValueError
     except Exception:
@@ -2447,7 +2523,7 @@ async def cmd_cex(message: Message):
         conn.cursor().execute("UPDATE cex_settings SET enabled=? WHERE ex_id=?", (1 if action == 'on' else 0, ex_id))
         conn.commit(); conn.close()
         reload_exchanges()
-        await message.answer(f"✅ CEX {ex_id.upper()} di-{action.upper()}!", reply_markup=main_keyboard())
+        await message.answer(f"✅ CEX {ex_id.upper()} di-{action.upper()}!", reply_markup=role_keyboard(callback))
     except Exception:
         await message.answer("⚠️ Format: /cex on/off <cex>")
 
@@ -2563,8 +2639,246 @@ async def cb_cex_toggle(callback: CallbackQuery):
     )
 
 
+
+@dp.callback_query(F.data == "owner_vip")
+async def cb_owner_vip(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "👥 <b>VIP MANAGEMENT</b>\n\n"
+        "Kelola member VIP langsung dari bot.",
+        reply_markup=vip_management_keyboard()
+    )
+
+@dp.callback_query(F.data == "vip_add")
+async def cb_vip_add(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+    PENDING_VIP_ACTION[callback.message.chat.id] = {'action': 'add'}
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "➕ <b>ADD VIP MEMBER</b>\n\n"
+        "Kirim <b>Telegram ID</b> user yang ingin ditambahkan.\n\n"
+        "Contoh:\n<code>123456789</code>\n\n"
+        "Bot tidak akan meminta API user di sini. User akan mengatur API miliknya sendiri."
+    )
+
+@dp.callback_query(F.data == "vip_list")
+async def cb_vip_list(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+    await safe_answer(callback)
+    rows = db_read(
+        "SELECT telegram_id, username, status, expires_at FROM vip_members ORDER BY added_at DESC"
+    )
+    if not rows:
+        text = "👥 <b>VIP MEMBERS</b>\n\nBelum ada member VIP."
+    else:
+        blocks = []
+        for i, (tid, username, status, expires_at) in enumerate(rows, 1):
+            blocks.append(
+                f"{i}. <code>{tid}</code>"
+                + (f" @{html.escape(username)}" if username else "")
+                + f"\n   Status: {'🟢' if status == 'ACTIVE' else '🔴'} {html.escape(status)}"
+                + f"\n   Expired: {html.escape(expires_at or 'Tanpa batas')}"
+            )
+        text = "👥 <b>VIP MEMBERS</b>\n\n" + "\n\n".join(blocks)
+    await callback.message.edit_text(text, reply_markup=vip_management_keyboard())
+
+@dp.callback_query(F.data == "vip_extend")
+async def cb_vip_extend(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+    PENDING_VIP_ACTION[callback.message.chat.id] = {'action': 'extend'}
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "⏳ <b>EXTEND VIP</b>\n\n"
+        "Kirim dengan format:\n"
+        "<code>TELEGRAM_ID HARI</code>\n\n"
+        "Contoh:\n<code>123456789 30</code>"
+    )
+
+@dp.callback_query(F.data == "vip_remove")
+async def cb_vip_remove(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+    PENDING_VIP_ACTION[callback.message.chat.id] = {'action': 'remove'}
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "🚫 <b>REMOVE VIP</b>\n\n"
+        "Kirim <b>Telegram ID</b> member yang ingin dinonaktifkan."
+    )
+
+@dp.callback_query(F.data == "vip_settings")
+async def cb_vip_settings(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True)
+        return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "💎 <b>RECOMMENDED VIP SETTINGS</b>\n\n"
+        "💵 Margin / Trade: <b>$2</b>\n"
+        "⚡ Leverage: <b>20x</b>\n"
+        "📊 Max Open Positions: <b>3</b>\n"
+        "📅 Max Trades / Day: <b>10</b>\n"
+        "🏦 Exchange: <b>Bitget + BingX</b>\n"
+        "🤖 Auto Trade: <b>ON</b>\n\n"
+        "ℹ️ Margin $2 adalah margin per posisi. Leverage 20x memperbesar "
+        "nilai posisi sekaligus risiko. Max posisi dan max trade membatasi "
+        "jumlah eksekusi.\n\n"
+        "⚠️ <b>WARNING</b>\n"
+        "Auto trading dan leverage memiliki risiko kerugian dan risiko "
+        "likuidasi. Gunakan dana yang siap untuk kehilangan dan pastikan "
+        "API exchange <b>tidak memiliki permission withdrawal</b>.\n\n"
+        "❗ Setting rekomendasi bukan jaminan profit atau win rate.",
+        reply_markup=vip_keyboard()
+    )
+
+@dp.callback_query(F.data == "vip_auto_trade")
+async def cb_vip_auto_trade(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True)
+        return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "🤖 <b>AUTO TRADE VIP</b>\n\n"
+        "Untuk keamanan, sebelum real trade aktif pastikan API sudah "
+        "terpasang dan permission withdrawal dimatikan.\n\n"
+        "Recommended:\n"
+        "💵 $2 margin/trade\n⚡ 20x leverage\n📊 3 posisi\n📅 10 trade/hari\n\n"
+        "⚠️ Real trading memiliki risiko kerugian dan likuidasi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ SAYA PAHAM & AKTIFKAN", callback_data="vip_auto_confirm")],
+            [InlineKeyboardButton(text="❌ BATAL", callback_data="menu")]
+        ])
+    )
+
+@dp.callback_query(F.data == "vip_auto_confirm")
+async def cb_vip_auto_confirm(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True)
+        return
+    await safe_answer(callback, "Konfirmasi diterima.")
+    # Do not toggle the global owner dry-run engine here. This callback is
+    # intentionally only a VIP authorization acknowledgement until the
+    # per-user execution layer is enabled.
+    await callback.message.edit_text(
+        "⚠️ <b>VIP BELUM AKTIF UNTUK REAL TRADE</b>\n\n"
+        "Konfirmasi tersimpan secara UI, tetapi engine trading saat ini "
+        "masih menggunakan execution/account layer global Owner.\n\n"
+        "Jangan gunakan tombol ini sebagai indikasi bahwa akun VIP sudah "
+        "terisolasi dari akun lain.",
+        reply_markup=vip_keyboard()
+    )
+
+
 @dp.message(F.text)
-async def handle_api_setup_message(message: Message):
+async def handle_text(message: Message):
+    if not is_allowed_chat(message):
+        return
+
+    chat_id = str(message.chat.id)
+    vip_action = PENDING_VIP_ACTION.get(chat_id)
+
+    if vip_action and is_owner(message):
+        text = (message.text or '').strip()
+        action = vip_action.get('action')
+
+        try:
+            if action == 'add':
+                if not text.isdigit():
+                    raise ValueError("Telegram ID harus angka.")
+                existing = db_read("SELECT status FROM vip_members WHERE telegram_id=?", (text,))
+                now = datetime.now(WIB)
+                expires = (now + timedelta(days=30)).isoformat(timespec='seconds')
+                conn = sqlite3.connect(DB_FILE, timeout=10)
+                try:
+                    conn.execute(
+                        """INSERT INTO vip_members
+                           (telegram_id, username, status, expires_at, added_at)
+                           VALUES (?, '', 'ACTIVE', ?, ?)
+                           ON CONFLICT(telegram_id) DO UPDATE SET
+                           status='ACTIVE', expires_at=excluded.expires_at""",
+                        (text, expires, now.isoformat(timespec='seconds'))
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                PENDING_VIP_ACTION.pop(chat_id, None)
+                await message.answer(
+                    f"✅ <b>VIP BERHASIL DIAKTIFKAN</b>\n\n"
+                    f"Telegram ID: <code>{text}</code>\n"
+                    f"Status: 🟢 ACTIVE\n"
+                    f"Expired: {expires}\n\n"
+                    f"Recommended: $2 margin • 20x • 3 posisi • 10 trade/hari",
+                    reply_markup=owner_keyboard()
+                )
+                return
+
+            if action == 'extend':
+                parts = text.split()
+                if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                    raise ValueError("Format salah.")
+                tid, days = parts[0], int(parts[1])
+                if days <= 0 or days > 3650:
+                    raise ValueError("Hari harus 1-3650.")
+                rows = db_read("SELECT expires_at FROM vip_members WHERE telegram_id=?", (tid,))
+                if not rows:
+                    raise ValueError("VIP tidak ditemukan.")
+                current = datetime.now(WIB)
+                if rows[0][0]:
+                    try:
+                        current = max(current, datetime.fromisoformat(rows[0][0]))
+                    except Exception:
+                        pass
+                expires = (current + timedelta(days=days)).isoformat(timespec='seconds')
+                db_write(
+                    "UPDATE vip_members SET status='ACTIVE', expires_at=? WHERE telegram_id=?",
+                    (expires, tid)
+                )
+                PENDING_VIP_ACTION.pop(chat_id, None)
+                await message.answer(
+                    f"✅ VIP diperpanjang.\n\nID: <code>{tid}</code>\n"
+                    f"Tambahan: {days} hari\nExpired: {expires}",
+                    reply_markup=owner_keyboard()
+                )
+                return
+
+            if action == 'remove':
+                if not text.isdigit():
+                    raise ValueError("Telegram ID harus angka.")
+                db_write(
+                    "UPDATE vip_members SET status='SUSPENDED' WHERE telegram_id=?",
+                    (text,)
+                )
+                PENDING_VIP_ACTION.pop(chat_id, None)
+                await message.answer(
+                    f"🚫 VIP <code>{text}</code> dinonaktifkan.",
+                    reply_markup=owner_keyboard()
+                )
+                return
+
+        except Exception as e:
+            await message.answer(
+                f"❌ {html.escape(str(e))}\n\n"
+                "Coba lagi sesuai format yang diminta."
+            )
+            return
+
+    # Preserve the original API/text handler below.
+    state = PENDING_API_SETUP.get(chat_id)
+    if not state:
+        return
+
+    # The original handler body is intentionally replaced below by the
+    # existing API state machine extracted from the source.
+
     if not is_allowed_chat(message):
         return
 
@@ -2714,12 +3028,13 @@ async def handle_api_setup_message(message: Message):
     )
 
 
+
 @dp.callback_query(F.data == "menu")
 async def cb_menu(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
     try:
-        await callback.message.edit_text("🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:", reply_markup=main_keyboard())
+        await callback.message.edit_text("🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:", reply_markup=role_keyboard(callback))
         LAST_MENU_MESSAGE[callback.message.chat.id] = callback.message.message_id
     except TelegramBadRequest:
         pass
@@ -2747,28 +3062,28 @@ async def cb_settings(callback: CallbackQuery):
 async def cb_stats(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
-    await callback.message.edit_text(build_stats_text(), reply_markup=main_keyboard())
+    await callback.message.edit_text(build_stats_text(), reply_markup=role_keyboard(callback))
 
 
 @dp.callback_query(F.data == "pairperf")
 async def cb_pairperf(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
-    await callback.message.edit_text(build_pairperf_text(), reply_markup=main_keyboard())
+    await callback.message.edit_text(build_pairperf_text(), reply_markup=role_keyboard(callback))
 
 
 @dp.callback_query(F.data == "cex_status")
 async def cb_cex_status(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
-    await callback.message.edit_text(build_cex_status_text(), reply_markup=main_keyboard())
+    await callback.message.edit_text(build_cex_status_text(), reply_markup=role_keyboard(callback))
 
 
 @dp.callback_query(F.data == "api_status")
 async def cb_api_status(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
-    await callback.message.edit_text(build_api_status_text(), reply_markup=main_keyboard())
+    await callback.message.edit_text(build_api_status_text(), reply_markup=role_keyboard(callback))
 
 
 @dp.callback_query(F.data == "pause")
@@ -2778,7 +3093,7 @@ async def cb_pause(callback: CallbackQuery):
     IS_BOT_PAUSED = True
     notify_runtime_status("PAUSED", "⏸️ <b>TRADING PAUSED</b>\nPembukaan trade baru dihentikan. Monitoring posisi tetap berjalan.")
     await safe_answer(callback, "Bot di-pause")
-    await callback.message.edit_text("⏸️ <b>Bot PAUSED</b>\nPembukaan trade baru dihentikan.", reply_markup=main_keyboard())
+    await callback.message.edit_text("⏸️ <b>Bot PAUSED</b>\nPembukaan trade baru dihentikan.", reply_markup=role_keyboard(callback))
 
 
 @dp.callback_query(F.data == "resume")
@@ -2788,7 +3103,7 @@ async def cb_resume(callback: CallbackQuery):
     IS_BOT_PAUSED = False
     notify_runtime_status("RESUMED", "▶️ <b>TRADING RESUMED</b>\nBot kembali boleh mencari setup baru.")
     await safe_answer(callback, "Bot dilanjutkan")
-    await callback.message.edit_text("▶️ <b>Bot RESUMED</b>\nBot kembali aktif.", reply_markup=main_keyboard())
+    await callback.message.edit_text("▶️ <b>Bot RESUMED</b>\nBot kembali aktif.", reply_markup=role_keyboard(callback))
 
 
 @dp.callback_query(F.data == "runtime_status")
