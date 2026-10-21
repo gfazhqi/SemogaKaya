@@ -46,15 +46,26 @@ CONFIG = {
     'MAX_CONCURRENT_POSITIONS': 2,
     'LEVERAGE': {ex: 50 for ex in DEFAULT_CEX.keys()},
     'DRY_RUN': True,
+    'DAILY_LOSS_LIMIT_ENABLED': True,
     'MIN_TRADES': 5,
     'MIN_WR': 40.0
 }
 
 IS_BOT_PAUSED = False
 daily_sl_count = 0
+daily_loss_limit_triggered = False
 last_error_time = 0
 ERROR_COOLDOWN = 300
 last_runtime_status = None
+
+# Exchange scanner protection: BingX can return code 100410 ("please try again later")
+# when market-data requests are too frequent or temporarily busy. This is handled
+# with a cooldown instead of spamming Telegram ERROR ALERT.
+EXCHANGE_SCAN_NEXT = {}
+EXCHANGE_BACKOFF_UNTIL = {}
+EXCHANGE_BACKOFF_NOTICE = {}
+EXCHANGE_SCAN_INTERVAL = 30
+BINGX_BACKOFF_SECONDS = 90
 
 # =================================================================
 # DATABASE & SETTINGS
@@ -114,6 +125,7 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('margin', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_pos', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dry_run', 1.0)")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('daily_loss_limit', 1.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_trades', 5.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_wr', 40.0)")
 
@@ -142,6 +154,8 @@ def load_settings():
             CONFIG['MAX_CONCURRENT_POSITIONS'] = int(row[1])
         elif row[0] == 'dry_run':
             CONFIG['DRY_RUN'] = bool(row[1])
+        elif row[0] == 'daily_loss_limit':
+            CONFIG['DAILY_LOSS_LIMIT_ENABLED'] = bool(row[1])
         elif row[0] == 'min_trades':
             CONFIG['MIN_TRADES'] = int(row[1])
         elif row[0] == 'min_wr':
@@ -262,22 +276,39 @@ def cancel_all_pending_orders_on_pause():
 
 
 def check_and_update_daily_sl():
-    global daily_sl_count, IS_BOT_PAUSED
+    global daily_sl_count, IS_BOT_PAUSED, daily_loss_limit_triggered
+
+    # Toggle OFF = completely ignore the daily SL limit. This is useful for
+    # DRY RUN/backtesting so the engine can continue past 2 losses.
+    if not CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True):
+        if daily_loss_limit_triggered:
+            daily_loss_limit_triggered = False
+            IS_BOT_PAUSED = False
+            send_telegram(
+                "🟢 <b>DAILY LOSS LIMIT OFF</b>\n"
+                "Bot kembali aktif. DRY RUN/backtest tidak dibatasi jumlah SL harian."
+            )
+        return
+
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
+        # trades.created_at is stored by SQLite in UTC. Compare in WIB so the
+        # daily limit follows the bot's 00:00 WIB day instead of UTC.
         daily_sl_count = conn.cursor().execute(
             "SELECT COUNT(*) FROM trades "
-            "WHERE created_at >= date('now', 'start of day') "
+            "WHERE date(created_at, '+7 hours') = date('now', '+7 hours') "
             "AND status LIKE '%SL%'"
         ).fetchone()[0]
         conn.close()
 
         if daily_sl_count >= MAX_DAILY_SL and not IS_BOT_PAUSED:
             IS_BOT_PAUSED = True
+            daily_loss_limit_triggered = True
             cancel_all_pending_orders_on_pause()
             send_telegram(
                 f"🛑 <b>DAILY LOSS LIMIT</b>\n"
-                f"Kena {daily_sl_count}x SL. Bot PAUSE!"
+                f"Kena {daily_sl_count}x SL dari batas {MAX_DAILY_SL}x. Bot PAUSE!\n\n"
+                "Gunakan tombol <b>DAILY LOSS LIMIT</b> di BOT CONTROL untuk mematikannya."
             )
     except Exception:
         pass
@@ -309,15 +340,13 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
     return sig, en, sl, tp
 
 
-def _safe_fetch_1m_candle(ex, symbol):
-    """Return the latest 1m OHLC candle when the exchange supports it."""
+def _safe_fetch_recent_1m_candles(ex, symbol, limit=4):
+    """Return recent 1m OHLC candles for more reliable DRY RUN lifecycle checks."""
     try:
-        rows = ex.fetch_ohlcv(symbol, '1m', limit=2)
-        if rows:
-            return rows[-1]
+        rows = ex.fetch_ohlcv(symbol, '1m', limit=limit)
+        return rows or []
     except Exception:
-        pass
-    return None
+        return []
 
 
 def _latest_closed_15m_ts(ex, symbol):
@@ -342,26 +371,30 @@ def _mark_trade_status(c, t_id, status, bars, filled_at=None, last_price=None, l
 
 
 def update_orders_and_positions():
-    """Manage pending/open trades without changing the existing SMC entry logic.
+    """Manage pending/open trades without changing SMC entry/SL/TP formulas.
 
-    Important fixes:
-    - DRY RUN uses 1m high/low instead of only one ticker snapshot.
-    - Entry is checked before TP/SL when a candle touches the entry area.
-      This prevents false 'MISSED (TP First)' when entry and TP occur in the
-      same polling interval.
-    - bars_count now represents actual 15m candles, not 15-second loops.
-    - Duplicate/ambiguous transitions are avoided by persisting lifecycle state.
+    Lifecycle fixes only:
+    - DRY RUN checks recent 1m candles instead of a single ticker snapshot.
+    - A pending setup can be filled even if the 15s polling interval misses the
+      exact tick that touched the 50% retrace entry.
+    - "MISSED (TP First)" is only produced when TP was actually reached in a
+      candle after the setup existed and the entry was not touched first.
+    - 15m bar aging is based on closed 15m candles, not 15s polling loops.
+    - If TP and SL occur in the same 1m candle, candle direction is used as a
+      deterministic tie-breaker; no strategy formula is changed.
     """
     conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
 
     rows = c.execute(
         "SELECT id, exchange_id, symbol, side, entry_price, sl_price, "
-        "tp_price, order_id, bars_count, status, last_price, last_bar_ts, filled_at, entry_bar_ts "
+        "tp_price, order_id, bars_count, status, last_price, last_bar_ts, "
+        "filled_at, entry_bar_ts, created_at "
         "FROM trades WHERE status IN ('PENDING', 'OPEN')"
     ).fetchall()
 
-    for t_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, last_price, last_bar_ts, filled_at, entry_bar_ts in rows:
+    for (t_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status,
+         last_price, last_bar_ts, filled_at, entry_bar_ts, created_at) in rows:
         if ex_id not in exchanges:
             continue
 
@@ -376,20 +409,12 @@ def update_orders_and_positions():
             is_sim = str(ord_id).startswith('sim_')
             tag = " (DRY RUN)" if is_sim else ""
 
-            # Use 1m OHLC for DRY RUN lifecycle decisions. If unavailable,
-            # safely fall back to the ticker price.
-            candle = _safe_fetch_1m_candle(ex, sym) if is_sim else None
-            if candle:
-                candle_ts, candle_open, candle_high, candle_low, candle_close = map(float, candle[:5])
-                candle_ts = int(candle_ts)
-            else:
-                candle_ts = None
-                candle_open = candle_high = candle_low = candle_close = curr_price
+            candles = _safe_fetch_recent_1m_candles(ex, sym, limit=4) if is_sim else []
+            candles = sorted(candles, key=lambda x: int(x[0]))
 
             closed_15m_ts = _latest_closed_15m_ts(ex, sym)
             n_bars = bars
             if closed_15m_ts is not None and int(closed_15m_ts) != int(last_bar_ts or 0):
-                # Only count a new closed 15m candle once.
                 n_bars = bars + 1
                 c.execute(
                     "UPDATE trades SET bars_count=?, last_bar_ts=? WHERE id=?",
@@ -400,22 +425,54 @@ def update_orders_and_positions():
                 entry_touched = False
                 tp_touched = False
                 sl_touched = False
+                entry_candle_ts = None
 
-                if is_sim and candle:
-                    entry_touched = candle_low <= en <= candle_high
-                    if side == 'BUY':
-                        tp_touched = candle_high >= tp
-                        sl_touched = candle_low <= sl
-                    else:
-                        tp_touched = candle_low <= tp
-                        sl_touched = candle_high >= sl
+                if is_sim and candles:
+                    # Only candles belonging to/after the minute in which the
+                    # setup was created are eligible. This avoids filling from
+                    # an old candle that existed before the signal was created.
+                    try:
+                        created_dt = datetime.strptime(
+                            str(created_at)[:19], '%Y-%m-%d %H:%M:%S'
+                        ).replace(tzinfo=timezone.utc)
+                        created_minute_ms = int(created_dt.timestamp() * 1000) // 60000 * 60000
+                    except Exception:
+                        created_minute_ms = int(candles[-1][0])
+
+                    eligible = [x for x in candles if int(x[0]) >= created_minute_ms]
+                    for row in eligible:
+                        cts, op, hi, lo, cl, *rest = row
+                        cts, op, hi, lo, cl = int(cts), float(op), float(hi), float(lo), float(cl)
+
+                        touches_entry = lo <= en <= hi
+                        if touches_entry:
+                            # Entry wins when the same 1m candle also contains
+                            # TP/SL because OHLC does not reveal intrabar order.
+                            entry_touched = True
+                            entry_candle_ts = cts
+                            break
+
+                        if side == 'BUY':
+                            if hi >= tp:
+                                tp_touched = True
+                                break
+                            if lo <= sl:
+                                sl_touched = True
+                                break
+                        else:
+                            if lo <= tp:
+                                tp_touched = True
+                                break
+                            if hi >= sl:
+                                sl_touched = True
+                                break
                 else:
-                    # Real order: prefer the exchange's actual order state.
+                    # Real order: use the exchange order state whenever possible.
                     try:
                         order = ex.fetch_order(ord_id, sym)
                         order_status = str(order.get('status', '')).lower()
                         filled_amount = float(order.get('filled') or 0)
-                        if order_status in ('closed',) or filled_amount > 0:
+                        if order_status == 'closed' or filled_amount > 0:
                             entry_touched = True
                         elif order_status in ('canceled', 'cancelled', 'expired', 'rejected'):
                             n_stat = f'CANCELLED ({order_status.upper()})'
@@ -430,7 +487,6 @@ def update_orders_and_positions():
                             )
                             continue
                     except Exception:
-                        # Fallback only if the exchange does not expose fetch_order.
                         entry_touched = (
                             (side == 'BUY' and curr_price <= en) or
                             (side == 'SELL' and curr_price >= en)
@@ -443,10 +499,6 @@ def update_orders_and_positions():
                         tp_touched = curr_price <= tp
                         sl_touched = curr_price >= sl
 
-                # IMPORTANT: entry wins over TP/SL when the same 1m candle
-                # contains the entry. We cannot know the exact intrabar path,
-                # so treating the setup as filled is safer than falsely calling
-                # it MISSED before an entry was ever recorded.
                 if entry_touched:
                     now_stamp = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
                     _mark_trade_status(
@@ -454,7 +506,7 @@ def update_orders_and_positions():
                         filled_at=now_stamp,
                         last_price=curr_price,
                         last_bar_ts=closed_15m_ts,
-                        entry_bar_ts=candle_ts
+                        entry_bar_ts=entry_candle_ts
                     )
                     send_telegram(
                         f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!\n"
@@ -462,8 +514,6 @@ def update_orders_and_positions():
                     )
                     continue
 
-                # Only classify as missed when price actually crossed TP
-                # without ever touching the entry area.
                 if tp_touched:
                     n_stat = 'MISSED (TP First)'
                 elif sl_touched:
@@ -472,7 +522,8 @@ def update_orders_and_positions():
                     n_stat = 'INVALID (>30 Bars)'
                 else:
                     c.execute(
-                        "UPDATE trades SET last_price=?, bars_count=?, last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
+                        "UPDATE trades SET last_price=?, bars_count=?, "
+                        "last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
                         (curr_price, n_bars, closed_15m_ts, t_id)
                     )
                     continue
@@ -494,34 +545,39 @@ def update_orders_and_positions():
                 )
 
             elif status == 'OPEN':
-                # Never evaluate the full 1m candle that triggered a simulated
-                # entry again. Its high/low may have occurred before the entry.
-                if is_sim and candle_ts is not None and entry_bar_ts and int(candle_ts) == int(entry_bar_ts):
-                    c.execute(
-                        "UPDATE trades SET last_price=?, bars_count=?, last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
-                        (curr_price, n_bars, closed_15m_ts, t_id)
-                    )
-                    continue
+                hit_tp = False
+                hit_sl = False
 
-                # For DRY RUN, use candle extremes so a 15-second polling gap
-                # cannot hide a genuine SL/TP touch.
-                if is_sim and candle:
-                    hit_tp = (candle_high >= tp) if side == 'BUY' else (candle_low <= tp)
-                    hit_sl = (candle_low <= sl) if side == 'BUY' else (candle_high >= sl)
+                if is_sim and candles:
+                    # Do not evaluate the candle that triggered the entry again;
+                    # we cannot know whether its high/low happened before or after
+                    # the simulated fill.
+                    for row in candles:
+                        cts, op, hi, lo, cl, *rest = row
+                        cts, op, hi, lo, cl = int(cts), float(op), float(hi), float(lo), float(cl)
+                        if entry_bar_ts and cts <= int(entry_bar_ts):
+                            continue
+
+                        this_tp = hi >= tp if side == 'BUY' else lo <= tp
+                        this_sl = lo <= sl if side == 'BUY' else hi >= sl
+
+                        if this_tp and this_sl:
+                            if side == 'BUY':
+                                this_tp = cl >= op
+                                this_sl = not this_tp
+                            else:
+                                this_tp = cl <= op
+                                this_sl = not this_tp
+
+                        if this_tp:
+                            hit_tp = True
+                            break
+                        if this_sl:
+                            hit_sl = True
+                            break
                 else:
                     hit_tp = (curr_price >= tp) if side == 'BUY' else (curr_price <= tp)
                     hit_sl = (curr_price <= sl) if side == 'BUY' else (curr_price >= sl)
-
-                # If both TP and SL are inside the same 1m candle, OHLC alone
-                # cannot reveal the exact sequence. Use the candle direction
-                # as a deterministic tie-breaker instead of always awarding TP.
-                if hit_tp and hit_sl and is_sim and candle:
-                    if side == 'BUY':
-                        hit_tp = candle_close >= candle_open
-                        hit_sl = not hit_tp
-                    else:
-                        hit_tp = candle_close <= candle_open
-                        hit_sl = not hit_tp
 
                 if hit_tp:
                     _mark_trade_status(
@@ -540,12 +596,12 @@ def update_orders_and_positions():
                     send_telegram(f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻")
                 else:
                     c.execute(
-                        "UPDATE trades SET last_price=?, bars_count=?, last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
+                        "UPDATE trades SET last_price=?, bars_count=?, "
+                        "last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
                         (curr_price, n_bars, closed_15m_ts, t_id)
                     )
 
         except Exception as e:
-            # Do not kill the whole lifecycle loop because one symbol/CEX failed.
             send_error_alert(f"Lifecycle [{ex_id} {sym}]: {e}")
 
     conn.commit()
@@ -555,6 +611,28 @@ def update_orders_and_positions():
 # =================================================================
 # MARKET SCANNER
 # =================================================================
+# Scanner/API protection only. Does not change the SMC entry/SL/TP formulas.
+def is_exchange_retryable_error(ex_id, exc):
+    text = str(exc).lower()
+    return (
+        ex_id.lower() == 'bingx' and
+        ('100410' in text or '请稍后重试' in text or 'try again later' in text)
+    )
+
+
+def mark_exchange_backoff(ex_id, seconds):
+    until = time.time() + seconds
+    EXCHANGE_BACKOFF_UNTIL[ex_id] = until
+    # Only one informational message per cooldown period.
+    if EXCHANGE_BACKOFF_NOTICE.get(ex_id, 0) <= time.time():
+        send_telegram(
+            f"⚠️ <b>{ex_id.upper()} MARKET DATA COOLDOWN</b>\n"
+            f"Exchange sedang membatasi/menunda request market data.\n"
+            f"Scanner {ex_id.upper()} dijeda sekitar {seconds} detik; CEX lain tetap berjalan."
+        )
+        EXCHANGE_BACKOFF_NOTICE[ex_id] = until
+
+
 # LOGIC TRADE TIDAK DIUBAH
 def scan_markets():
     conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -580,7 +658,28 @@ def scan_markets():
 
     for ex_id, ex in exchanges.items():
         try:
-            for sym in [s for s in ex.fetch_tickers().keys()
+            now_ts = time.time()
+
+            # The strategy uses 15m candles, so rescanning the whole market every
+            # 15 seconds only creates unnecessary API traffic. Keep the existing
+            # lifecycle/position monitor at 15s, but scan each exchange at 30s.
+            if now_ts < EXCHANGE_BACKOFF_UNTIL.get(ex_id, 0):
+                continue
+            if now_ts < EXCHANGE_SCAN_NEXT.get(ex_id, 0):
+                continue
+
+            try:
+                tickers = ex.fetch_tickers()
+            except Exception as e:
+                if is_exchange_retryable_error(ex_id, e):
+                    mark_exchange_backoff(ex_id, BINGX_BACKOFF_SECONDS)
+                    EXCHANGE_SCAN_NEXT[ex_id] = time.time() + BINGX_BACKOFF_SECONDS
+                    continue
+                raise
+
+            EXCHANGE_SCAN_NEXT[ex_id] = time.time() + EXCHANGE_SCAN_INTERVAL
+
+            for sym in [s for s in tickers.keys()
                         if s.endswith('/USDT:USDT') or s.endswith('/USDT')][:60]:
 
                 if is_manual_alert_symbol(sym):
@@ -682,6 +781,10 @@ def scan_markets():
                     act_count += 1
 
         except Exception as e:
+            if is_exchange_retryable_error(ex_id, e):
+                mark_exchange_backoff(ex_id, BINGX_BACKOFF_SECONDS)
+                EXCHANGE_SCAN_NEXT[ex_id] = time.time() + BINGX_BACKOFF_SECONDS
+                continue
             send_error_alert(f"Scan Ex [{ex_id}]: {e}")
 
 
@@ -724,9 +827,11 @@ def main_keyboard():
 
 def bot_control_keyboard():
     dry = "🟢 DRY RUN: ON" if CONFIG['DRY_RUN'] else "🔴 DRY RUN: OFF / REAL"
+    loss = "🟢 DAILY LOSS: ON (2 SL)" if CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True) else "🔴 DAILY LOSS: OFF"
     pause = "▶️ RESUME TRADING" if IS_BOT_PAUSED else "⏸️ PAUSE TRADING"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=dry, callback_data="dryrun_toggle")],
+        [InlineKeyboardButton(text=loss, callback_data="daily_loss_toggle")],
         [InlineKeyboardButton(text=pause, callback_data="resume" if IS_BOT_PAUSED else "pause")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
@@ -1594,7 +1699,8 @@ async def cb_bot_control(callback: CallbackQuery):
     await callback.message.edit_text(
         "🤖 <b>BOT CONTROL</b>\n\n"
         f"Status: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}\n"
-        f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n\n"
+        f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n"
+        f"Daily Loss Limit: {'🟢 ON (2 SL)' if CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True) else '🔴 OFF'}\n\n"
         "Gunakan tombol di bawah untuk mengubah kontrol yang memang tersedia di script.",
         reply_markup=bot_control_keyboard()
     )
@@ -1613,6 +1719,33 @@ async def cb_dryrun_toggle(callback: CallbackQuery):
         reply_markup=bot_control_keyboard()
     )
     send_telegram("🧪 <b>MODE BERUBAH</b> — " + ("DRY RUN aktif. Tidak ada order real." if value else "⚠️ REAL MONEY aktif. Order real diizinkan."))
+
+
+@dp.callback_query(F.data == "daily_loss_toggle")
+async def cb_daily_loss_toggle(callback: CallbackQuery):
+    global IS_BOT_PAUSED, daily_loss_limit_triggered
+    if not is_allowed_chat(callback):
+        return
+
+    value = not CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True)
+    CONFIG['DAILY_LOSS_LIMIT_ENABLED'] = value
+    update_db_setting('daily_loss_limit', 1.0 if value else 0.0)
+
+    if not value and daily_loss_limit_triggered:
+        daily_loss_limit_triggered = False
+        IS_BOT_PAUSED = False
+
+    await safe_answer(callback, "DAILY LOSS ON" if value else "DAILY LOSS OFF")
+    await callback.message.edit_text(
+        f"{'🟢 <b>DAILY LOSS LIMIT AKTIF</b>' if value else '🔴 <b>DAILY LOSS LIMIT MATI</b>'}\n\n"
+        f"Batas: <b>{MAX_DAILY_SL} SL / hari</b>\n"
+        f"Status bot: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}",
+        reply_markup=bot_control_keyboard()
+    )
+    send_telegram(
+        "🛡️ <b>DAILY LOSS LIMIT</b> — "
+        + (f"ON ({MAX_DAILY_SL} SL/hari)." if value else "OFF. Bot tidak akan auto-pause karena jumlah SL harian.")
+    )
 
 
 @dp.callback_query(F.data == "cancelall")
@@ -1910,7 +2043,7 @@ def notify_runtime_status(new_status, text):
 
 
 def main_loop():
-    global daily_sl_count, IS_BOT_PAUSED
+    global daily_sl_count, IS_BOT_PAUSED, daily_loss_limit_triggered
 
     last_hb = time.time()
     send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>\n🟢 Trading engine siap. Menunggu kondisi scan.")
@@ -1921,6 +2054,7 @@ def main_loop():
 
             if now.hour == 7 and now.minute == 0 and now.second < 15:
                 daily_sl_count = 0
+                daily_loss_limit_triggered = False
                 if IS_BOT_PAUSED:
                     IS_BOT_PAUSED = False
                     send_telegram("🌅 <b>NEW DAY RESET</b>\nBot otomatis kembali aktif.")
@@ -1930,6 +2064,7 @@ def main_loop():
                     "💓 <b>SYSTEM PING</b>\n"
                     f"Bot: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}\n"
                     f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n"
+                    f"Daily Loss: {'ON' if CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True) else 'OFF'}\n"
                     f"CEX aktif: {len(exchanges)}"
                 )
                 last_hb = time.time()
