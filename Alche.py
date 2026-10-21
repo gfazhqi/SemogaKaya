@@ -8,6 +8,7 @@ import requests
 import ccxt
 import asyncio
 import html
+import json
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -53,6 +54,7 @@ IS_BOT_PAUSED = False
 daily_sl_count = 0
 last_error_time = 0
 ERROR_COOLDOWN = 300
+last_runtime_status = None
 
 # =================================================================
 # DATABASE & SETTINGS
@@ -93,6 +95,10 @@ def init_db():
         c.execute("ALTER TABLE cex_settings ADD COLUMN account_label TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    try:
+        c.execute("ALTER TABLE cex_settings ADD COLUMN account_info TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('margin', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_pos', 2.0)")
@@ -106,7 +112,7 @@ def init_db():
             (f'lev_{ex}',)
         )
         c.execute(
-            "INSERT OR IGNORE INTO cex_settings (ex_id, api_key, secret, enabled, account_label) VALUES (?, '', '', 0, '')",
+            "INSERT OR IGNORE INTO cex_settings (ex_id, api_key, secret, enabled, account_label, account_info) VALUES (?, '', '', 0, '', '')",
             (ex,)
         )
 
@@ -503,7 +509,8 @@ bot = Bot(
 dp = Dispatcher()
 
 # Conversational API setup state.
-# {chat_id: {"stage": "choose_key"/"secret", "ex_id": "bingx", "api": "..."}}
+# {chat_id: {stage, ex_id, api, prompt_message_id, ack_message_id}}
+# Prompt/ack message IDs are tracked so the API setup conversation can be cleaned up.
 PENDING_API_SETUP = {}
 
 
@@ -513,51 +520,61 @@ def is_allowed_chat(message_or_callback):
 
 
 def main_keyboard():
+    # Semua fitur yang memang sudah ada di script dipusatkan di inline keyboard.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📊 Posisi", callback_data="positions"),
-            InlineKeyboardButton(text="📈 Statistik", callback_data="stats")
-        ],
-        [
-            InlineKeyboardButton(text="⚙️ Settings", callback_data="settings"),
-            InlineKeyboardButton(text="🏆 Pair Perf", callback_data="pairperf")
-        ],
-        [
-            InlineKeyboardButton(text="🏦 CEX", callback_data="cex_status"),
-            InlineKeyboardButton(text="🔐 API", callback_data="api_menu")
-        ],
-        [
-            InlineKeyboardButton(text="⏸ Pause", callback_data="pause"),
-            InlineKeyboardButton(text="▶️ Resume", callback_data="resume")
-        ],
-        [InlineKeyboardButton(text="🔄 Refresh", callback_data="menu")]
+        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"),
+         InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
+        [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings"),
+         InlineKeyboardButton(text="🏆 PAIR PERF", callback_data="pairperf")],
+        [InlineKeyboardButton(text="🏦 CEX", callback_data="cex_status"),
+         InlineKeyboardButton(text="🔐 API", callback_data="api_menu")],
+        [InlineKeyboardButton(text="⏯ BOT CONTROL", callback_data="bot_control")],
+        [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
+        [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
     ])
+
+
+def bot_control_keyboard():
+    dry = "🧪 DRY RUN 🟢" if CONFIG['DRY_RUN'] else "🧪 DRY RUN 🔴"
+    pause = "▶️ RESUME" if IS_BOT_PAUSED else "⏸ PAUSE"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=dry, callback_data="dryrun_toggle")],
+        [InlineKeyboardButton(text=pause, callback_data="resume" if IS_BOT_PAUSED else "pause")],
+        [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
+        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
+    ])
+
+
+def settings_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💵 MARGIN", callback_data="set_margin_menu"),
+         InlineKeyboardButton(text="📊 MAX POS", callback_data="set_maxpos_menu")],
+        [InlineKeyboardButton(text="🎯 MIN WR", callback_data="set_minwr_menu"),
+         InlineKeyboardButton(text="📈 MIN TRADES", callback_data="set_mintrades_menu")],
+        [InlineKeyboardButton(text="⚡ LEVERAGE", callback_data="set_lev_menu")],
+        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
+    ])
+
+
+def preset_keyboard(title, values, prefix, back="settings"):
+    rows = []
+    row = []
+    for value, label in values:
+        row.append(InlineKeyboardButton(text=label, callback_data=f"{prefix}:{value}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=back)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cex_api_keyboard():
     rows = []
     for ex_id in DEFAULT_CEX:
-        rows.append([
-            InlineKeyboardButton(
-                text=f"🔑 {ex_id.upper()}",
-                callback_data=f"api_setup:{ex_id}"
-            )
-        ])
-    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def cex_toggle_keyboard():
-    rows = []
-    for ex_id, api_cfg in DEFAULT_CEX.items():
-        row = [
-            InlineKeyboardButton(
-                text=f"🔑 {ex_id.upper()}",
-                callback_data=f"api_setup:{ex_id}"
-            )
-        ]
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")])
+        rows.append([InlineKeyboardButton(text=f"🔑 {ex_id.upper()}", callback_data=f"api_setup:{ex_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="api_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -571,7 +588,7 @@ def cex_control_keyboard():
             InlineKeyboardButton(text=f"{ex_id.upper()} {state}", callback_data=f"cex_toggle:{ex_id}:{toggle_action}"),
             InlineKeyboardButton(text="🔑 API", callback_data=f"api_setup:{ex_id}")
         ])
-    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="api_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -584,6 +601,31 @@ def api_menu_keyboard():
     ])
 
 
+def leverage_keyboard():
+    rows = []
+    for ex_id in DEFAULT_CEX:
+        rows.append([InlineKeyboardButton(
+            text=f"⚡ {ex_id.upper()} ({CONFIG['LEVERAGE'].get(ex_id, 50)}x)",
+            callback_data=f"lev_ex:{ex_id}"
+        )])
+    rows.append([InlineKeyboardButton(text="⚡ SEMUA CEX", callback_data="lev_all")])
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="settings")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def leverage_value_keyboard(target):
+    values = [(5,'5x'), (10,'10x'), (20,'20x'), (25,'25x'), (50,'50x'), (75,'75x'), (100,'100x')]
+    rows = []
+    row = []
+    for value, label in values:
+        row.append(InlineKeyboardButton(text=label, callback_data=f"lev_set:{target}:{value}"))
+        if len(row) == 3:
+            rows.append(row); row=[]
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="set_lev_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def db_read(query, params=()):
     conn = sqlite3.connect(DB_FILE, timeout=5)
     try:
@@ -593,10 +635,10 @@ def db_read(query, params=()):
 
 
 def build_settings_text():
-    cex_db = db_read("SELECT ex_id, api_key, enabled, account_label FROM cex_settings")
+    cex_db = db_read("SELECT ex_id, api_key, enabled, account_label, account_info FROM cex_settings")
     mode_text = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL MONEY"
     lines = []
-    for ex_id, api, en, account_label in cex_db:
+    for ex_id, api, en, account_label, account_info in cex_db:
         loaded = ex_id in exchanges
         account_text = html.escape(account_label) if account_label else 'Belum diverifikasi'
         lines.append(
@@ -698,11 +740,11 @@ def build_pairperf_text():
 
 
 def build_cex_status_text():
-    rows = db_read("SELECT ex_id, api_key, enabled, account_label FROM cex_settings")
+    rows = db_read("SELECT ex_id, api_key, enabled, account_label, account_info FROM cex_settings")
     if not rows:
         return "🏦 <b>CEX STATUS</b>\nBelum ada CEX."
     lines = []
-    for ex_id, api, enabled, account_label in rows:
+    for ex_id, api, enabled, account_label, account_info in rows:
         if not enabled:
             state = "🔴 OFF"
         elif ex_id in exchanges:
@@ -711,11 +753,20 @@ def build_cex_status_text():
             state = "🟡 CONFIGURED / NOT LOADED"
         account = html.escape(account_label) if account_label else 'Belum diverifikasi'
         lines.append(
-            f"• <b>{ex_id.upper()}</b> | {state} | API {'✅' if api else '❌'} | "
-            f"Lev {CONFIG['LEVERAGE'].get(ex_id, 50)}x\n"
-            f"  👤 Akun: {account}"
+            f"🏦 <b>{ex_id.upper()}</b> — {state}\n"
+            f"   🔑 API: {'✅' if api else '❌'} | Lev: {CONFIG['LEVERAGE'].get(ex_id, 50)}x\n"
+            f"   👤 {account}"
         )
-    return "🏦 <b>CEX STATUS</b>\n\n" + "\n".join(lines)
+        if account_info:
+            try:
+                info=json.loads(account_info)
+                extras=[]
+                for k in ('USDT Total','USDT Free','Open Positions','Open Orders','Private API'):
+                    if k in info: extras.append(f"{k}: {info[k]}")
+                if extras: lines.append('   ' + ' | '.join(extras))
+            except Exception:
+                pass
+    return "🏦 <b>CEX STATUS</b>\n\n" + "\n\n".join(lines)
 
 
 def _deep_find_values(obj, wanted_keys):
@@ -739,6 +790,13 @@ def _deep_find_values(obj, wanted_keys):
     return found
 
 
+def _safe_call(fn):
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
 def extract_account_details(ex, balance):
     info = balance.get('info', {}) if isinstance(balance, dict) else {}
     values = _deep_find_values(info, [
@@ -746,7 +804,8 @@ def extract_account_details(ex, balance):
         'displayName', 'display_name', 'accountName', 'account_name',
         'uid', 'userId', 'user_id', 'memberId', 'member_id',
         'accountId', 'account_id', 'accountAlias', 'subAccountId',
-        'subAccountName', 'accountType', 'email'
+        'subAccountName', 'accountType', 'email', 'marginMode',
+        'unifiedMarginStatus', 'tradePermission', 'readOnly'
     ])
 
     def pick(*keys):
@@ -756,74 +815,105 @@ def extract_account_details(ex, balance):
                 return value
         return '-'
 
-    # CCXT normalized balance values are useful even when the exchange
-    # does not expose a username/UID. Do not expose API secrets.
     usdt = balance.get('USDT', {}) if isinstance(balance, dict) else {}
     free = total = used = None
     if isinstance(usdt, dict):
-        try: free = float(usdt.get('free')) if usdt.get('free') is not None else None
-        except Exception: pass
-        try: total = float(usdt.get('total')) if usdt.get('total') is not None else None
-        except Exception: pass
-        try: used = float(usdt.get('used')) if usdt.get('used') is not None else None
-        except Exception: pass
+        for name, target in [('free','free'), ('total','total'), ('used','used')]:
+            try:
+                val = usdt.get(name)
+                if val is not None:
+                    if target == 'free': free = float(val)
+                    elif target == 'total': total = float(val)
+                    else: used = float(val)
+            except Exception:
+                pass
 
-    if total is None and isinstance(balance.get('total'), dict):
-        try: total = float(balance['total'].get('USDT'))
-        except Exception: pass
-    if free is None and isinstance(balance.get('free'), dict):
-        try: free = float(balance['free'].get('USDT'))
-        except Exception: pass
-
-    # Some exchanges put the useful identity in the raw response under
-    # different casing. Fall back to a clear message instead of guessing.
-    username = pick('username', 'userName', 'user_name', 'nickname', 'nickName', 'displayName', 'display_name', 'accountName', 'account_name')
-    uid = pick('uid', 'userId', 'user_id', 'memberId', 'member_id', 'accountId', 'account_id')
-    account_type = pick('accountType')
-    alias = pick('accountAlias', 'subAccountName', 'subAccountId')
-
-    return {
-        'username': username,
-        'uid': uid,
-        'account_type': account_type,
-        'alias': alias,
+    details = {
+        'username': pick('username', 'userName', 'user_name', 'nickname', 'nickName', 'displayName', 'display_name', 'accountName', 'account_name'),
+        'uid': pick('uid', 'userId', 'user_id', 'memberId', 'member_id', 'accountId', 'account_id'),
+        'account_type': pick('accountType'),
+        'alias': pick('accountAlias', 'subAccountName', 'subAccountId'),
         'free_usdt': free,
         'total_usdt': total,
         'used_usdt': used,
-        'raw_keys': list(info.keys())[:30] if isinstance(info, dict) else []
+        'margin_mode': pick('marginMode'),
+        'read_only': pick('readOnly'),
+        'trade_permission': pick('tradePermission')
     }
+    return details
+
+
+def enrich_account_details(ex, details):
+    # These calls only READ account data. They never place an order.
+    positions = _safe_call(lambda: ex.fetch_positions())
+    if isinstance(positions, list):
+        details['open_positions'] = sum(1 for p in positions if isinstance(p, dict) and (p.get('contracts') or p.get('contractSize') or p.get('info')))
+    else:
+        details['open_positions'] = 'N/A'
+
+    orders = _safe_call(lambda: ex.fetch_open_orders())
+    if isinstance(orders, list):
+        details['open_orders'] = len(orders)
+    else:
+        details['open_orders'] = 'N/A'
+
+    details['private_api'] = 'READ OK'
+    details['exchange'] = ex.id.upper()
+    details['market_type'] = str(ex.options.get('defaultType', '-')).upper()
+    return details
 
 
 def format_account_details(details):
     def money(v):
         return f"${v:,.4f}" if isinstance(v, (int, float)) else '-'
+    def val(key):
+        v = details.get(key, '-')
+        return html.escape(str(v)) if v not in (None, '') else '-'
     return (
-        f"👤 <b>Username/Nama:</b> {html.escape(str(details.get('username', '-')))}\n"
-        f"🆔 <b>UID/Account ID:</b> {html.escape(str(details.get('uid', '-')))}\n"
-        f"🏷️ <b>Alias:</b> {html.escape(str(details.get('alias', '-')))}\n"
-        f"📁 <b>Account Type:</b> {html.escape(str(details.get('account_type', '-')))}\n"
+        f"🏦 <b>Exchange:</b> {val('exchange')}\n"
+        f"👤 <b>Username/Nama:</b> {val('username')}\n"
+        f"🆔 <b>UID/Account ID:</b> {val('uid')}\n"
+        f"🏷️ <b>Alias:</b> {val('alias')}\n"
+        f"📁 <b>Account Type:</b> {val('account_type')}\n"
+        f"📐 <b>Market:</b> {val('market_type')}\n"
+        f"🔒 <b>Private API:</b> {val('private_api')}\n"
         f"💵 <b>USDT Total:</b> {money(details.get('total_usdt'))}\n"
         f"🟢 <b>USDT Free:</b> {money(details.get('free_usdt'))}\n"
-        f"🟡 <b>USDT Used:</b> {money(details.get('used_usdt'))}"
+        f"🟡 <b>USDT Used:</b> {money(details.get('used_usdt'))}\n"
+        f"📊 <b>Open Positions:</b> {val('open_positions')}\n"
+        f"📋 <b>Open Orders:</b> {val('open_orders')}"
     )
 
 
 def build_api_status_text():
-    rows = db_read("SELECT ex_id, api_key, secret, enabled, account_label FROM cex_settings")
-    lines = []
-    for ex_id, api, secret, enabled, account_label in rows:
-        if not api or not secret:
-            state = "❌ Belum diisi"
-        elif ex_id in exchanges:
-            state = "🟢 Valid & loaded"
-        else:
-            state = "🟡 Tersimpan / CEX OFF"
-        account = html.escape(account_label) if account_label else 'Belum diverifikasi'
-        lines.append(
-            f"• <b>{ex_id.upper()}</b>: {state} | API {'✅' if api else '❌'}\n"
-            f"  👤 {account}"
-        )
-    return "🔐 <b>API & AKUN</b>\n\n" + ("\n".join(lines) or "Belum ada")
+    rows = db_read("SELECT ex_id, api_key, enabled, account_label, account_info FROM cex_settings")
+    if not rows:
+        return "🔐 <b>API & AKUN</b>\n\nBelum ada konfigurasi CEX."
+    blocks = []
+    for ex_id, api, enabled, account_label, account_info in rows:
+        state = "🟢 ON" if enabled else "🔴 OFF"
+        lines = [
+            f"🏦 <b>{ex_id.upper()}</b> — {state}",
+            f"🔑 API: {'✅ Tersimpan' if api else '❌ Belum ada'}",
+            f"👤 Akun: {html.escape(account_label) if account_label else 'Belum diverifikasi'}"
+        ]
+        if account_info:
+            try:
+                info = json.loads(account_info)
+                order = [
+                    ('Exchange','🏦'), ('Account Type','📁'), ('Market','📐'),
+                    ('Private API','🔒'), ('USDT Total','💵'), ('USDT Free','🟢'),
+                    ('USDT Used','🟡'), ('Open Positions','📊'), ('Open Orders','📋'),
+                    ('Trade Permission','🛡️'), ('Read Only','👁️')
+                ]
+                for key, icon in order:
+                    if key in info:
+                        value = html.escape(str(info[key]))
+                        lines.append(f"{icon} {key}: {value}")
+            except Exception:
+                pass
+        blocks.append("\n".join(lines))
+    return "🔐 <b>API & INFORMASI AKUN</b>\n\n" + "\n\n".join(blocks)
 
 
 def validate_cex_api(ex_id, api, secret):
@@ -841,6 +931,7 @@ def validate_cex_api(ex_id, api, secret):
         })
         balance = ex.fetch_balance()
         details = extract_account_details(ex, balance)
+        details = enrich_account_details(ex, details)
         return True, "API valid dan private endpoint berhasil diakses.", details
     except Exception as e:
         return False, str(e)[:1200], None
@@ -1060,7 +1151,9 @@ async def cb_api_setup(callback: CallbackQuery):
         return
     PENDING_API_SETUP[callback.message.chat.id] = {
         'stage': 'api_key',
-        'ex_id': ex_id
+        'ex_id': ex_id,
+        'prompt_message_id': None,
+        'ack_message_id': None
     }
     await safe_answer(callback, f"Pilih {ex_id.upper()}")
     await callback.message.edit_text(
@@ -1072,14 +1165,23 @@ async def cb_api_setup(callback: CallbackQuery):
             [InlineKeyboardButton(text="❌ Batal", callback_data="api_cancel")]
         ])
     )
+    PENDING_API_SETUP[callback.message.chat.id]['prompt_message_id'] = callback.message.message_id
 
 
 @dp.callback_query(F.data == "api_cancel")
 async def cb_api_cancel(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
-    PENDING_API_SETUP.pop(callback.message.chat.id, None)
+    state = PENDING_API_SETUP.pop(callback.message.chat.id, None)
     await safe_answer(callback, "Dibatalkan")
-    await callback.message.edit_text("🔐 <b>API MANAGEMENT</b>\n\nDibatalkan.", reply_markup=api_menu_keyboard())
+    if state:
+        for mid in (state.get('prompt_message_id'), state.get('ack_message_id')):
+            if mid:
+                try: await bot.delete_message(callback.message.chat.id, mid)
+                except Exception: pass
+    try:
+        await callback.message.edit_text("🔐 <b>API MANAGEMENT</b>\n\nDibatalkan.", reply_markup=api_menu_keyboard())
+    except TelegramBadRequest:
+        pass
 
 
 @dp.callback_query(F.data == "cex_control")
@@ -1128,40 +1230,48 @@ async def handle_api_setup_message(message: Message):
     if not text:
         return
 
-    # SECURITY: delete the user's API Key / Secret Key message immediately.
-    # Never echo, log, or send these credentials back to Telegram.
-    credential_message_id = message.message_id
+    ex_id = state['ex_id']
+
+    # Delete the user's credential message immediately.
     try:
-        await bot.delete_message(chat_id=chat_id, message_id=credential_message_id)
+        await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
     except Exception:
-        # In case Telegram refuses deletion, continue processing but never echo
-        # the credential. A private bot chat normally allows this deletion.
         pass
 
-    ex_id = state['ex_id']
     if state['stage'] == 'api_key':
-        PENDING_API_SETUP[chat_id] = {
-            'stage': 'secret',
-            'ex_id': ex_id,
-            'api': text
-        }
-        await bot.send_message(
+        state['stage'] = 'secret'
+        state['api'] = text
+        ack = await bot.send_message(
             chat_id,
             f"🔐 <b>API Key diterima</b> untuk {ex_id.upper()}.\n"
-            "🗑️ Pesan API Key sudah dihapus otomatis.\n\n"
-            "Sekarang kirim <b>Secret Key</b> saja. Pesan Secret Key juga akan otomatis dihapus.",
+            "🗑️ Pesan API Key sudah dihapus.\n\n"
+            "Sekarang kirim <b>Secret Key</b> saja. Pesan Secret Key juga akan dihapus otomatis.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="❌ Batal", callback_data="api_cancel")]
+                [InlineKeyboardButton(text="❌ BATAL & HAPUS SESI", callback_data="api_cancel")]
             ])
         )
+        state['ack_message_id'] = ack.message_id
         return
 
     api = state.get('api', '')
     secret = text
+    original_api, original_secret = api, secret
+    # Remove setup state before validation so no credential stays in memory longer than needed.
     PENDING_API_SETUP.pop(chat_id, None)
-    status_msg = await bot.send_message(chat_id, f"🔄 Memvalidasi API {ex_id.upper()}...")
+
+    # Delete the bot's API acknowledgement and setup prompt from chat history too.
+    for mid in (state.get('ack_message_id'), state.get('prompt_message_id')):
+        if mid:
+            try: await bot.delete_message(chat_id, mid)
+            except Exception: pass
+
+    status_msg = await bot.send_message(chat_id, f"🔄 <b>Memvalidasi API {ex_id.upper()}...</b>")
 
     ok, detail, account_details = await asyncio.to_thread(validate_cex_api, ex_id, api, secret)
+    # Explicitly drop local secret references as soon as validation returns.
+    secret = ''
+    api = ''
+
     if not ok:
         safe_detail = html.escape(detail)
         await status_msg.edit_text(
@@ -1175,20 +1285,39 @@ async def handle_api_setup_message(message: Message):
     username = account_details.get('username', '-')
     uid = account_details.get('uid', '-')
     alias = account_details.get('alias', '-')
-    account_type = account_details.get('account_type', '-')
     label_parts = []
     if username != '-': label_parts.append(username)
     if uid != '-': label_parts.append(f"UID {uid}")
     if alias != '-': label_parts.append(alias)
     account_label = " | ".join(label_parts) if label_parts else "Private account terverifikasi"
 
+    # Store only the validated credentials and non-secret account metadata.
+    # The credentials remain in the DB because the trading engine needs them.
+    stored_info = {
+        'Exchange': account_details.get('exchange', '-'),
+        'Account Type': account_details.get('account_type', '-'),
+        'Market': account_details.get('market_type', '-'),
+        'Private API': account_details.get('private_api', '-'),
+        'USDT Total': account_details.get('total_usdt'),
+        'USDT Free': account_details.get('free_usdt'),
+        'USDT Used': account_details.get('used_usdt'),
+        'Open Positions': account_details.get('open_positions', 'N/A'),
+        'Open Orders': account_details.get('open_orders', 'N/A'),
+        'Trade Permission': account_details.get('trade_permission', '-'),
+        'Read Only': account_details.get('read_only', '-')
+    }
+    stored_info = {k: v for k, v in stored_info.items() if v not in (None, '', '-')}
+
     conn = sqlite3.connect(DB_FILE, timeout=5)
     conn.cursor().execute(
-        "UPDATE cex_settings SET api_key=?, secret=?, account_label=? WHERE ex_id=?",
-        (api, secret, account_label, ex_id)
+        "UPDATE cex_settings SET api_key=?, secret=?, account_label=?, account_info=? WHERE ex_id=?",
+        (original_api, original_secret, account_label, json.dumps(stored_info, ensure_ascii=False), ex_id)
     )
     conn.commit(); conn.close()
     reload_exchanges()
+
+    # Clear local credential references after persistence.
+    original_api, original_secret = '', ''
 
     await status_msg.edit_text(
         f"✅ <b>API {ex_id.upper()} VALID</b>\n\n"
@@ -1220,7 +1349,7 @@ async def cb_positions(callback: CallbackQuery):
 async def cb_settings(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
-    await callback.message.edit_text(build_settings_text(), reply_markup=main_keyboard())
+    await callback.message.edit_text(build_settings_text(), reply_markup=settings_keyboard())
 
 
 @dp.callback_query(F.data == "stats")
@@ -1256,8 +1385,9 @@ async def cb_pause(callback: CallbackQuery):
     global IS_BOT_PAUSED
     if not is_allowed_chat(callback): return
     IS_BOT_PAUSED = True
+    notify_runtime_status("PAUSED", "⏸️ <b>TRADING PAUSED</b>\nPembukaan trade baru dihentikan. Monitoring posisi tetap berjalan.")
     await safe_answer(callback, "Bot di-pause")
-    await callback.message.edit_text("⏸️ <b>Bot PAUSED</b>", reply_markup=main_keyboard())
+    await callback.message.edit_text("⏸️ <b>Bot PAUSED</b>\nPembukaan trade baru dihentikan.", reply_markup=main_keyboard())
 
 
 @dp.callback_query(F.data == "resume")
@@ -1265,8 +1395,158 @@ async def cb_resume(callback: CallbackQuery):
     global IS_BOT_PAUSED
     if not is_allowed_chat(callback): return
     IS_BOT_PAUSED = False
+    notify_runtime_status("RESUMED", "▶️ <b>TRADING RESUMED</b>\nBot kembali boleh mencari setup baru.")
     await safe_answer(callback, "Bot dilanjutkan")
-    await callback.message.edit_text("▶️ <b>Bot RESUMED</b>", reply_markup=main_keyboard())
+    await callback.message.edit_text("▶️ <b>Bot RESUMED</b>\nBot kembali aktif.", reply_markup=main_keyboard())
+
+
+@dp.callback_query(F.data == "bot_control")
+async def cb_bot_control(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "🤖 <b>BOT CONTROL</b>\n\n"
+        f"Status: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}\n"
+        f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n\n"
+        "Gunakan tombol di bawah untuk mengubah kontrol yang memang tersedia di script.",
+        reply_markup=bot_control_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "dryrun_toggle")
+async def cb_dryrun_toggle(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    value = not CONFIG['DRY_RUN']
+    CONFIG['DRY_RUN'] = value
+    update_db_setting('dry_run', 1.0 if value else 0.0)
+    await safe_answer(callback, "DRY RUN ON" if value else "REAL MONEY ON")
+    await callback.message.edit_text(
+        f"{'🧪 <b>DRY RUN AKTIF</b>' if value else '⚠️ <b>REAL MONEY AKTIF</b>'}\n\n"
+        "Mode berhasil diubah.",
+        reply_markup=bot_control_keyboard()
+    )
+    send_telegram("🧪 <b>MODE BERUBAH</b> — " + ("DRY RUN aktif. Tidak ada order real." if value else "⚠️ REAL MONEY aktif. Order real diizinkan."))
+
+
+@dp.callback_query(F.data == "cancelall")
+async def cb_cancelall(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    cancel_all_pending_orders_on_pause()
+    await safe_answer(callback, "Pending order diproses")
+    await callback.message.edit_text(
+        "🧹 <b>CANCEL ALL</b>\n\nSemua pending order yang terdaftar diproses untuk dibatalkan.",
+        reply_markup=bot_control_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "set_margin_menu")
+async def cb_set_margin_menu(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback)
+    await callback.message.edit_text("💵 <b>PILIH MARGIN / TRADE</b>", reply_markup=preset_keyboard("", [(1,'$1'),(2,'$2'),(5,'$5'),(10,'$10')], 'set_margin'))
+
+
+@dp.callback_query(F.data.startswith("set_margin:"))
+async def cb_set_margin(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    value=float(callback.data.split(':')[1])
+    CONFIG['MARGIN_PER_TRADE']=value
+    update_db_setting('margin', value)
+    await safe_answer(callback, f"Margin ${value}")
+    await callback.message.edit_text(f"✅ <b>Margin disetel:</b> ${value}", reply_markup=settings_keyboard())
+
+
+@dp.callback_query(F.data == "set_maxpos_menu")
+async def cb_set_maxpos_menu(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback)
+    await callback.message.edit_text("📊 <b>PILIH MAX POSISI</b>", reply_markup=preset_keyboard("", [(1,'1'),(2,'2'),(3,'3'),(5,'5')], 'set_maxpos'))
+
+
+@dp.callback_query(F.data.startswith("set_maxpos:"))
+async def cb_set_maxpos(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    value=int(callback.data.split(':')[1])
+    CONFIG['MAX_CONCURRENT_POSITIONS']=value
+    update_db_setting('max_pos', value)
+    await safe_answer(callback, f"Max posisi {value}")
+    await callback.message.edit_text(f"✅ <b>Max posisi:</b> {value}", reply_markup=settings_keyboard())
+
+
+@dp.callback_query(F.data == "set_minwr_menu")
+async def cb_set_minwr_menu(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback)
+    await callback.message.edit_text("🎯 <b>PILIH MINIMUM WIN RATE</b>", reply_markup=preset_keyboard("", [(30,'30%'),(40,'40%'),(50,'50%'),(60,'60%'),(70,'70%')], 'set_minwr'))
+
+
+@dp.callback_query(F.data.startswith("set_minwr:"))
+async def cb_set_minwr(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    value=float(callback.data.split(':')[1])
+    CONFIG['MIN_WR']=value
+    update_db_setting('min_wr', value)
+    await safe_answer(callback, f"Min WR {value}%")
+    await callback.message.edit_text(f"✅ <b>Min Win Rate:</b> {value}%", reply_markup=settings_keyboard())
+
+
+@dp.callback_query(F.data == "set_mintrades_menu")
+async def cb_set_mintrades_menu(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback)
+    await callback.message.edit_text("📈 <b>PILIH MINIMUM TRADE</b>", reply_markup=preset_keyboard("", [(3,'3'),(5,'5'),(10,'10'),(20,'20')], 'set_mintrades'))
+
+
+@dp.callback_query(F.data.startswith("set_mintrades:"))
+async def cb_set_mintrades(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    value=int(callback.data.split(':')[1])
+    CONFIG['MIN_TRADES']=value
+    update_db_setting('min_trades', value)
+    await safe_answer(callback, f"Min trades {value}")
+    await callback.message.edit_text(f"✅ <b>Min Trades:</b> {value}", reply_markup=settings_keyboard())
+
+
+@dp.callback_query(F.data == "set_lev_menu")
+async def cb_set_lev_menu(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback)
+    await callback.message.edit_text("⚡ <b>PILIH CEX UNTUK LEVERAGE</b>", reply_markup=leverage_keyboard())
+
+
+@dp.callback_query(F.data == "lev_all")
+async def cb_lev_all(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback)
+    await callback.message.edit_text("⚡ <b>LEVERAGE SEMUA CEX</b>", reply_markup=leverage_value_keyboard('all'))
+
+
+@dp.callback_query(F.data.startswith("lev_ex:"))
+async def cb_lev_ex(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    ex_id=callback.data.split(':',1)[1]
+    await safe_answer(callback)
+    await callback.message.edit_text(f"⚡ <b>LEVERAGE {ex_id.upper()}</b>\nSaat ini: {CONFIG['LEVERAGE'].get(ex_id,50)}x", reply_markup=leverage_value_keyboard(ex_id))
+
+
+@dp.callback_query(F.data.startswith("lev_set:"))
+async def cb_lev_set(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    _, target, value_s = callback.data.split(':',2)
+    value=int(value_s)
+    if target == 'all':
+        for ex_id in DEFAULT_CEX:
+            CONFIG['LEVERAGE'][ex_id]=value
+            update_db_setting(f'lev_{ex_id}', value)
+        text=f"✅ <b>Semua leverage:</b> {value}x"
+    else:
+        if target not in DEFAULT_CEX:
+            await safe_answer(callback, "CEX tidak dikenal", True); return
+        CONFIG['LEVERAGE'][target]=value
+        update_db_setting(f'lev_{target}', value)
+        text=f"✅ <b>Leverage {target.upper()}:</b> {value}x"
+    await safe_answer(callback, "Leverage diperbarui")
+    await callback.message.edit_text(text, reply_markup=settings_keyboard())
 
 
 async def aiogram_polling():
@@ -1340,11 +1620,18 @@ def api_stats():
     })
 
 
+def notify_runtime_status(new_status, text):
+    global last_runtime_status
+    if last_runtime_status != new_status:
+        last_runtime_status = new_status
+        send_telegram(text)
+
+
 def main_loop():
     global daily_sl_count, IS_BOT_PAUSED
 
     last_hb = time.time()
-    send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>")
+    send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>\n🟢 Trading engine siap. Menunggu kondisi scan.")
 
     while True:
         try:
@@ -1354,17 +1641,42 @@ def main_loop():
                 daily_sl_count = 0
                 if IS_BOT_PAUSED:
                     IS_BOT_PAUSED = False
-                    send_telegram("🌅 <b>NEW DAY RESET</b>")
+                    send_telegram("🌅 <b>NEW DAY RESET</b>\nBot otomatis kembali aktif.")
 
             if time.time() - last_hb >= 21600:
-                send_telegram("💓 <b>PING</b> Sistem normal.")
+                send_telegram(
+                    "💓 <b>SYSTEM PING</b>\n"
+                    f"Bot: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}\n"
+                    f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n"
+                    f"CEX aktif: {len(exchanges)}"
+                )
                 last_hb = time.time()
 
             check_and_update_daily_sl()
             update_orders_and_positions()
 
-            if not IS_BOT_PAUSED and is_kill_zone():
-                scan_markets()
+            if IS_BOT_PAUSED:
+                notify_runtime_status(
+                    'PAUSED',
+                    "⏸️ <b>TRADING PAUSED</b>\nPembukaan trade baru dihentikan. Monitoring posisi tetap berjalan."
+                )
+            elif is_kill_zone():
+                if not exchanges:
+                    notify_runtime_status(
+                        'NO_CEX',
+                        "⚠️ <b>SCAN TIDAK BERJALAN</b>\nTidak ada CEX yang sedang ON. Aktifkan CEX setelah API valid."
+                    )
+                else:
+                    notify_runtime_status(
+                        'SCANNING',
+                        "🔎 <b>SCANNING MARKET</b>\nBot sedang mencari setup sesuai logic SMC yang ada."
+                    )
+                    scan_markets()
+            else:
+                notify_runtime_status(
+                    'WAITING',
+                    "⏹️ <b>STOP TRADE / WAITING</b>\nDi luar kill zone. Bot tidak membuka trade baru dan menunggu sesi berikutnya."
+                )
 
         except Exception as e:
             send_error_alert(str(e))
