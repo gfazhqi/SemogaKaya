@@ -49,7 +49,7 @@ CONFIG = {
     'DRY_RUN': True,
     'MIN_TRADES': 5,
     'MIN_WR': 40.0,
-    'MAX_DAILY_SL': 2 # Default 2x SL per hari (0 = OFF)
+    'MAX_DAILY_SL': 2
 }
 
 IS_BOT_PAUSED = False
@@ -211,7 +211,7 @@ def cancel_all_pending_orders_on_pause():
 def check_and_update_daily_sl():
     global daily_sl_count, IS_BOT_PAUSED
     limit = CONFIG.get('MAX_DAILY_SL', 2)
-    if limit <= 0: return # Fitur Daily SL dimatikan (OFF)
+    if limit <= 0: return
 
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -374,14 +374,17 @@ def scan_markets():
                         wr = (pair_perf[sym]['w'] / tot_trades) * 100
                         if wr < CONFIG['MIN_WR']: continue
 
-                active_same = c.execute(
+                # FIX DATABASE CLOSED ERROR DI SINI
+                conn_chk = sqlite3.connect(DB_FILE, timeout=5)
+                active_same = conn_chk.cursor().execute(
                     "SELECT 1 FROM trades WHERE exchange_id=? AND symbol=? AND side=? "
                     "AND status IN ('PENDING','OPEN') LIMIT 1", (ex_id, sym, 'BUY')
                 ).fetchone()
-                active_same_sell = c.execute(
+                active_same_sell = conn_chk.cursor().execute(
                     "SELECT 1 FROM trades WHERE exchange_id=? AND symbol=? AND side=? "
                     "AND status IN ('PENDING','OPEN') LIMIT 1", (ex_id, sym, 'SELL')
                 ).fetchone()
+                conn_chk.close()
 
                 m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
                 h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
