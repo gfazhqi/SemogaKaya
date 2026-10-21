@@ -55,10 +55,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, exchange_id TEXT, symbol TEXT, order_type TEXT, side TEXT, entry_price REAL, sl_price REAL, tp_price REAL, order_id TEXT, bars_count INTEGER DEFAULT 0, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS cex_settings (ex_id TEXT PRIMARY KEY, api_key TEXT, secret TEXT, enabled INTEGER DEFAULT 0)''')
-    
-    # AUTO-FIX: Tambahkan kolom 'enabled' jika database pakai versi lama
-    try:
-        c.execute("ALTER TABLE cex_settings ADD COLUMN enabled INTEGER DEFAULT 0")
+    try: c.execute("ALTER TABLE cex_settings ADD COLUMN enabled INTEGER DEFAULT 0")
     except: pass
 
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('margin', 2.0)")
@@ -90,7 +87,14 @@ def reload_exchanges():
     exchanges.clear()
     for ex_id, api, sec, en in rows:
         if en == 1:
-            try: exchanges[ex_id] = getattr(ccxt, ex_id)({'apiKey': api if api else '', 'secret': sec if sec else '', 'options': {'defaultType': DEFAULT_CEX[ex_id]['type']}, 'enableRateLimit': True, 'timeout': 10000})
+            try: 
+                exchanges[ex_id] = getattr(ccxt, ex_id)({
+                    'apiKey': api if api else '', 
+                    'secret': sec if sec else '', 
+                    'options': {'defaultType': DEFAULT_CEX[ex_id]['type']}, 
+                    'enableRateLimit': True, 
+                    'timeout': 5000
+                })
             except: pass
 
 def update_db_setting(key, value):
@@ -99,19 +103,17 @@ def update_db_setting(key, value):
     conn.commit(); conn.close()
 
 # =================================================================
-# HELPERS (MENGGUNAKAN HTML AGAR KEBAL BLOKIR TELEGRAM)
+# HELPERS
 # =================================================================
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(url, json=payload, timeout=5)
         if r.status_code != 200:
-            print(f"Telegram API Error: {r.text}")
             payload.pop("parse_mode")
-            requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"Failed to send telegram: {e}")
+            requests.post(url, json=payload, timeout=5)
+    except: pass
 
 def send_error_alert(err_msg):
     global last_error_time
@@ -128,13 +130,11 @@ def is_manual_alert_symbol(symbol):
 
 def get_free_usdt_balance(ex_instance):
     try:
-        bal = ex_instance.fetch_balance(params={'recvWindow': 10000})
+        bal = ex_instance.fetch_balance()
         usdt = bal.get('USDT', {})
         if isinstance(usdt, dict): return float(usdt.get('free', 0.0))
         return 0.0
-    except Exception as e:
-        print(f"Balance fetch error: {e}")
-        return 0.0
+    except: return 0.0
 
 def cancel_all_pending_orders_on_pause():
     try:
@@ -156,7 +156,7 @@ def check_and_update_daily_sl():
         conn.close()
         if daily_sl_count >= MAX_DAILY_SL and not IS_BOT_PAUSED:
             IS_BOT_PAUSED = True; cancel_all_pending_orders_on_pause()
-            send_telegram(f"🛑 <b>DAILY LOSS LIMIT</b>\nKena {daily_sl_count}x SL. Bot PAUSE! Aktif besok 07:00 WIB.")
+            send_telegram(f"🛑 <b>DAILY LOSS LIMIT</b>\nKena {daily_sl_count}x SL. Bot PAUSE!")
     except: pass
 
 # =================================================================
@@ -205,10 +205,10 @@ def update_orders_and_positions():
             elif status == 'OPEN':
                 if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
                     c.execute("UPDATE trades SET status='CLOSED (TP)' WHERE id=?", (t_id,))
-                    send_telegram(f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | Profit: +1R 🚀")
+                    send_telegram(f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | +1R 🚀")
                 elif (side == 'BUY' and curr_price <= sl) or (side == 'SELL' and curr_price >= sl):
                     c.execute("UPDATE trades SET status='CLOSED (SL)' WHERE id=?", (t_id,))
-                    send_telegram(f"❌ <b>STOP LOSS{tag}</b> {sym} | Loss: -1R 🔻")
+                    send_telegram(f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻")
         except: pass
     conn.commit(); conn.close()
 
@@ -233,7 +233,7 @@ def scan_markets():
                     m15, h1, d1 = ex.fetch_ohlcv(sym,'15m',limit=50), ex.fetch_ohlcv(sym,'1h',limit=60), ex.fetch_ohlcv(sym,'1d',limit=2)
                     if m15 and h1 and d1:
                         sig, en, sl, tp = analyze_smc_retrace(pd.DataFrame(m15, columns=['time','open','high','low','close','vol']), pd.DataFrame(h1, columns=['time','open','high','low','close','vol']), d1[-1][1])
-                        if sig: send_telegram(f"📢 <b>FX ALERT</b> {sym} | {sig}\nEntry: {en:.5f} | TP: {tp:.5f}")
+                        if sig: send_telegram(f"📢 <b>FX ALERT</b> {sym} | {sig}")
                     continue
 
                 if act_count >= CONFIG['MAX_CONCURRENT_POSITIONS']: continue
@@ -264,7 +264,7 @@ def scan_markets():
                     conn.cursor().execute("INSERT INTO trades (exchange_id, symbol, order_type, side, entry_price, sl_price, tp_price, order_id, status) VALUES (?, ?, 'LIMIT', ?, ?, ?, ?, ?, 'PENDING')", (ex_id, sym, sig, en, sl, tp, ord_id))
                     conn.commit(); conn.close()
 
-                    send_telegram(f"🎯 <b>{mode}</b>\nCEX: {ex_id.upper()} | {sym} | {sig}\nEntry: {en:.5f}\nMargin: ${CONFIG['MARGIN_PER_TRADE']} ({lev}x)")
+                    send_telegram(f"🎯 <b>{mode}</b>\nCEX: {ex_id.upper()} | {sym} | {sig}\nEntry: {en:.5f}")
                     act_count += 1
         except Exception as e: send_error_alert(f"Scan Ex [{ex_id}]: {e}")
 
@@ -275,7 +275,7 @@ def telegram_polling():
     last_id = 0
     while True:
         try:
-            res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={last_id+1}&timeout=10", timeout=15).json()
+            res = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates?offset={last_id+1}&timeout=5", timeout=10).json()
             if res.get("ok"):
                 for r in res.get("result", []):
                     last_id, msg = r["update_id"], r.get("message", {})
@@ -289,7 +289,7 @@ def telegram_polling():
                             conn = sqlite3.connect(DB_FILE)
                             conn.cursor().execute("UPDATE cex_settings SET api_key=?, secret=? WHERE ex_id=?", (api, sec, ex_id))
                             conn.commit(); conn.close(); reload_exchanges()
-                            send_telegram(f"✅ API Key {ex_id.upper()} disimpan!\n⚠️ Hapus pesan API kamu dari chat!")
+                            send_telegram(f"✅ API Key {ex_id.upper()} disimpan!")
                     elif text.startswith("/cex ") and len(parts) == 3:
                         action, ex_id = parts[1].lower(), parts[2].lower()
                         if ex_id in DEFAULT_CEX and action in ['on', 'off']:
@@ -299,11 +299,11 @@ def telegram_polling():
                             send_telegram(f"✅ CEX {ex_id.upper()} di-{action.upper()}!")
 
                     elif text == "/dryrun on": CONFIG['DRY_RUN']=True; update_db_setting('dry_run',1.0); send_telegram("✅ <b>DRY RUN AKTIF</b>")
-                    elif text == "/dryrun off": CONFIG['DRY_RUN']=False; update_db_setting('dry_run',0.0); send_telegram("⚠️ <b>DRY RUN NONAKTIF</b> (Uang Asli!)")
+                    elif text == "/dryrun off": CONFIG['DRY_RUN']=False; update_db_setting('dry_run',0.0); send_telegram("⚠️ <b>REAL MONEY AKTIF</b>")
                     elif text.startswith("/setmargin ") and len(parts)==2: CONFIG['MARGIN_PER_TRADE']=float(parts[1]); update_db_setting('margin',float(parts[1])); send_telegram(f"✅ Margin: ${parts[1]}")
                     elif text.startswith("/setmaxpos ") and len(parts)==2: CONFIG['MAX_CONCURRENT_POSITIONS']=int(parts[1]); update_db_setting('max_pos',int(parts[1])); send_telegram(f"✅ Max Posisi: {parts[1]}")
                     elif text.startswith("/setminwr ") and len(parts)==2: CONFIG['MIN_WR']=float(parts[1]); update_db_setting('min_wr',float(parts[1])); send_telegram(f"✅ Min WinRate: {parts[1]}%")
-                    elif text.startswith("/setmintrades ") and len(parts)==2: CONFIG['MIN_TRADES']=int(parts[1]); update_db_setting('min_trades',int(parts[1])); send_telegram(f"✅ Jatah Trade Evaluasi: {parts[1]}x")
+                    elif text.startswith("/setmintrades ") and len(parts)==2: CONFIG['MIN_TRADES']=int(parts[1]); update_db_setting('min_trades',int(parts[1])); send_telegram(f"✅ Min Trade: {parts[1]}x")
                     elif text.startswith("/setlev "):
                         if len(parts) == 2:
                             for ex in DEFAULT_CEX.keys(): CONFIG['LEVERAGE'][ex]=int(parts[1]); update_db_setting(f'lev_{ex}',int(parts[1]))
@@ -327,12 +327,11 @@ def telegram_polling():
                             is_core = sym in CORE_PAIRS
                             core_tag = " [CORE]" if is_core else ""
                             line = f"• {sym}{core_tag}: {data['w']}W/{data['l']}L (WR: {wr:.1f}%)\n"
-                            
                             if t < CONFIG['MIN_TRADES']: eval_wait += line
                             elif is_core or wr >= CONFIG['MIN_WR']: gacor += line
                             else: blist += line
                         
-                        msg = f"🏆 <b>PERFORMA KOIN</b>\nSyarat: Min {CONFIG['MIN_TRADES']} Trade, WR {CONFIG['MIN_WR']}%\n\n🔥 <b>AKTIF TRADING</b>\n{gacor if gacor else 'Belum ada'}\n\n⏳ <b>EVALUASI</b>\n{eval_wait if eval_wait else 'Belum ada'}\n\n🗑️ <b>BLACKLIST</b>\n{blist if blist else 'Belum ada'}"
+                        msg = f"🏆 <b>PERFORMA KOIN</b>\n\n🔥 <b>AKTIF</b>\n{gacor or 'Belum ada'}\n\n⏳ <b>EVALUASI</b>\n{eval_wait or 'Belum ada'}\n\n🗑️ <b>BLACKLIST</b>\n{blist or 'Belum ada'}"
                         send_telegram(msg)
                         
                     elif text in ["/setting", "/settings"]:
@@ -340,37 +339,15 @@ def telegram_polling():
                             conn = sqlite3.connect(DB_FILE)
                             cex_db = conn.cursor().execute("SELECT ex_id, api_key, enabled FROM cex_settings").fetchall()
                             conn.close()
-                            
-                            mode_text = "🟢 DRY RUN (Simulasi)" if CONFIG['DRY_RUN'] else "⚠️ REAL MONEY (Uang Asli)"
-                            
-                            cex_info = ""
-                            for ex, api, en in cex_db:
-                                status = "🟢 ON" if en else "🔴 OFF"
-                                api_stat = "✅ Terpasang" if api else "❌ Kosong"
-                                lev = CONFIG['LEVERAGE'].get(ex, 50)
-                                cex_info += f"• {ex.upper()}: {status} | Lev: {lev}x | API: {api_stat}\n"
-                            
-                            if not cex_info: cex_info = "Belum ada data CEX\n"
-                            
-                            msg = (f"⚙️ <b>INFORMASI SETTING BOT</b>\n\n"
-                                   f"<b>MODE TRADING:</b>\n{mode_text}\n\n"
-                                   f"<b>RISK MANAGEMENT:</b>\n"
-                                   f"• Margin per Trade: ${CONFIG['MARGIN_PER_TRADE']}\n"
-                                   f"• Max Posisi: {CONFIG['MAX_CONCURRENT_POSITIONS']} Trade\n"
-                                   f"• Max Daily SL: {MAX_DAILY_SL}x SL\n\n"
-                                   f"<b>AUTO-BLACKLIST:</b>\n"
-                                   f"• Min Evaluasi: {CONFIG['MIN_TRADES']}x Trade\n"
-                                   f"• Min WinRate: {CONFIG['MIN_WR']}%\n\n"
-                                   f"<b>STATUS BURSA:</b>\n"
-                                   f"{cex_info}")
-                            
+                            mode_text = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL MONEY"
+                            cex_info = "".join([f"• {ex.upper()}: {'🟢 ON' if en else '🔴 OFF'} | Lev: {CONFIG['LEVERAGE'].get(ex, 50)}x | API: {'✅' if api else '❌'}\n" for ex, api, en in cex_db])
+                            msg = f"⚙️ <b>SETTING BOT</b>\n\nMode: {mode_text}\nMargin: ${CONFIG['MARGIN_PER_TRADE']}\nMax Pos: {CONFIG['MAX_CONCURRENT_POSITIONS']}\n\n<b>BURSA:</b>\n{cex_info or 'Belum ada'}"
                             send_telegram(msg)
                         except Exception as e:
-                            print(f"Error Setting: {e}")
-                            send_telegram(f"⚠️ ERROR SETTING: {e}")
+                            send_telegram(f"⚠️ ERROR: {e}")
 
                     elif text in ["/start", "/help"]:
-                        send_telegram("🤖 <b>COMMANDS</b>\n• /cex on/off | /setapi cex api secret\n• /dryrun on/off\n• /posisi | /setting | /stat | /pairperf\n• /setmargin | /setlev | /setmaxpos\n• /setminwr | /setmintrades\n• /cancelall | /pause | /resume")
+                        send_telegram("🤖 <b>COMMANDS</b>\n• /cex on/off | /setapi cex api secret\n• /dryrun on/off\n• /posisi | /setting | /stat | /pairperf\n• /setmargin | /setlev | /setmaxpos")
                     
                     elif text == "/posisi":
                         try:
@@ -379,41 +356,35 @@ def telegram_polling():
                             cex_db = c.execute("SELECT ex_id, api_key, enabled FROM cex_settings").fetchall()
                             conn.close()
                             
-                            cex_stat = "".join([f"• {ex.upper()} {'🟢 ON' if en else '🔴 OFF'} | API: {'✅ SET' if api else '❌ KOSONG'}\n" for ex, api, en in cex_db])
-                            if not cex_stat: cex_stat = "Belum ada data CEX\n"
+                            cex_stat = "".join([f"• {ex.upper()} {'🟢 ON' if en else '🔴 OFF'}\n" for ex, api, en in cex_db])
                             
-                            bal = "\n".join([f"• {k.upper()} Free: ${get_free_usdt_balance(v):.2f}" for k,v in exchanges.items()])
-                            if not bal: bal = "• Saldo: $0.00 (Belum ada CEX yg ON)"
-                            
-                            mode = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL MONEY"
-                            stat_bot = "PAUSED 🛑" if IS_BOT_PAUSED else "RUNNING 🟢"
-                            
-                            m = (f"📊 <b>STATUS & POSISI</b>\n"
-                                 f"Bot: {stat_bot}\n"
-                                 f"Mode: {mode}\n"
-                                 f"SL Harian: {daily_sl_count}/{MAX_DAILY_SL}\n\n"
-                                 f"🔌 <b>CEX:</b>\n{cex_stat}\n"
-                                 f"💰 <b>SALDO:</b>\n{bal}\n\n"
-                                 f"📋 <b>ANTREAN:</b> {len(trades)}\n")
+                            # Pengecekan saldo aman anti-hang
+                            bal = ""
+                            for k, v in exchanges.items():
+                                try:
+                                    b = get_free_usdt_balance(v)
+                                    bal += f"• {k.upper()} Free: ${b:.2f}\n"
+                                except:
+                                    bal += f"• {k.upper()} Free: Error/Timeout\n"
+                            if not bal: bal = "• Saldo: Tidak ada CEX aktif"
+
+                            mode = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL"
+                            m = f"📊 <b>STATUS & POSISI</b>\nBot: {'PAUSED' if IS_BOT_PAUSED else 'RUNNING'} | Mode: {mode}\n\n🔌 <b>CEX:</b>\n{cex_stat}\n💰 <b>SALDO:</b>\n{bal}\n📋 <b>ANTREAN:</b> {len(trades)}\n"
                             for t in trades: 
-                                tag = "[SIM]" if str(t[4]).startswith('sim_') else ""
-                                m += f"• {t[0].upper()} | {t[1]} {tag} | {t[2]} | {t[3]}\n"
-                            
+                                m += f"• {t[0].upper()} | {t[1]} | {t[2]} | {t[3]}\n"
                             send_telegram(m)
                         except Exception as e:
-                            print(f"Error Posisi: {e}")
                             send_telegram(f"⚠️ ERROR POSISI: {e}")
 
-                    elif text == "/pause": IS_BOT_PAUSED = True; send_telegram("⏸️ Bot PAUSED")
-                    elif text == "/resume": IS_BOT_PAUSED = False; send_telegram("▶️ Bot RESUMED")
+                    elif text == "/pause": IS_BOT_PAUSED = True; send_telegram("⏸️ Paused")
+                    elif text == "/resume": IS_BOT_PAUSED = False; send_telegram("▶️ Resumed")
                     elif text == "/cancelall": cancel_all_pending_orders_on_pause()
                     elif text == "/stat":
                         conn = sqlite3.connect(DB_FILE)
                         stats = "\n".join([f"• {s[0]}: {s[1]}" for s in conn.cursor().execute("SELECT status, COUNT(*) FROM trades GROUP BY status").fetchall()])
                         conn.close()
-                        send_telegram(f"📈 <b>STATISTIK</b>\n\n{stats}")
-        except Exception as e: 
-            time.sleep(5)
+                        send_telegram(f"📈 <b>STATISTIK</b>\n\n{stats or 'Belum ada data'}")
+        except: time.sleep(3)
         time.sleep(1)
 
 # =================================================================
@@ -430,20 +401,16 @@ def api_stats():
     conn = sqlite3.connect(DB_FILE)
     df = pd.read_sql_query("SELECT symbol, side, status, created_at FROM trades WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)') ORDER BY id ASC", conn)
     conn.close()
-
     if df.empty: return jsonify({'dates': [], 'pnl': [], 'win_rate': 0, 'wins': 0, 'losses': 0, 'net_pnl': 0, 'recent': []})
-
     margin = CONFIG.get('MARGIN_PER_TRADE', 2.0)
     df['pnl_value'] = df['status'].apply(lambda x: margin if 'TP' in x else -margin)
     df['cum_pnl'] = df['pnl_value'].cumsum()
     df['date_only'] = pd.to_datetime(df['created_at']).dt.strftime('%d %b %H:%M')
-
     wins, losses = len(df[df['status'] == 'CLOSED (TP)']), len(df[df['status'] == 'CLOSED (SL)'])
     total = wins + losses
     win_rate = round((wins / total) * 100, 1) if total > 0 else 0
     net_pnl = round(df['cum_pnl'].iloc[-1], 2) if not df.empty else 0
     recent = df.tail(10)[::-1].to_dict('records')
-
     return jsonify({'dates': df['date_only'].tolist(), 'pnl': df['cum_pnl'].tolist(), 'win_rate': win_rate, 'wins': wins, 'losses': losses, 'net_pnl': net_pnl, 'recent': recent})
 
 def main_loop():
