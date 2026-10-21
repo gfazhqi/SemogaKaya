@@ -9,8 +9,10 @@ import ccxt
 import asyncio
 import html
 import json
+import re
 import zipfile
 import shutil
+import tempfile
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -26,6 +28,14 @@ from flask import Flask, render_template, jsonify
 # CONFIGURATION & PARAMETERS
 # =================================================================
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
+# Optional public signal channel. Set PUBLIC_CHANNEL_ID in config.py or environment.
+PUBLIC_CHANNEL_ID = os.getenv('PUBLIC_CHANNEL_ID') or getattr(__import__('config'), 'PUBLIC_CHANNEL_ID', '')
+PUBLIC_MAX_SIGNALS_PER_SESSION = 5
+PUBLIC_SESSION_COUNTS = {}
+PUBLIC_SIGNAL_MESSAGES = {}
+PUBLIC_SESSION_SUMMARY_SENT = set()
+PUBLIC_CHANNEL_ENABLED = bool(PUBLIC_CHANNEL_ID)
 
 SL_BUFFER_PERCENT = 0.0005
 MAX_DAILY_SL = 2
@@ -54,12 +64,8 @@ DB_LOCK = threading.RLock()
 EXCHANGE_SCAN_NEXT = {}
 EXCHANGE_MARKETS = {}
 EXCHANGE_LAST_CANDLE = {}
-EXCHANGE_SCAN_CURSOR = {}
-EXCHANGE_REQUEST_NEXT = {}
-BINGX_BACKOFF_SECONDS = 30
-BINGX_REQUEST_SPACING = 0.35
-SCANNER_MIN_INTERVAL = 15
-
+BINGX_BACKOFF_SECONDS = 90
+SCANNER_MIN_INTERVAL = 30
 
 CONFIG = {
     'MARGIN_PER_TRADE': 2.0,
@@ -180,13 +186,11 @@ def load_settings():
 
 
 def reload_exchanges():
-    global exchanges, EXCHANGE_MARKETS, EXCHANGE_SCAN_NEXT, EXCHANGE_LAST_CANDLE, EXCHANGE_SCAN_CURSOR, EXCHANGE_REQUEST_NEXT
+    global exchanges, EXCHANGE_MARKETS, EXCHANGE_SCAN_NEXT, EXCHANGE_LAST_CANDLE
 
     rows = db_read(
         "SELECT ex_id, api_key, secret, enabled, password FROM cex_settings"
     )
-    EXCHANGE_SCAN_CURSOR = {}
-    EXCHANGE_REQUEST_NEXT = {}
 
     exchanges.clear()
     EXCHANGE_MARKETS.clear()
@@ -204,8 +208,6 @@ def reload_exchanges():
                 'enableRateLimit': True,
                 'timeout': 8000
             }
-            if ex_id == 'bingx':
-                params['rateLimit'] = 350
             if ex_id == 'bitget':
                 # CCXT/Bitget uses `password` for API passphrase.
                 params['password'] = password or ''
@@ -310,6 +312,203 @@ def send_telegram(message):
     except Exception:
         pass
 
+
+def _public_session_key():
+    """Use the bot's existing trading kill-zones as public-signal sessions."""
+    now = datetime.now(WIB)
+    h = now.hour
+    if 14 <= h < 17:
+        return now.strftime('%Y-%m-%d') + ':SESSION_A'
+    if 19 <= h < 22:
+        return now.strftime('%Y-%m-%d') + ':SESSION_B'
+    return now.strftime('%Y-%m-%d') + ':OUTSIDE'
+
+
+def _public_session_label(key):
+    if ':SESSION_A' in key:
+        return '14:00–17:00 WIB'
+    if ':SESSION_B' in key:
+        return '19:00–22:00 WIB'
+    return 'Outside session'
+
+
+def _public_can_send():
+    if not PUBLIC_CHANNEL_ENABLED:
+        return False
+    key = _public_session_key()
+    return ':SESSION_' in key and PUBLIC_SESSION_COUNTS.get(key, 0) < PUBLIC_MAX_SIGNALS_PER_SESSION
+
+
+def _public_send_signal(t_id, ex_id, sym, side, en, sl, tp):
+    """Publish max 5 crypto scalp signals per session; never creates a trade."""
+    if not _public_can_send() or not _is_public_crypto_symbol(sym):
+        return False
+    try:
+        risk = abs(float(en) - float(sl))
+        if risk <= 0:
+            return False
+        tp1 = float(en) + (risk if side == 'BUY' else -risk)
+        tp2 = float(en) + (2.0 * risk if side == 'BUY' else -2.0 * risk)
+        key = _public_session_key()
+        n = PUBLIC_SESSION_COUNTS.get(key, 0) + 1
+        now = datetime.now(WIB)
+        text = (
+            f"📣 <b>SCALP TRADE SIGNAL #{n}/5</b>\n\n"
+            f"📅 {now.strftime('%d %B %Y')}\n"
+            f"🕐 {now.strftime('%H:%M:%S')} WIB\n\n"
+            f"🪙 <b>{html.escape(sym)}</b> | {side}\n"
+            f"🏦 {ex_id.upper()}\n\n"
+            f"🎯 Entry: <code>{en:.8f}</code>\n"
+            f"🛑 SL: <code>{sl:.8f}</code>\n"
+            f"💰 TP1: <code>{tp1:.8f}</code> (1R)\n"
+            f"🚀 TP2: <code>{tp2:.8f}</code> (2R)\n\n"
+            f"⚡ <b>SCALP TRADE</b>\n"
+            f"📊 Timeframe: M15\n\n"
+            f"ℹ️ <i>Public signal only — tidak membuka trade dari channel.</i>"
+        )
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={'chat_id': PUBLIC_CHANNEL_ID, 'text': text, 'parse_mode': 'HTML'},
+            timeout=8
+        )
+        if r.status_code != 200:
+            return False
+        data = r.json().get('result', {})
+        PUBLIC_SESSION_COUNTS[key] = n
+        PUBLIC_SIGNAL_MESSAGES[t_id] = {
+            'chat_id': PUBLIC_CHANNEL_ID,
+            'message_id': data.get('message_id'),
+            'session_key': key,
+            'tp1': tp1,
+            'tp2': tp2,
+            'side': side,
+            'entry': float(en),
+            'sl': float(sl),
+            'status': 'PUBLISHED',
+            'r': 0.0,
+            'symbol': sym,
+            'exchange': ex_id,
+        }
+        return True
+    except Exception as e:
+        send_error_alert(f"Public channel signal: {e}")
+        return False
+
+
+def _public_update(t_id, status, extra=''):
+    info = PUBLIC_SIGNAL_MESSAGES.get(t_id)
+    if not info or not info.get('message_id'):
+        return
+    try:
+        side = info['side']; en = info['entry']; sl = info['sl']
+        tp1 = info['tp1']; tp2 = info['tp2']
+        if status == 'OPEN': title = '🟢 <b>ENTRY TRIGGERED</b>'
+        elif status == 'TP1': title = '🎉 <b>TP1 HIT — +1R</b>'
+        elif status == 'TP2': title = '🚀 <b>TP2 HIT — +2R</b>'
+        elif status == 'SL': title = '❌ <b>SL HIT — -1R</b>'
+        else: title = f'ℹ️ <b>{html.escape(status)}</b>'
+        text = (
+            f"{title}\n\n"
+            f"📅 {datetime.now(WIB).strftime('%d %B %Y')}\n"
+            f"🪙 <b>{html.escape(str(info.get('symbol', extra or '')))}</b>\n"
+            f"🏦 {html.escape(str(info.get('exchange','')).upper())}\n"
+            f"↕️ {side}\n"
+            f"🎯 Entry: <code>{en:.8f}</code>\n"
+            f"🛑 SL: <code>{sl:.8f}</code>\n"
+            f"💰 TP1: <code>{tp1:.8f}</code> (1R)\n"
+            f"🚀 TP2: <code>{tp2:.8f}</code> (2R)\n\n"
+            f"⚡ <b>SCALP TRADE</b> | M15"
+        )
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText",
+            json={'chat_id': info['chat_id'], 'message_id': info['message_id'], 'text': text, 'parse_mode': 'HTML'},
+            timeout=8
+        )
+        info['status'] = status
+        info['r'] = 2.0 if status == 'TP2' else (1.0 if status == 'TP1' else (-1.0 if status == 'SL' else 0.0))
+    except Exception:
+        pass
+
+
+def _is_public_crypto_symbol(sym):
+    raw = str(sym).upper()
+    if not re.fullmatch(r'[A-Z0-9]{2,20}/USDT(?::USDT)?', raw):
+        return False
+    base = raw.split('/')[0]
+    if base in {'XAU','XAG','WTI','USOIL','EUR','GBP','JPY','AUD','CAD','CHF','NZD'}:
+        return False
+    if re.search(r'\d+[LS]$', base) or any(x in base for x in ('UP','DOWN','BULL','BEAR')):
+        return False
+    return True
+
+
+def _public_monitor_signals():
+    """Monitor public-only signals. This never inserts/changes a trade."""
+    if not PUBLIC_CHANNEL_ENABLED:
+        return
+    for t_id, info in list(PUBLIC_SIGNAL_MESSAGES.items()):
+        if info.get('status') in ('TP2', 'SL'):
+            continue
+        ex = exchanges.get(info.get('exchange'))
+        if not ex:
+            continue
+        try:
+            price = float(ex.fetch_ticker(info['symbol']).get('last') or 0)
+            if price <= 0: continue
+            side=info['side']; tp1=info['tp1']; tp2=info['tp2']; sl=info['sl']
+            if side == 'BUY':
+                if price >= tp2: _public_update(t_id,'TP2',info['symbol'])
+                elif price >= tp1 and info.get('status') not in ('TP1','TP2'):
+                    _public_update(t_id,'TP1',info['symbol'])
+                elif price <= sl and info.get('status') not in ('TP1','TP2'):
+                    _public_update(t_id,'SL',info['symbol'])
+            else:
+                if price <= tp2: _public_update(t_id,'TP2',info['symbol'])
+                elif price <= tp1 and info.get('status') not in ('TP1','TP2'):
+                    _public_update(t_id,'TP1',info['symbol'])
+                elif price >= sl and info.get('status') not in ('TP1','TP2'):
+                    _public_update(t_id,'SL',info['symbol'])
+        except Exception:
+            continue
+
+
+def _public_maybe_finalize_session():
+    """Send one session result at the first loop after the session closes."""
+    now=datetime.now(WIB); h=now.hour
+    candidates=[]
+    if h >= 17:
+        candidates.append(now.strftime('%Y-%m-%d')+':SESSION_A')
+    if h >= 22:
+        candidates.append(now.strftime('%Y-%m-%d')+':SESSION_B')
+    # If a new day starts, finalize yesterday's sessions too.
+    yesterday=(now.date()-timedelta(days=1)).strftime('%Y-%m-%d')
+    candidates += [yesterday+':SESSION_A', yesterday+':SESSION_B']
+    for key in candidates:
+        if key in PUBLIC_SESSION_SUMMARY_SENT or not PUBLIC_CHANNEL_ENABLED:
+            continue
+        items=[v for v in PUBLIC_SIGNAL_MESSAGES.values() if v.get('session_key')==key]
+        if not items:
+            PUBLIC_SESSION_SUMMARY_SENT.add(key); continue
+        wins=sum(1 for x in items if x.get('status') in ('TP1','TP2'))
+        losses=sum(1 for x in items if x.get('status')=='SL')
+        unresolved=len(items)-wins-losses
+        decided=wins+losses
+        wr=(wins/decided*100) if decided else 0.0
+        rr=sum(float(x.get('r',0)) for x in items)
+        date_part=key.split(':')[0]
+        label='14:00–17:00 WIB' if key.endswith('SESSION_A') else '19:00–22:00 WIB'
+        details='\n'.join(f"#{x.get('n','-')} {x.get('symbol')} {'✅' if x.get('status') in ('TP1','TP2') else ('❌' if x.get('status')=='SL' else '⏳')}" for x in items)
+        text=(f"📊 <b>SCALP TRADE — SESSION RESULT</b>\n\n"
+              f"📅 Tanggal: {datetime.strptime(date_part,'%Y-%m-%d').strftime('%d %B %Y')}\n"
+              f"🕐 Sesi: {label}\n\n"
+              f"📢 Total Signal: {len(items)}\n✅ TP: {wins}\n❌ SL: {losses}\n⏳ Unresolved: {unresolved}\n\n"
+              f"🏆 Win Rate: <b>{wr:.1f}%</b>\n📈 Result: <b>{rr:+.2f}R</b>\n\n{details}")
+        try:
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                          json={'chat_id':PUBLIC_CHANNEL_ID,'text':text,'parse_mode':'HTML'}, timeout=8)
+            PUBLIC_SESSION_SUMMARY_SENT.add(key)
+        except Exception:
+            pass
 
 def send_error_alert(err_msg):
     global last_error_time, ERROR_HISTORY
@@ -672,6 +871,7 @@ def update_orders_and_positions():
                             send_telegram(
                                 f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!"
                             )
+                            _public_update(t_id, 'OPEN', sym)
                         elif n_stat != 'PENDING':
                             if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
                                 try:
@@ -713,6 +913,7 @@ def update_orders_and_positions():
                                 send_telegram(
                                     f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | +1R 🚀"
                                 )
+                                _public_update(t_id, 'TP1', sym)
 
                         elif (side == 'BUY' and curr_price <= sl) or (
                             side == 'SELL' and curr_price >= sl
@@ -726,6 +927,7 @@ def update_orders_and_positions():
                                 send_telegram(
                                     f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻"
                                 )
+                                _public_update(t_id, 'SL', sym)
 
                 except Exception as e:
                     # Keep one bad symbol from aborting the whole monitor pass.
@@ -769,7 +971,7 @@ def build_runtime_status_text():
         "",
         f"{engine} | {mode}",
         f"⏱ Uptime: {_fmt_uptime(time.time() - BOT_STARTED_AT)}",
-        f"🧠 Strategy: SMC M15 / H1 / D1",
+        f"🧠 Strategy: SMC M15 + H1 filters",
         f"🕐 Kill Zone: {kill}",
         "",
         "🔎 <b>SCANNER PER CEX</b>",
@@ -827,12 +1029,39 @@ def _is_retryable_market_error(ex_id, exc):
     )
 
 
-def _valid_usdt_swap_symbols(ex_id, ex):
-    """Return active USDT-settled perpetual symbols only.
+def _is_clean_crypto_perpetual_symbol(sym, market):
+    """Reject leveraged/structured/obviously non-standard instruments.
 
-    This intentionally avoids random/expired/non-contract instruments that
-    can appear in fetch_tickers(). The strategy itself remains M15/H1/D1.
+    The exchange catalogue can contain USDT-settled contracts that technically
+    satisfy contract+swap+USDT but are not normal crypto perpetuals (for example
+    leveraged-token style symbols ending in 2L/2S/3L/3S or UP/DOWN). Those
+    symbols must never reach strategy analysis or order creation.
     """
+    s = str(sym or '').upper()
+    base = str((market or {}).get('base', '') or '').upper()
+
+    # Common Binance/BingX/etc leveraged or directional token suffixes.
+    if re.search(r'(?:[2-9]L|[2-9]S)$', base) or re.search(r'(?:[2-9]L|[2-9]S)$', s.split('/')[0]):
+        return False
+    if re.search(r'(?:UP|DOWN)$', base) or re.search(r'(?:UP|DOWN)$', s.split('/')[0]):
+        return False
+
+    # Explicitly reject common structured/legacy/test instruments.
+    bad_tokens = ('BULL', 'BEAR', 'TEST', '1000', 'HEDGE')
+    if any(tok in base or tok in s for tok in bad_tokens):
+        return False
+
+    # Only standard USDT-quoted symbols. Reject unusual separator/format.
+    if ':' not in s:
+        return False
+    if '/USDT:USDT' not in s:
+        return False
+
+    return True
+
+
+def _valid_usdt_swap_symbols(ex_id, ex):
+    """Return active, normal USDT-settled crypto perpetual symbols only."""
     markets = EXCHANGE_MARKETS.get(ex_id) or getattr(ex, 'markets', {}) or {}
     symbols = []
 
@@ -849,46 +1078,19 @@ def _valid_usdt_swap_symbols(ex_id, ex):
             continue
         if str(m.get('settle', '')).upper() != 'USDT':
             continue
-        # Skip obvious test/expired/legacy instruments.
-        if any(x in sym.upper() for x in ('TEST', '1000', 'BULL', 'BEAR')):
+        if not _is_clean_crypto_perpetual_symbol(sym, m):
             continue
         symbols.append(sym)
 
-    # Core pairs first, then deterministic order. We do not cap by the first
-    # 60 dictionary entries because that made some CEXs effectively invisible.
     core = [s for s in CORE_PAIRS if s in symbols]
     rest = sorted(s for s in symbols if s not in core)
     return core + rest
 
 
-def _bingx_ohlcv(ex, symbol, timeframe, limit):
-    """Rate-limit BingX public OHLCV calls without blocking other CEXs."""
-    if getattr(ex, 'id', '') != 'bingx':
-        return ex.fetch_ohlcv(symbol, timeframe, limit=limit)
-
-    now = time.time()
-    wait = EXCHANGE_REQUEST_NEXT.get('bingx', 0) - now
-    if wait > 0:
-        time.sleep(wait)
-
-    try:
-        data = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
-        EXCHANGE_REQUEST_NEXT['bingx'] = time.time() + BINGX_REQUEST_SPACING
-        return data
-    except Exception:
-        EXCHANGE_REQUEST_NEXT['bingx'] = time.time() + BINGX_REQUEST_SPACING
-        raise
-
-
 def _scan_one_exchange(ex_id, ex, pair_perf):
     now = time.time()
-    runtime = EXCHANGE_RUNTIME.setdefault(
-        ex_id,
-        {'state': 'IDLE', 'last_scan': '-', 'last_reason': '',
-         'signals': 0, 'created': 0}
-    )
+    runtime = EXCHANGE_RUNTIME.setdefault(ex_id, {'state': 'IDLE', 'last_scan': '-', 'last_reason': '', 'signals': 0, 'created': 0})
     runtime['state'] = 'SCANNING'
-
     if now < EXCHANGE_SCAN_NEXT.get(ex_id, 0):
         return 0
 
@@ -896,29 +1098,29 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
         symbols = _valid_usdt_swap_symbols(ex_id, ex)
         runtime['last_scan'] = datetime.now(WIB).strftime('%H:%M:%S')
         runtime['last_reason'] = f'{len(symbols)} valid USDT perpetual markets'
-
         if not symbols:
             EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
             return 0
 
-        # IMPORTANT:
-        # Do not use one "probe" symbol to gate the entire exchange.
-        # BingX can return 100410 on one request while other symbols are fine.
-        # Scan a small rotating batch instead of firing hundreds of OHLCV
-        # requests at once. This keeps M15 logic unchanged while avoiding
-        # BingX's global/IP+UID rate limiter.
-        if ex_id == 'bingx':
-            batch_size = 4
-            cursor = EXCHANGE_SCAN_CURSOR.get(ex_id, 0) % len(symbols)
-            scan_symbols = [
-                symbols[(cursor + i) % len(symbols)]
-                for i in range(min(batch_size, len(symbols)))
-            ]
-            EXCHANGE_SCAN_CURSOR[ex_id] = (cursor + len(scan_symbols)) % len(symbols)
-        else:
-            # Other exchanges retain the existing broad scan behavior.
-            scan_symbols = symbols
+        # One lightweight closed-candle probe per exchange. If the M15 candle
+        # has not changed, there is no reason to recalculate every pair.
+        probe = symbols[0]
+        probe_bars = ex.fetch_ohlcv(probe, '15m', limit=3)
+        if not probe_bars or len(probe_bars) < 2:
+            EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
+            return 0
 
+        closed_candle_ts = probe_bars[-2][0]
+        if EXCHANGE_LAST_CANDLE.get(ex_id) == closed_candle_ts:
+            runtime['last_reason'] = 'Menunggu candle M15 baru'
+            EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
+            return 0
+
+        EXCHANGE_LAST_CANDLE[ex_id] = closed_candle_ts
+
+        # MAX positions is applied per active CEX. This prevents the first CEX
+        # in the dictionary (usually BingX) from consuming the global quota and
+        # starving Bitget/Bybit/Binance.
         active_count = db_read(
             "SELECT COUNT(*) FROM trades "
             "WHERE exchange_id=? AND status IN ('PENDING','OPEN')",
@@ -932,17 +1134,17 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
             return 0
 
         created = 0
-        rate_limited = 0
 
-        for sym in scan_symbols:
+        for sym in symbols:
             if created >= slots:
                 break
 
             if is_manual_alert_symbol(sym):
+                # Manual-alert pairs are alerts only, not normal trade slots.
                 try:
-                    m15 = _bingx_ohlcv(ex, sym, '15m', 50) if ex_id == 'bingx' else ex.fetch_ohlcv(sym, '15m', limit=50)
-                    h1 = _bingx_ohlcv(ex, sym, '1h', 60) if ex_id == 'bingx' else ex.fetch_ohlcv(sym, '1h', limit=60)
-                    d1 = _bingx_ohlcv(ex, sym, '1d', 2) if ex_id == 'bingx' else ex.fetch_ohlcv(sym, '1d', limit=2)
+                    m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
+                    h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
+                    d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
                     if m15 and h1 and d1:
                         sig, _, _, _ = analyze_smc_retrace(
                             pd.DataFrame(m15, columns=['time','open','high','low','close','vol']),
@@ -951,10 +1153,8 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                         )
                         if sig:
                             send_telegram(f"📢 <b>FX ALERT</b> {sym} | {sig}")
-                except Exception as e:
-                    if _is_retryable_market_error(ex_id, e):
-                        rate_limited += 1
-                    continue
+                except Exception:
+                    pass
                 continue
 
             if sym in pair_perf and sym not in CORE_PAIRS:
@@ -964,23 +1164,19 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                     if wr < CONFIG['MIN_WR']:
                         continue
 
+            # Final symbol safety gate immediately before any analysis/order.
+            market_meta = (EXCHANGE_MARKETS.get(ex_id) or {}).get(sym)
+            if not _is_clean_crypto_perpetual_symbol(sym, market_meta):
+                runtime['last_reason'] = f'{sym}: blocked non-standard/leveraged symbol'
+                continue
+
             try:
-                if ex_id == 'bingx':
-                    m15 = _bingx_ohlcv(ex, sym, '15m', 50)
-                    h1 = _bingx_ohlcv(ex, sym, '1h', 60)
-                    d1 = _bingx_ohlcv(ex, sym, '1d', 2)
-                else:
-                    m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
-                    h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
-                    d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
+                m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
+                h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
+                d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
             except Exception as e:
-                # A BingX 100410 belongs to this symbol/request only.
-                # Never abort the whole BingX scan and never put the entire
-                # CEX into a 90-second dead period.
                 if _is_retryable_market_error(ex_id, e):
-                    rate_limited += 1
-                    runtime['last_reason'] = f'{sym}: market cooldown, skip symbol'
-                    continue
+                    raise
                 continue
 
             if not m15 or not h1 or not d1:
@@ -996,6 +1192,7 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                 runtime['last_reason'] = f'{sym}: no setup / filter'
                 continue
 
+            # Avoid duplicate setup on the same exchange/pair/side.
             exists = db_read(
                 "SELECT 1 FROM trades "
                 "WHERE exchange_id=? AND symbol=? AND side=? "
@@ -1017,6 +1214,12 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                 except Exception:
                     pass
 
+                # Never send a live order for a symbol that failed the
+                # normalized perpetual-market safety filter.
+                if not _is_clean_crypto_perpetual_symbol(sym, (EXCHANGE_MARKETS.get(ex_id) or {}).get(sym)):
+                    runtime['last_reason'] = f'{sym}: order blocked by symbol safety filter'
+                    continue
+
                 try:
                     ord_id = str(ex.create_order(
                         sym,
@@ -1035,13 +1238,14 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
 
             conn = sqlite3.connect(DB_FILE, timeout=10)
             try:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO trades "
                     "(exchange_id, symbol, order_type, side, entry_price, "
                     "sl_price, tp_price, order_id, status) "
                     "VALUES (?, ?, 'LIMIT', ?, ?, ?, ?, ?, 'PENDING')",
                     (ex_id, sym, sig, en, sl, tp, ord_id)
                 )
+                t_id = cur.lastrowid
                 conn.commit()
             finally:
                 conn.close()
@@ -1051,36 +1255,36 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                 f"CEX: {ex_id.upper()} | {sym} | {sig}\n"
                 f"Entry: {en:.5f}"
             )
+            # Public channel is signal-only: it never inserts a trade or changes execution.
+            _public_send_signal(t_id, ex_id, sym, sig, en, sl, tp)
             created += 1
             runtime['signals'] = runtime.get('signals', 0) + 1
             runtime['created'] = runtime.get('created', 0) + 1
             runtime['last_reason'] = f'{sym}: {sig} setup created'
             set_runtime_event(f'{ex_id.upper()} {sym} {sig} setup created')
 
-        if rate_limited:
-            runtime['last_reason'] = (
-                f'{rate_limited} symbol request kena 100410, '
-                f'skip lokal; scanner tetap jalan'
-            )
-
         runtime['state'] = 'SCANNING'
         EXCHANGE_SCAN_NEXT[ex_id] = time.time() + SCANNER_MIN_INTERVAL
         return created
 
     except Exception as e:
-        runtime['state'] = 'ERROR'
-        runtime['last_reason'] = str(e)[:160]
-        set_runtime_event(f'{ex_id.upper()} scanner error')
-        # Only a genuine exchange-level failure gets a short retry delay.
-        EXCHANGE_SCAN_NEXT[ex_id] = time.time() + SCANNER_MIN_INTERVAL
         if _is_retryable_market_error(ex_id, e):
+            runtime['state'] = 'ERROR'
+            runtime['last_reason'] = f'Cooldown/rate limit: {str(e)[:120]}'
+            set_runtime_event(f'{ex_id.upper()} cooldown/rate-limit')
+            EXCHANGE_SCAN_NEXT[ex_id] = time.time() + BINGX_BACKOFF_SECONDS
             send_error_alert(
-                f"Scan Ex [{ex_id}]: market data cooldown "
-                f"(skip batch, scanner lanjut)"
+                f"Scan Ex [{ex_id}]: market data cooldown {BINGX_BACKOFF_SECONDS}s "
+                f"({str(e)[:500]})"
             )
         else:
+            runtime['state'] = 'ERROR'
+            runtime['last_reason'] = str(e)[:160]
+            set_runtime_event(f'{ex_id.upper()} scanner error')
+            EXCHANGE_SCAN_NEXT[ex_id] = time.time() + SCANNER_MIN_INTERVAL
             send_error_alert(f"Scan Ex [{ex_id}]: {e}")
         return 0
+
 
 def scan_markets():
     """Scan every enabled CEX independently without changing SMC formulas."""
@@ -1119,8 +1323,6 @@ dp = Dispatcher()
 # Prompt/ack message IDs are tracked so the API setup conversation can be cleaned up.
 PENDING_API_SETUP = {}
 PENDING_RESTORE = set()
-BACKUP_DIR = Path("backups")
-BACKUP_DIR.mkdir(exist_ok=True)
 
 
 def is_allowed_chat(message_or_callback):
@@ -1671,48 +1873,33 @@ async def delete_backup_message_later(chat_id: int, message_id: int, delay: int 
 
 
 def create_database_backup():
-    """Create a consistent SQLite backup without copying a live WAL file blindly."""
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    raw_db = BACKUP_DIR / f"trades_{ts}.db"
-    zip_path = BACKUP_DIR / f"alchemist_backup_{ts}.zip"
-    src = sqlite3.connect(DB_FILE, timeout=20)
+    """Create a temporary ZIP backup only; caller owns cleanup."""
+    fd, zip_name = tempfile.mkstemp(prefix='alche_backup_', suffix='.zip')
+    os.close(fd)
+    zip_path=Path(zip_name)
+    raw_fd, raw_name=tempfile.mkstemp(prefix='alche_db_', suffix='.db'); os.close(raw_fd)
+    raw_path=Path(raw_name)
     try:
-        # Force WAL contents into the main DB before making the backup.
+        src=sqlite3.connect(DB_FILE, timeout=20)
+        dst=sqlite3.connect(str(raw_path), timeout=20)
         try:
-            src.execute("PRAGMA wal_checkpoint(FULL)")
-        except Exception:
-            pass
-        dst = sqlite3.connect(str(raw_db), timeout=20)
-        try:
+            try: src.execute('PRAGMA wal_checkpoint(FULL)')
+            except Exception: pass
             src.backup(dst)
         finally:
-            dst.close()
+            dst.close(); src.close()
+        readme=("ALCHEMIST temporary migration backup\n"
+                "Contains trades.db. Keep this file only as long as needed.\n"
+                "No permanent backup is retained on the VPS.\n")
+        with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED) as z:
+            z.write(raw_path,arcname='trades.db')
+            z.writestr('MIGRATION.txt',readme)
+        return zip_path
+    except Exception:
+        zip_path.unlink(missing_ok=True)
+        raise
     finally:
-        src.close()
-
-    readme = (
-        "ALCHEMIST BACKUP\n"
-        "================\n"
-        f"Created: {datetime.now().isoformat()}\n"
-        "Contains: trades.db database (settings, CEX configuration, trade history, pending/open state).\n\n"
-        "Migration:\n"
-        "1. Stop the old bot before final cutover.\n"
-        "2. Copy this backup to the new VPS.\n"
-        "3. Restore it as trades.db (or use /restore in the bot).\n"
-        "4. Copy the latest source code/config separately from your Git repo/VPS.\n"
-        "5. Start only ONE bot instance.\n"
-    )
-    readme_path = BACKUP_DIR / f"MIGRATION_{ts}.txt"
-    readme_path.write_text(readme, encoding="utf-8")
-    try:
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-            z.write(raw_db, arcname="trades.db")
-            z.write(readme_path, arcname="MIGRATION.txt")
-    finally:
-        for f in (raw_db, readme_path):
-            try: f.unlink()
-            except Exception: pass
-    return zip_path
+        raw_path.unlink(missing_ok=True)
 
 
 def validate_restore_db(path):
@@ -1733,40 +1920,30 @@ def validate_restore_db(path):
 
 
 def restore_database_from_file(source_path):
-    """Safely replace the live DB after validation and create a rollback backup first."""
+    """Validate and replace live DB. Rollback exists only in OS temp and is removed after success."""
     global IS_BOT_PAUSED
     ok, detail = validate_restore_db(source_path)
-    if not ok:
-        return False, detail
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rollback = BACKUP_DIR / f"before_restore_{ts}.db"
+    if not ok: return False, detail
+    fd, rollback_name=tempfile.mkstemp(prefix='alche_rollback_', suffix='.db'); os.close(fd)
+    rollback=Path(rollback_name)
     try:
-        # Backup current live DB first.
-        src = sqlite3.connect(DB_FILE, timeout=20)
-        try:
-            try: src.execute("PRAGMA wal_checkpoint(FULL)")
-            except Exception: pass
-            dst = sqlite3.connect(str(rollback), timeout=20)
-            try: src.backup(dst)
-            finally: dst.close()
-        finally:
-            src.close()
-
-        IS_BOT_PAUSED = True
-        time.sleep(1.0)
-        # Remove stale WAL/SHM sidecars before atomic replacement.
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(DB_FILE + suffix)
-            try: sidecar.unlink()
-            except FileNotFoundError: pass
-        os.replace(str(source_path), DB_FILE)
-        init_db()
-        load_settings()
-        reload_exchanges()
-        return True, str(rollback)
+        src=sqlite3.connect(DB_FILE,timeout=20); dst=sqlite3.connect(str(rollback),timeout=20)
+        try: src.backup(dst)
+        finally: dst.close(); src.close()
+        IS_BOT_PAUSED=True
+        for suffix in ('-wal','-shm'):
+            Path(DB_FILE+suffix).unlink(missing_ok=True)
+        os.replace(str(source_path),DB_FILE)
+        init_db(); load_settings(); reload_exchanges()
+        return True, 'temporary rollback created and removed after restore'
     except Exception as e:
+        # Best-effort rollback if replacement happened but reload failed.
+        try:
+            if rollback.exists(): os.replace(str(rollback),DB_FILE)
+        except Exception: pass
         return False, str(e)
+    finally:
+        rollback.unlink(missing_ok=True)
 
 
 @dp.callback_query(F.data == "backup_menu")
@@ -1798,15 +1975,16 @@ async def cb_backup_create(callback: CallbackQuery):
             document=FSInputFile(str(path)),
             caption=(
                 "💾 <b>BACKUP BERHASIL</b>\n\n"
-                "Simpan file ini untuk migrasi VPS/restore.\n"
-                "Database berisi konfigurasi CEX dan history trading.\n\n"
-                "🗑️ Pesan backup ini akan otomatis dihapus dalam <b>5 menit</b>.\n"
-                "💾 File backup tetap tersimpan di VPS."
+                "📥 Simpan sekarang untuk migrasi VPS.\n"
+                "🗑️ Pesan DAN file temporary akan dihapus otomatis dalam <b>5 menit</b>."
             )
         )
-        asyncio.create_task(delete_backup_message_later(
-            callback.message.chat.id, sent.message_id, 300
-        ))
+        async def cleanup_backup():
+            await asyncio.sleep(300)
+            try: await bot.delete_message(callback.message.chat.id, sent.message_id)
+            except Exception: pass
+            Path(path).unlink(missing_ok=True)
+        asyncio.create_task(cleanup_backup())
     except Exception as e:
         await callback.message.answer(f"❌ Backup gagal: <code>{html.escape(str(e))}</code>")
 
@@ -1849,8 +2027,8 @@ async def handle_restore_document(message: Message):
         return
 
     PENDING_RESTORE.discard(chat_id)
-    temp_path = BACKUP_DIR / f"incoming_restore_{int(time.time())}.db"
-    downloaded_path = BACKUP_DIR / f"incoming_{int(time.time())}{Path(name).suffix}"
+    temp_path = Path(tempfile.mktemp(prefix='alche_restore_', suffix='.db'))
+    downloaded_path = Path(tempfile.mktemp(prefix='alche_incoming_', suffix=Path(name).suffix))
     status = await message.answer("♻️ <b>Memeriksa backup...</b>")
     try:
         tg_file = await bot.get_file(doc.file_id)
@@ -1912,14 +2090,16 @@ async def cmd_backup(message: Message):
             document=FSInputFile(str(path)),
             caption=(
                 "💾 <b>BACKUP BERHASIL</b>\n"
-                "Simpan file ini untuk migrasi VPS/restore.\n\n"
-                "🗑️ Pesan backup ini akan otomatis dihapus dalam <b>5 menit</b>.\n"
-                "💾 File backup tetap tersimpan di VPS."
+                "📥 Simpan sekarang untuk migrasi VPS.\n"
+                "🗑️ Pesan DAN file temporary akan dihapus otomatis dalam <b>5 menit</b>."
             )
         )
-        asyncio.create_task(delete_backup_message_later(
-            message.chat.id, sent.message_id, 300
-        ))
+        async def cleanup_backup_cmd():
+            await asyncio.sleep(300)
+            try: await bot.delete_message(message.chat.id, sent.message_id)
+            except Exception: pass
+            Path(path).unlink(missing_ok=True)
+        asyncio.create_task(cleanup_backup_cmd())
     except Exception as e:
         await bot.send_message(message.chat.id, f"❌ Backup gagal: <code>{html.escape(str(e))}</code>")
 
@@ -2960,6 +3140,8 @@ def main_loop():
 
             check_and_update_daily_sl()
             update_orders_and_positions()
+            _public_monitor_signals()
+            _public_maybe_finalize_session()
 
             if IS_BOT_PAUSED:
                 notify_runtime_status(
