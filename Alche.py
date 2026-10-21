@@ -27,6 +27,7 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 SL_BUFFER_PERCENT = 0.0005
 MAX_DAILY_SL = 2
+DAILY_LOSS_ENABLED = True
 DB_FILE = "trades.db"
 LOCK_FILE = "alchemist_v2.lock"
 WIB = timezone(timedelta(hours=7))
@@ -110,6 +111,7 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('margin', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_pos', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dry_run', 1.0)")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('daily_loss_enabled', 1.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_trades', 5.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_wr', 40.0)")
 
@@ -128,6 +130,7 @@ def init_db():
 
 
 def load_settings():
+    global DAILY_LOSS_ENABLED
     conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
 
@@ -138,6 +141,8 @@ def load_settings():
             CONFIG['MAX_CONCURRENT_POSITIONS'] = int(row[1])
         elif row[0] == 'dry_run':
             CONFIG['DRY_RUN'] = bool(row[1])
+        elif row[0] == 'daily_loss_enabled':
+            DAILY_LOSS_ENABLED = bool(row[1])
         elif row[0] == 'min_trades':
             CONFIG['MIN_TRADES'] = int(row[1])
         elif row[0] == 'min_wr':
@@ -262,6 +267,8 @@ def cancel_all_pending_orders_on_pause():
 
 def check_and_update_daily_sl():
     global daily_sl_count, IS_BOT_PAUSED
+    if not DAILY_LOSS_ENABLED:
+        return
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         daily_sl_count = conn.cursor().execute(
@@ -604,9 +611,11 @@ def main_keyboard():
 def bot_control_keyboard():
     dry = "🧪 DRY RUN 🟢" if CONFIG['DRY_RUN'] else "🧪 DRY RUN 🔴"
     pause = "▶️ RESUME" if IS_BOT_PAUSED else "⏸ PAUSE"
+    daily = "🛑 DAILY LOSS 🟢 ON" if DAILY_LOSS_ENABLED else "🛑 DAILY LOSS 🔴 OFF"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=dry, callback_data="dryrun_toggle")],
         [InlineKeyboardButton(text=pause, callback_data="resume" if IS_BOT_PAUSED else "pause")],
+        [InlineKeyboardButton(text=daily, callback_data="daily_loss_toggle")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
     ])
@@ -1511,8 +1520,9 @@ async def cb_bot_control(callback: CallbackQuery):
     await callback.message.edit_text(
         "🤖 <b>BOT CONTROL</b>\n\n"
         f"Status: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}\n"
-        f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n\n"
-        "Gunakan tombol di bawah untuk mengubah kontrol yang memang tersedia di script.",
+        f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n"
+        f"Daily Loss Limit: {'🟢 ON' if DAILY_LOSS_ENABLED else '🔴 OFF'} ({MAX_DAILY_SL}x SL/hari)\n\n"
+        "Gunakan tombol di bawah untuk mengubah kontrol bot.",
         reply_markup=bot_control_keyboard()
     )
 
@@ -1530,6 +1540,24 @@ async def cb_dryrun_toggle(callback: CallbackQuery):
         reply_markup=bot_control_keyboard()
     )
     send_telegram("🧪 <b>MODE BERUBAH</b> — " + ("DRY RUN aktif. Tidak ada order real." if value else "⚠️ REAL MONEY aktif. Order real diizinkan."))
+
+
+@dp.callback_query(F.data == "daily_loss_toggle")
+async def cb_daily_loss_toggle(callback: CallbackQuery):
+    global DAILY_LOSS_ENABLED
+    if not is_allowed_chat(callback):
+        return
+    DAILY_LOSS_ENABLED = not DAILY_LOSS_ENABLED
+    update_db_setting('daily_loss_enabled', 1.0 if DAILY_LOSS_ENABLED else 0.0)
+    await safe_answer(callback, "Daily Loss Limit ON" if DAILY_LOSS_ENABLED else "Daily Loss Limit OFF")
+    status = "🟢 ON" if DAILY_LOSS_ENABLED else "🔴 OFF"
+    await callback.message.edit_text(
+        "🛑 <b>DAILY LOSS LIMIT</b>\n\n"
+        f"Status: <b>{status}</b>\n"
+        f"Batas: <b>{MAX_DAILY_SL}x SL/hari</b>\n\n"
+        + ("Jika mencapai batas, pembukaan trade baru akan dipause. Posisi OPEN tetap dimonitor." if DAILY_LOSS_ENABLED else "Limit dinonaktifkan. Bot tidak akan pause karena jumlah SL harian, tetapi monitoring posisi tetap berjalan."),
+        reply_markup=bot_control_keyboard()
+    )
 
 
 @dp.callback_query(F.data == "cancelall")
