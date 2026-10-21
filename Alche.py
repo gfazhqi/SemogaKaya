@@ -54,8 +54,13 @@ def init_db():
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, exchange_id TEXT, symbol TEXT, order_type TEXT, side TEXT, entry_price REAL, sl_price REAL, tp_price REAL, order_id TEXT, bars_count INTEGER DEFAULT 0, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value REAL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS cex_settings (ex_id TEXT PRIMARY KEY, api_key TEXT, secret TEXT, enabled INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS cex_settings (ex_id TEXT PRIMARY KEY, api_key TEXT, secret TEXT, enabled INTEGER DEFAULT 0)''')
     
+    # AUTO-FIX: Tambahkan kolom 'enabled' jika database pakai versi lama
+    try:
+        c.execute("ALTER TABLE cex_settings ADD COLUMN enabled INTEGER DEFAULT 0")
+    except: pass
+
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('margin', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_pos', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dry_run', 1.0)")
@@ -94,22 +99,25 @@ def update_db_setting(key, value):
     conn.commit(); conn.close()
 
 # =================================================================
-# HELPERS
+# HELPERS (MENGGUNAKAN HTML AGAR KEBAL BLOKIR TELEGRAM)
 # =================================================================
 def send_telegram(message):
-    # SISTEM ANTI-BUNGKAM: Jika format Markdown ditolak Telegram, kirim ulang sebagai Plain Text.
     try:
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload, timeout=10)
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+        r = requests.post(url, json=payload, timeout=10)
         if r.status_code != 200:
+            print(f"Telegram API Error: {r.text}")
             payload.pop("parse_mode")
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=payload, timeout=10)
-    except: pass
+            requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Failed to send telegram: {e}")
 
 def send_error_alert(err_msg):
     global last_error_time
     if time.time() - last_error_time > ERROR_COOLDOWN:
-        send_telegram(f"⚠️ *ERROR ALERT*\n\n{err_msg}"); last_error_time = time.time()
+        send_telegram(f"⚠️ <b>ERROR ALERT</b>\n\n<code>{err_msg}</code>")
+        last_error_time = time.time()
 
 def is_kill_zone():
     h = datetime.now(WIB).hour
@@ -120,11 +128,13 @@ def is_manual_alert_symbol(symbol):
 
 def get_free_usdt_balance(ex_instance):
     try:
-        bal = ex_instance.fetch_balance()
+        bal = ex_instance.fetch_balance(params={'recvWindow': 10000})
         usdt = bal.get('USDT', {})
         if isinstance(usdt, dict): return float(usdt.get('free', 0.0))
         return 0.0
-    except: return 0.0
+    except Exception as e:
+        print(f"Balance fetch error: {e}")
+        return 0.0
 
 def cancel_all_pending_orders_on_pause():
     try:
@@ -135,7 +145,7 @@ def cancel_all_pending_orders_on_pause():
                 except: pass
             c.execute("UPDATE trades SET status='CANCELLED (Auto/Manual)' WHERE id=?", (t_id,))
         conn.commit(); conn.close()
-        send_telegram("🧹 *CLEANUP* Semua pending order dibatalkan!")
+        send_telegram("🧹 <b>CLEANUP</b> Semua pending order dibatalkan!")
     except: pass
 
 def check_and_update_daily_sl():
@@ -146,7 +156,7 @@ def check_and_update_daily_sl():
         conn.close()
         if daily_sl_count >= MAX_DAILY_SL and not IS_BOT_PAUSED:
             IS_BOT_PAUSED = True; cancel_all_pending_orders_on_pause()
-            send_telegram(f"🛑 *DAILY LOSS LIMIT*\nKena {daily_sl_count}x SL. Bot PAUSE! Aktif besok 07:00 WIB.")
+            send_telegram(f"🛑 <b>DAILY LOSS LIMIT</b>\nKena {daily_sl_count}x SL. Bot PAUSE! Aktif besok 07:00 WIB.")
     except: pass
 
 # =================================================================
@@ -176,7 +186,7 @@ def update_orders_and_positions():
             tag = " (DRY RUN)" if is_sim else ""
             if status == 'PENDING':
                 n_stat = 'PENDING'
-                if (side == 'BUY' and curr_price <= en) or (side == 'SELL' and curr_price >= en): n_stat = 'OPEN'; send_telegram(f"🔔 *ORDER FILLED{tag}* {sym} di {ex_id.upper()}!")
+                if (side == 'BUY' and curr_price <= en) or (side == 'SELL' and curr_price >= en): n_stat = 'OPEN'; send_telegram(f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!")
                 elif side == 'BUY':
                     if curr_price >= tp: n_stat = 'MISSED (TP First)'
                     elif curr_price <= sl: n_stat = 'CANCELLED (SL First)'
@@ -189,16 +199,16 @@ def update_orders_and_positions():
                     if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
                         try: exchanges[ex_id].cancel_order(ord_id, sym)
                         except: pass
-                    send_telegram(f"⚪ *AUTO-CANCEL{tag}* {sym}\nAlasan: {n_stat}")
+                    send_telegram(f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\nAlasan: {n_stat}")
                     c.execute("UPDATE trades SET status=?, bars_count=? WHERE id=?", (n_stat, n_bars, t_id))
                 else: c.execute("UPDATE trades SET bars_count=? WHERE id=?", (n_bars, t_id))
             elif status == 'OPEN':
                 if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
                     c.execute("UPDATE trades SET status='CLOSED (TP)' WHERE id=?", (t_id,))
-                    send_telegram(f"🎉 *TAKE PROFIT{tag}* {sym} | Profit: +1R 🚀")
+                    send_telegram(f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | Profit: +1R 🚀")
                 elif (side == 'BUY' and curr_price <= sl) or (side == 'SELL' and curr_price >= sl):
                     c.execute("UPDATE trades SET status='CLOSED (SL)' WHERE id=?", (t_id,))
-                    send_telegram(f"❌ *STOP LOSS{tag}* {sym} | Loss: -1R 🔻")
+                    send_telegram(f"❌ <b>STOP LOSS{tag}</b> {sym} | Loss: -1R 🔻")
         except: pass
     conn.commit(); conn.close()
 
@@ -223,7 +233,7 @@ def scan_markets():
                     m15, h1, d1 = ex.fetch_ohlcv(sym,'15m',limit=50), ex.fetch_ohlcv(sym,'1h',limit=60), ex.fetch_ohlcv(sym,'1d',limit=2)
                     if m15 and h1 and d1:
                         sig, en, sl, tp = analyze_smc_retrace(pd.DataFrame(m15, columns=['time','open','high','low','close','vol']), pd.DataFrame(h1, columns=['time','open','high','low','close','vol']), d1[-1][1])
-                        if sig: send_telegram(f"📢 *FX ALERT* {sym} | {sig}\nEntry: {en:.5f} | TP: {tp:.5f}")
+                        if sig: send_telegram(f"📢 <b>FX ALERT</b> {sym} | {sig}\nEntry: {en:.5f} | TP: {tp:.5f}")
                     continue
 
                 if act_count >= CONFIG['MAX_CONCURRENT_POSITIONS']: continue
@@ -254,7 +264,7 @@ def scan_markets():
                     conn.cursor().execute("INSERT INTO trades (exchange_id, symbol, order_type, side, entry_price, sl_price, tp_price, order_id, status) VALUES (?, ?, 'LIMIT', ?, ?, ?, ?, ?, 'PENDING')", (ex_id, sym, sig, en, sl, tp, ord_id))
                     conn.commit(); conn.close()
 
-                    send_telegram(f"🎯 *{mode}*\nCEX: {ex_id.upper()} | {sym} | {sig}\nEntry: {en:.5f}\nMargin: ${CONFIG['MARGIN_PER_TRADE']} ({lev}x)")
+                    send_telegram(f"🎯 <b>{mode}</b>\nCEX: {ex_id.upper()} | {sym} | {sig}\nEntry: {en:.5f}\nMargin: ${CONFIG['MARGIN_PER_TRADE']} ({lev}x)")
                     act_count += 1
         except Exception as e: send_error_alert(f"Scan Ex [{ex_id}]: {e}")
 
@@ -288,8 +298,8 @@ def telegram_polling():
                             conn.commit(); conn.close(); reload_exchanges()
                             send_telegram(f"✅ CEX {ex_id.upper()} di-{action.upper()}!")
 
-                    elif text == "/dryrun on": CONFIG['DRY_RUN']=True; update_db_setting('dry_run',1.0); send_telegram("✅ *DRY RUN AKTIF*")
-                    elif text == "/dryrun off": CONFIG['DRY_RUN']=False; update_db_setting('dry_run',0.0); send_telegram("⚠️ *DRY RUN NONAKTIF* (Uang Asli!)")
+                    elif text == "/dryrun on": CONFIG['DRY_RUN']=True; update_db_setting('dry_run',1.0); send_telegram("✅ <b>DRY RUN AKTIF</b>")
+                    elif text == "/dryrun off": CONFIG['DRY_RUN']=False; update_db_setting('dry_run',0.0); send_telegram("⚠️ <b>DRY RUN NONAKTIF</b> (Uang Asli!)")
                     elif text.startswith("/setmargin ") and len(parts)==2: CONFIG['MARGIN_PER_TRADE']=float(parts[1]); update_db_setting('margin',float(parts[1])); send_telegram(f"✅ Margin: ${parts[1]}")
                     elif text.startswith("/setmaxpos ") and len(parts)==2: CONFIG['MAX_CONCURRENT_POSITIONS']=int(parts[1]); update_db_setting('max_pos',int(parts[1])); send_telegram(f"✅ Max Posisi: {parts[1]}")
                     elif text.startswith("/setminwr ") and len(parts)==2: CONFIG['MIN_WR']=float(parts[1]); update_db_setting('min_wr',float(parts[1])); send_telegram(f"✅ Min WinRate: {parts[1]}%")
@@ -322,7 +332,7 @@ def telegram_polling():
                             elif is_core or wr >= CONFIG['MIN_WR']: gacor += line
                             else: blist += line
                         
-                        msg = f"🏆 *PERFORMA KOIN*\nSyarat: Min {CONFIG['MIN_TRADES']} Trade, WR {CONFIG['MIN_WR']}%\n\n🔥 *AKTIF TRADING*\n{gacor if gacor else 'Belum ada'}\n\n⏳ *EVALUASI*\n{eval_wait if eval_wait else 'Belum ada'}\n\n🗑️ *BLACKLIST*\n{blist if blist else 'Belum ada'}"
+                        msg = f"🏆 <b>PERFORMA KOIN</b>\nSyarat: Min {CONFIG['MIN_TRADES']} Trade, WR {CONFIG['MIN_WR']}%\n\n🔥 <b>AKTIF TRADING</b>\n{gacor if gacor else 'Belum ada'}\n\n⏳ <b>EVALUASI</b>\n{eval_wait if eval_wait else 'Belum ada'}\n\n🗑️ <b>BLACKLIST</b>\n{blist if blist else 'Belum ada'}"
                         send_telegram(msg)
                         
                     elif text in ["/setting", "/settings"]:
@@ -342,24 +352,25 @@ def telegram_polling():
                             
                             if not cex_info: cex_info = "Belum ada data CEX\n"
                             
-                            msg = (f"⚙️ *INFORMASI SETTING BOT*\n\n"
-                                   f"*MODE TRADING:*\n{mode_text}\n\n"
-                                   f"*RISK MANAGEMENT:*\n"
+                            msg = (f"⚙️ <b>INFORMASI SETTING BOT</b>\n\n"
+                                   f"<b>MODE TRADING:</b>\n{mode_text}\n\n"
+                                   f"<b>RISK MANAGEMENT:</b>\n"
                                    f"• Margin per Trade: ${CONFIG['MARGIN_PER_TRADE']}\n"
                                    f"• Max Posisi: {CONFIG['MAX_CONCURRENT_POSITIONS']} Trade\n"
                                    f"• Max Daily SL: {MAX_DAILY_SL}x SL\n\n"
-                                   f"*AUTO-BLACKLIST:*\n"
+                                   f"<b>AUTO-BLACKLIST:</b>\n"
                                    f"• Min Evaluasi: {CONFIG['MIN_TRADES']}x Trade\n"
                                    f"• Min WinRate: {CONFIG['MIN_WR']}%\n\n"
-                                   f"*STATUS BURSA:*\n"
+                                   f"<b>STATUS BURSA:</b>\n"
                                    f"{cex_info}")
                             
                             send_telegram(msg)
                         except Exception as e:
+                            print(f"Error Setting: {e}")
                             send_telegram(f"⚠️ ERROR SETTING: {e}")
 
                     elif text in ["/start", "/help"]:
-                        send_telegram("🤖 *COMMANDS*\n• `/cex on/off` | `/setapi <cex> <api> <secret>`\n• `/dryrun on/off`\n• `/posisi` | `/setting` | `/stat` | `/pairperf`\n• `/setmargin` | `/setlev` | `/setmaxpos`\n• `/setminwr` | `/setmintrades`\n• `/cancelall` | `/pause` | `/resume`")
+                        send_telegram("🤖 <b>COMMANDS</b>\n• /cex on/off | /setapi cex api secret\n• /dryrun on/off\n• /posisi | /setting | /stat | /pairperf\n• /setmargin | /setlev | /setmaxpos\n• /setminwr | /setmintrades\n• /cancelall | /pause | /resume")
                     
                     elif text == "/posisi":
                         try:
@@ -377,19 +388,20 @@ def telegram_polling():
                             mode = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL MONEY"
                             stat_bot = "PAUSED 🛑" if IS_BOT_PAUSED else "RUNNING 🟢"
                             
-                            m = (f"📊 *STATUS & POSISI*\n"
+                            m = (f"📊 <b>STATUS & POSISI</b>\n"
                                  f"Bot: {stat_bot}\n"
                                  f"Mode: {mode}\n"
                                  f"SL Harian: {daily_sl_count}/{MAX_DAILY_SL}\n\n"
-                                 f"🔌 *CEX:*\n{cex_stat}\n"
-                                 f"💰 *SALDO:*\n{bal}\n\n"
-                                 f"📋 *ANTREAN:* {len(trades)}\n")
+                                 f"🔌 <b>CEX:</b>\n{cex_stat}\n"
+                                 f"💰 <b>SALDO:</b>\n{bal}\n\n"
+                                 f"📋 <b>ANTREAN:</b> {len(trades)}\n")
                             for t in trades: 
                                 tag = "[SIM]" if str(t[4]).startswith('sim_') else ""
                                 m += f"• {t[0].upper()} | {t[1]} {tag} | {t[2]} | {t[3]}\n"
                             
                             send_telegram(m)
                         except Exception as e:
+                            print(f"Error Posisi: {e}")
                             send_telegram(f"⚠️ ERROR POSISI: {e}")
 
                     elif text == "/pause": IS_BOT_PAUSED = True; send_telegram("⏸️ Bot PAUSED")
@@ -399,8 +411,9 @@ def telegram_polling():
                         conn = sqlite3.connect(DB_FILE)
                         stats = "\n".join([f"• {s[0]}: {s[1]}" for s in conn.cursor().execute("SELECT status, COUNT(*) FROM trades GROUP BY status").fetchall()])
                         conn.close()
-                        send_telegram(f"📈 *STATISTIK*\n\n{stats}")
-        except: time.sleep(5)
+                        send_telegram(f"📈 <b>STATISTIK</b>\n\n{stats}")
+        except Exception as e: 
+            time.sleep(5)
         time.sleep(1)
 
 # =================================================================
@@ -435,15 +448,15 @@ def api_stats():
 
 def main_loop():
     last_hb = time.time()
-    send_telegram("🚀 *[ALCHEMIST v2 INITIALIZED]*")
+    send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>")
     while True:
         try:
             now = datetime.now(WIB)
             if now.hour == 7 and now.minute == 0 and now.second < 15:
                 global daily_sl_count, IS_BOT_PAUSED
                 daily_sl_count = 0
-                if IS_BOT_PAUSED: IS_BOT_PAUSED = False; send_telegram("🌅 *NEW DAY RESET*")
-            if time.time() - last_hb >= 21600: send_telegram("💓 *PING* Sistem normal."); last_hb = time.time()
+                if IS_BOT_PAUSED: IS_BOT_PAUSED = False; send_telegram("🌅 <b>NEW DAY RESET</b>")
+            if time.time() - last_hb >= 21600: send_telegram("💓 <b>PING</b> Sistem normal."); last_hb = time.time()
             check_and_update_daily_sl()
             update_orders_and_positions()
             if not IS_BOT_PAUSED and is_kill_zone(): scan_markets()
