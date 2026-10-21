@@ -1568,6 +1568,79 @@ app = Flask(__name__, template_folder='templates')
 def dashboard():
     return render_template('index.html')
 
+@app.route('/api/cex-monitor')
+def api_cex_monitor():
+    """Return live CEX configuration/connection state for the web dashboard.
+
+    This endpoint only reads local bot state/database metadata. It does not
+    call private exchange endpoints on every dashboard refresh.
+    """
+    try:
+        rows = db_read(
+            "SELECT ex_id, api_key, enabled, account_label, account_info "
+            "FROM cex_settings ORDER BY ex_id"
+        )
+
+        items = []
+        for ex_id, api_key, enabled, account_label, account_info in rows:
+            info = {}
+            if account_info:
+                try:
+                    info = json.loads(account_info)
+                except Exception:
+                    info = {}
+
+            configured = bool(api_key)
+            loaded = ex_id in exchanges
+            enabled = bool(enabled)
+
+            if not enabled:
+                state = 'OFF'
+                state_icon = '🔴'
+            elif not configured:
+                state = 'API NOT SET'
+                state_icon = '🟠'
+            elif loaded:
+                state = 'ON / READY'
+                state_icon = '🟢'
+            else:
+                state = 'ON / NOT LOADED'
+                state_icon = '🟡'
+
+            items.append({
+                'id': ex_id,
+                'name': ex_id.upper(),
+                'enabled': enabled,
+                'configured': configured,
+                'loaded': loaded,
+                'state': state,
+                'state_icon': state_icon,
+                'leverage': CONFIG['LEVERAGE'].get(ex_id, 50),
+                'account': account_label or 'Belum diverifikasi',
+                'account_type': info.get('Account Type', '-'),
+                'market': info.get('Market', '-'),
+                'private_api': info.get('Private API', '-'),
+                'usdt_free': info.get('USDT Free'),
+                'usdt_total': info.get('USDT Total'),
+                'open_positions': info.get('Open Positions', 'N/A'),
+                'open_orders': info.get('Open Orders', 'N/A'),
+                'trade_permission': info.get('Trade Permission', '-'),
+                'read_only': info.get('Read Only', '-')
+            })
+
+        return jsonify({
+            'ok': True,
+            'bot_paused': bool(IS_BOT_PAUSED),
+            'dry_run': bool(CONFIG.get('DRY_RUN', True)),
+            'scanning': bool(exchanges) and not IS_BOT_PAUSED and is_kill_zone(),
+            'last_runtime_status': last_runtime_status or 'UNKNOWN',
+            'updated': datetime.now(WIB).strftime('%d/%m/%Y, %H:%M:%S'),
+            'cex': items
+        })
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e), 'cex': []}), 500
+
+
 @app.route('/api/stats')
 def api_stats():
     conn = sqlite3.connect(DB_FILE, timeout=10)
