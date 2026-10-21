@@ -29,6 +29,38 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 PUBLIC_CHANNEL_ID = getattr(__import__('config'), 'PUBLIC_CHANNEL_ID', '')
 VIP_JOIN_URL = getattr(__import__('config'), 'VIP_JOIN_URL', '')
 
+# =================================================================
+# VIP USER SETTINGS — SIMPLE MODE
+# =================================================================
+# These defaults are for VIP users only. Owner/Dry-Run logic is unchanged.
+VIP_RECOMMENDED_MARGIN_USD = 2.0
+VIP_RECOMMENDED_LEVERAGE = 20
+VIP_RECOMMENDED_MAX_OPEN_POSITIONS = 3
+VIP_RECOMMENDED_MAX_TRADES_PER_DAY = 10
+
+def vip_recommended_settings_text():
+    return (
+        "💎 <b>RECOMMENDED VIP SETTINGS</b>\n\n"
+        "💵 <b>Margin / Trade:</b> $2\n"
+        "⚡ <b>Leverage:</b> 20x\n"
+        "📊 <b>Max Open Positions:</b> 3\n"
+        "📅 <b>Max Trades / Day:</b> 10\n"
+        "🏦 <b>Exchange:</b> Bitget + BingX\n"
+        "🤖 <b>Auto Trade:</b> ON\n\n"
+        "ℹ️ <b>Penjelasan</b>\n"
+        "• Margin $2 adalah margin yang dialokasikan untuk satu posisi.\n"
+        "• Leverage 20x memperbesar nilai nominal posisi dan juga memperbesar risiko.\n"
+        "• Maksimal 3 posisi aktif membatasi jumlah posisi bersamaan.\n"
+        "• Maksimal 10 trade/hari membatasi jumlah pembukaan trade dalam satu hari.\n"
+        "• Bitget + BingX adalah exchange rekomendasi awal; user tetap dapat mengatur exchange yang tersedia di akun VIP.\n\n"
+        "⚠️ <b>WARNING</b>\n"
+        "Auto trading dan leverage memiliki risiko kerugian. Leverage 20x dapat memperbesar dampak pergerakan harga dan tetap memiliki risiko likuidasi.\n\n"
+        "Gunakan dana yang siap untuk kehilangan. Pastikan API exchange "
+        "<b>tidak memiliki permission withdrawal/penarikan dana</b>.\n\n"
+        "❗ Recommended Settings bukan jaminan profit, win rate, atau hasil trading tertentu."
+    )
+
+
 SL_BUFFER_PERCENT = 0.0005
 MAX_DAILY_SL = 2
 DB_FILE = "trades.db"
@@ -895,6 +927,14 @@ def _public_crypto_symbol(sym):
     if any(x in base for x in ('UP', 'DOWN', 'BULL', 'BEAR')) or re.search(r'\d+[LS]$', base):
         return False
     return True
+
+
+VIP_WARNING_TEXT = (
+    "⚠️ <b>WARNING</b>\n"
+    "Auto trading dan leverage memiliki risiko kerugian. "
+"20x leverage dapat memperbesar dampak pergerakan harga dan risiko likuidasi.\n\n"
+"Gunakan dana yang siap untuk kehilangan dan pastikan API tidak memiliki permission withdrawal."
+)
 
 def _public_keyboard():
     rows = []
