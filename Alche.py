@@ -54,8 +54,12 @@ DB_LOCK = threading.RLock()
 EXCHANGE_SCAN_NEXT = {}
 EXCHANGE_MARKETS = {}
 EXCHANGE_LAST_CANDLE = {}
-BINGX_BACKOFF_SECONDS = 90
-SCANNER_MIN_INTERVAL = 30
+EXCHANGE_SCAN_CURSOR = {}
+EXCHANGE_REQUEST_NEXT = {}
+BINGX_BACKOFF_SECONDS = 30
+BINGX_REQUEST_SPACING = 0.35
+SCANNER_MIN_INTERVAL = 15
+
 
 CONFIG = {
     'MARGIN_PER_TRADE': 2.0,
@@ -176,11 +180,13 @@ def load_settings():
 
 
 def reload_exchanges():
-    global exchanges, EXCHANGE_MARKETS, EXCHANGE_SCAN_NEXT, EXCHANGE_LAST_CANDLE
+    global exchanges, EXCHANGE_MARKETS, EXCHANGE_SCAN_NEXT, EXCHANGE_LAST_CANDLE, EXCHANGE_SCAN_CURSOR, EXCHANGE_REQUEST_NEXT
 
     rows = db_read(
         "SELECT ex_id, api_key, secret, enabled, password FROM cex_settings"
     )
+    EXCHANGE_SCAN_CURSOR = {}
+    EXCHANGE_REQUEST_NEXT = {}
 
     exchanges.clear()
     EXCHANGE_MARKETS.clear()
@@ -198,6 +204,8 @@ def reload_exchanges():
                 'enableRateLimit': True,
                 'timeout': 8000
             }
+            if ex_id == 'bingx':
+                params['rateLimit'] = 350
             if ex_id == 'bitget':
                 # CCXT/Bitget uses `password` for API passphrase.
                 params['password'] = password or ''
@@ -853,10 +861,34 @@ def _valid_usdt_swap_symbols(ex_id, ex):
     return core + rest
 
 
+def _bingx_ohlcv(ex, symbol, timeframe, limit):
+    """Rate-limit BingX public OHLCV calls without blocking other CEXs."""
+    if getattr(ex, 'id', '') != 'bingx':
+        return ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+
+    now = time.time()
+    wait = EXCHANGE_REQUEST_NEXT.get('bingx', 0) - now
+    if wait > 0:
+        time.sleep(wait)
+
+    try:
+        data = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+        EXCHANGE_REQUEST_NEXT['bingx'] = time.time() + BINGX_REQUEST_SPACING
+        return data
+    except Exception:
+        EXCHANGE_REQUEST_NEXT['bingx'] = time.time() + BINGX_REQUEST_SPACING
+        raise
+
+
 def _scan_one_exchange(ex_id, ex, pair_perf):
     now = time.time()
-    runtime = EXCHANGE_RUNTIME.setdefault(ex_id, {'state': 'IDLE', 'last_scan': '-', 'last_reason': '', 'signals': 0, 'created': 0})
+    runtime = EXCHANGE_RUNTIME.setdefault(
+        ex_id,
+        {'state': 'IDLE', 'last_scan': '-', 'last_reason': '',
+         'signals': 0, 'created': 0}
+    )
     runtime['state'] = 'SCANNING'
+
     if now < EXCHANGE_SCAN_NEXT.get(ex_id, 0):
         return 0
 
@@ -864,25 +896,29 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
         symbols = _valid_usdt_swap_symbols(ex_id, ex)
         runtime['last_scan'] = datetime.now(WIB).strftime('%H:%M:%S')
         runtime['last_reason'] = f'{len(symbols)} valid USDT perpetual markets'
+
         if not symbols:
             EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
             return 0
 
-        # Do NOT gate an entire CEX on one probe symbol. A single bad/stale
-        # BingX market can otherwise make the whole exchange look dead while
-        # every other market is healthy. M15 candles are time-aligned, so use
-        # the wall-clock 15m bucket as the exchange scan gate instead.
-        closed_bucket = int(time.time() // 900) - 1
-        if EXCHANGE_LAST_CANDLE.get(ex_id) == closed_bucket:
-            runtime['last_reason'] = 'Menunggu candle M15 baru'
-            EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
-            return 0
+        # IMPORTANT:
+        # Do not use one "probe" symbol to gate the entire exchange.
+        # BingX can return 100410 on one request while other symbols are fine.
+        # Scan a small rotating batch instead of firing hundreds of OHLCV
+        # requests at once. This keeps M15 logic unchanged while avoiding
+        # BingX's global/IP+UID rate limiter.
+        if ex_id == 'bingx':
+            batch_size = 4
+            cursor = EXCHANGE_SCAN_CURSOR.get(ex_id, 0) % len(symbols)
+            scan_symbols = [
+                symbols[(cursor + i) % len(symbols)]
+                for i in range(min(batch_size, len(symbols)))
+            ]
+            EXCHANGE_SCAN_CURSOR[ex_id] = (cursor + len(scan_symbols)) % len(symbols)
+        else:
+            # Other exchanges retain the existing broad scan behavior.
+            scan_symbols = symbols
 
-        EXCHANGE_LAST_CANDLE[ex_id] = closed_bucket
-
-        # MAX positions is applied per active CEX. This prevents the first CEX
-        # in the dictionary (usually BingX) from consuming the global quota and
-        # starving Bitget/Bybit/Binance.
         active_count = db_read(
             "SELECT COUNT(*) FROM trades "
             "WHERE exchange_id=? AND status IN ('PENDING','OPEN')",
@@ -896,17 +932,17 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
             return 0
 
         created = 0
+        rate_limited = 0
 
-        for sym in symbols:
+        for sym in scan_symbols:
             if created >= slots:
                 break
 
             if is_manual_alert_symbol(sym):
-                # Manual-alert pairs are alerts only, not normal trade slots.
                 try:
-                    m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
-                    h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
-                    d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
+                    m15 = _bingx_ohlcv(ex, sym, '15m', 50) if ex_id == 'bingx' else ex.fetch_ohlcv(sym, '15m', limit=50)
+                    h1 = _bingx_ohlcv(ex, sym, '1h', 60) if ex_id == 'bingx' else ex.fetch_ohlcv(sym, '1h', limit=60)
+                    d1 = _bingx_ohlcv(ex, sym, '1d', 2) if ex_id == 'bingx' else ex.fetch_ohlcv(sym, '1d', limit=2)
                     if m15 and h1 and d1:
                         sig, _, _, _ = analyze_smc_retrace(
                             pd.DataFrame(m15, columns=['time','open','high','low','close','vol']),
@@ -915,8 +951,10 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                         )
                         if sig:
                             send_telegram(f"📢 <b>FX ALERT</b> {sym} | {sig}")
-                except Exception:
-                    pass
+                except Exception as e:
+                    if _is_retryable_market_error(ex_id, e):
+                        rate_limited += 1
+                    continue
                 continue
 
             if sym in pair_perf and sym not in CORE_PAIRS:
@@ -927,12 +965,22 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                         continue
 
             try:
-                m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
-                h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
-                d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
+                if ex_id == 'bingx':
+                    m15 = _bingx_ohlcv(ex, sym, '15m', 50)
+                    h1 = _bingx_ohlcv(ex, sym, '1h', 60)
+                    d1 = _bingx_ohlcv(ex, sym, '1d', 2)
+                else:
+                    m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
+                    h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
+                    d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
             except Exception as e:
+                # A BingX 100410 belongs to this symbol/request only.
+                # Never abort the whole BingX scan and never put the entire
+                # CEX into a 90-second dead period.
                 if _is_retryable_market_error(ex_id, e):
-                    raise
+                    rate_limited += 1
+                    runtime['last_reason'] = f'{sym}: market cooldown, skip symbol'
+                    continue
                 continue
 
             if not m15 or not h1 or not d1:
@@ -948,7 +996,6 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                 runtime['last_reason'] = f'{sym}: no setup / filter'
                 continue
 
-            # Avoid duplicate setup on the same exchange/pair/side.
             exists = db_read(
                 "SELECT 1 FROM trades "
                 "WHERE exchange_id=? AND symbol=? AND side=? "
@@ -1010,28 +1057,30 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
             runtime['last_reason'] = f'{sym}: {sig} setup created'
             set_runtime_event(f'{ex_id.upper()} {sym} {sig} setup created')
 
+        if rate_limited:
+            runtime['last_reason'] = (
+                f'{rate_limited} symbol request kena 100410, '
+                f'skip lokal; scanner tetap jalan'
+            )
+
         runtime['state'] = 'SCANNING'
         EXCHANGE_SCAN_NEXT[ex_id] = time.time() + SCANNER_MIN_INTERVAL
         return created
 
     except Exception as e:
+        runtime['state'] = 'ERROR'
+        runtime['last_reason'] = str(e)[:160]
+        set_runtime_event(f'{ex_id.upper()} scanner error')
+        # Only a genuine exchange-level failure gets a short retry delay.
+        EXCHANGE_SCAN_NEXT[ex_id] = time.time() + SCANNER_MIN_INTERVAL
         if _is_retryable_market_error(ex_id, e):
-            runtime['state'] = 'ERROR'
-            runtime['last_reason'] = f'Cooldown/rate limit: {str(e)[:120]}'
-            set_runtime_event(f'{ex_id.upper()} cooldown/rate-limit')
-            EXCHANGE_SCAN_NEXT[ex_id] = time.time() + BINGX_BACKOFF_SECONDS
             send_error_alert(
-                f"Scan Ex [{ex_id}]: market data cooldown {BINGX_BACKOFF_SECONDS}s "
-                f"({str(e)[:500]})"
+                f"Scan Ex [{ex_id}]: market data cooldown "
+                f"(skip batch, scanner lanjut)"
             )
         else:
-            runtime['state'] = 'ERROR'
-            runtime['last_reason'] = str(e)[:160]
-            set_runtime_event(f'{ex_id.upper()} scanner error')
-            EXCHANGE_SCAN_NEXT[ex_id] = time.time() + SCANNER_MIN_INTERVAL
             send_error_alert(f"Scan Ex [{ex_id}]: {e}")
         return 0
-
 
 def scan_markets():
     """Scan every enabled CEX independently without changing SMC formulas."""
