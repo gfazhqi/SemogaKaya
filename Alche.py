@@ -46,26 +46,15 @@ CONFIG = {
     'MAX_CONCURRENT_POSITIONS': 2,
     'LEVERAGE': {ex: 50 for ex in DEFAULT_CEX.keys()},
     'DRY_RUN': True,
-    'DAILY_LOSS_LIMIT_ENABLED': True,
     'MIN_TRADES': 5,
     'MIN_WR': 40.0
 }
 
 IS_BOT_PAUSED = False
 daily_sl_count = 0
-daily_loss_limit_triggered = False
 last_error_time = 0
 ERROR_COOLDOWN = 300
 last_runtime_status = None
-
-# Exchange scanner protection: BingX can return code 100410 ("please try again later")
-# when market-data requests are too frequent or temporarily busy. This is handled
-# with a cooldown instead of spamming Telegram ERROR ALERT.
-EXCHANGE_SCAN_NEXT = {}
-EXCHANGE_BACKOFF_UNTIL = {}
-EXCHANGE_BACKOFF_NOTICE = {}
-EXCHANGE_SCAN_INTERVAL = 30
-BINGX_BACKOFF_SECONDS = 90
 
 # =================================================================
 # DATABASE & SETTINGS
@@ -87,17 +76,6 @@ def init_db():
         status TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
-    # Lifecycle tracking fields. These do NOT change the strategy/entry logic.
-    for col, definition in (
-        ('last_price', 'REAL'),
-        ('last_bar_ts', 'INTEGER DEFAULT 0'),
-        ('filled_at', 'TIMESTAMP'),
-        ('entry_bar_ts', 'INTEGER DEFAULT 0'),
-    ):
-        try:
-            c.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
-        except sqlite3.OperationalError:
-            pass
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value REAL
@@ -106,6 +84,7 @@ def init_db():
         ex_id TEXT PRIMARY KEY,
         api_key TEXT,
         secret TEXT,
+        password TEXT DEFAULT '',
         enabled INTEGER DEFAULT 0,
         account_label TEXT DEFAULT ''
     )''')
@@ -121,11 +100,14 @@ def init_db():
         c.execute("ALTER TABLE cex_settings ADD COLUMN account_info TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    try:
+        c.execute("ALTER TABLE cex_settings ADD COLUMN password TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
 
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('margin', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_pos', 2.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dry_run', 1.0)")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('daily_loss_limit', 1.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_trades', 5.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_wr', 40.0)")
 
@@ -135,7 +117,7 @@ def init_db():
             (f'lev_{ex}',)
         )
         c.execute(
-            "INSERT OR IGNORE INTO cex_settings (ex_id, api_key, secret, enabled, account_label, account_info) VALUES (?, '', '', 0, '', '')",
+            "INSERT OR IGNORE INTO cex_settings (ex_id, api_key, secret, password, enabled, account_label, account_info) VALUES (?, '', '', '', 0, '', '')",
             (ex,)
         )
 
@@ -154,8 +136,6 @@ def load_settings():
             CONFIG['MAX_CONCURRENT_POSITIONS'] = int(row[1])
         elif row[0] == 'dry_run':
             CONFIG['DRY_RUN'] = bool(row[1])
-        elif row[0] == 'daily_loss_limit':
-            CONFIG['DAILY_LOSS_LIMIT_ENABLED'] = bool(row[1])
         elif row[0] == 'min_trades':
             CONFIG['MIN_TRADES'] = int(row[1])
         elif row[0] == 'min_wr':
@@ -171,22 +151,25 @@ def reload_exchanges():
 
     conn = sqlite3.connect(DB_FILE, timeout=10)
     rows = conn.cursor().execute(
-        "SELECT ex_id, api_key, secret, enabled FROM cex_settings"
+        "SELECT ex_id, api_key, secret, password, enabled FROM cex_settings"
     ).fetchall()
     conn.close()
 
     exchanges.clear()
 
-    for ex_id, api, sec, en in rows:
+    for ex_id, api, sec, password, en in rows:
         if en == 1:
             try:
-                exchanges[ex_id] = getattr(ccxt, ex_id)({
+                params = {
                     'apiKey': api if api else '',
                     'secret': sec if sec else '',
                     'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
                     'enableRateLimit': True,
                     'timeout': 5000
-                })
+                }
+                if ex_id == 'bitget':
+                    params['password'] = password if password else ''
+                exchanges[ex_id] = getattr(ccxt, ex_id)(params)
             except Exception:
                 pass
 
@@ -276,39 +259,22 @@ def cancel_all_pending_orders_on_pause():
 
 
 def check_and_update_daily_sl():
-    global daily_sl_count, IS_BOT_PAUSED, daily_loss_limit_triggered
-
-    # Toggle OFF = completely ignore the daily SL limit. This is useful for
-    # DRY RUN/backtesting so the engine can continue past 2 losses.
-    if not CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True):
-        if daily_loss_limit_triggered:
-            daily_loss_limit_triggered = False
-            IS_BOT_PAUSED = False
-            send_telegram(
-                "🟢 <b>DAILY LOSS LIMIT OFF</b>\n"
-                "Bot kembali aktif. DRY RUN/backtest tidak dibatasi jumlah SL harian."
-            )
-        return
-
+    global daily_sl_count, IS_BOT_PAUSED
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
-        # trades.created_at is stored by SQLite in UTC. Compare in WIB so the
-        # daily limit follows the bot's 00:00 WIB day instead of UTC.
         daily_sl_count = conn.cursor().execute(
             "SELECT COUNT(*) FROM trades "
-            "WHERE date(created_at, '+7 hours') = date('now', '+7 hours') "
+            "WHERE created_at >= date('now', 'start of day') "
             "AND status LIKE '%SL%'"
         ).fetchone()[0]
         conn.close()
 
         if daily_sl_count >= MAX_DAILY_SL and not IS_BOT_PAUSED:
             IS_BOT_PAUSED = True
-            daily_loss_limit_triggered = True
             cancel_all_pending_orders_on_pause()
             send_telegram(
                 f"🛑 <b>DAILY LOSS LIMIT</b>\n"
-                f"Kena {daily_sl_count}x SL dari batas {MAX_DAILY_SL}x. Bot PAUSE!\n\n"
-                "Gunakan tombol <b>DAILY LOSS LIMIT</b> di BOT CONTROL untuk mematikannya."
+                f"Kena {daily_sl_count}x SL. Bot PAUSE!"
             )
     except Exception:
         pass
@@ -340,269 +306,83 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
     return sig, en, sl, tp
 
 
-def _safe_fetch_recent_1m_candles(ex, symbol, limit=4):
-    """Return recent 1m OHLC candles for more reliable DRY RUN lifecycle checks."""
-    try:
-        rows = ex.fetch_ohlcv(symbol, '1m', limit=limit)
-        return rows or []
-    except Exception:
-        return []
-
-
-def _latest_closed_15m_ts(ex, symbol):
-    """Return the timestamp of the latest closed 15m candle for bar aging."""
-    try:
-        rows = ex.fetch_ohlcv(symbol, '15m', limit=3)
-        if len(rows) >= 2:
-            # The last row is normally the currently forming candle.
-            return int(rows[-2][0])
-    except Exception:
-        pass
-    return None
-
-
-def _mark_trade_status(c, t_id, status, bars, filled_at=None, last_price=None, last_bar_ts=None, entry_bar_ts=None):
-    c.execute(
-        "UPDATE trades SET status=?, bars_count=?, filled_at=COALESCE(?, filled_at), "
-        "last_price=COALESCE(?, last_price), last_bar_ts=COALESCE(?, last_bar_ts), "
-        "entry_bar_ts=COALESCE(?, entry_bar_ts) WHERE id=?",
-        (status, bars, filled_at, last_price, last_bar_ts, entry_bar_ts, t_id)
-    )
-
-
 def update_orders_and_positions():
-    """Manage pending/open trades without changing SMC entry/SL/TP formulas.
-
-    Lifecycle fixes only:
-    - DRY RUN checks recent 1m candles instead of a single ticker snapshot.
-    - A pending setup can be filled even if the 15s polling interval misses the
-      exact tick that touched the 50% retrace entry.
-    - "MISSED (TP First)" is only produced when TP was actually reached in a
-      candle after the setup existed and the entry was not touched first.
-    - 15m bar aging is based on closed 15m candles, not 15s polling loops.
-    - If TP and SL occur in the same 1m candle, candle direction is used as a
-      deterministic tie-breaker; no strategy formula is changed.
-    """
     conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
 
     rows = c.execute(
         "SELECT id, exchange_id, symbol, side, entry_price, sl_price, "
-        "tp_price, order_id, bars_count, status, last_price, last_bar_ts, "
-        "filled_at, entry_bar_ts, created_at "
+        "tp_price, order_id, bars_count, status "
         "FROM trades WHERE status IN ('PENDING', 'OPEN')"
     ).fetchall()
 
-    for (t_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status,
-         last_price, last_bar_ts, filled_at, entry_bar_ts, created_at) in rows:
+    for t_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status in rows:
         if ex_id not in exchanges:
             continue
 
         try:
-            ex = exchanges[ex_id]
-            ticker = ex.fetch_ticker(sym)
-            curr_price = ticker.get('last')
-            if curr_price is None:
-                continue
-            curr_price = float(curr_price)
-
-            is_sim = str(ord_id).startswith('sim_')
+            curr_price = exchanges[ex_id].fetch_ticker(sym)['last']
+            n_bars, is_sim = bars + 1, str(ord_id).startswith('sim_')
             tag = " (DRY RUN)" if is_sim else ""
 
-            candles = _safe_fetch_recent_1m_candles(ex, sym, limit=4) if is_sim else []
-            candles = sorted(candles, key=lambda x: int(x[0]))
-
-            closed_15m_ts = _latest_closed_15m_ts(ex, sym)
-            n_bars = bars
-            if closed_15m_ts is not None and int(closed_15m_ts) != int(last_bar_ts or 0):
-                n_bars = bars + 1
-                c.execute(
-                    "UPDATE trades SET bars_count=?, last_bar_ts=? WHERE id=?",
-                    (n_bars, int(closed_15m_ts), t_id)
-                )
-
             if status == 'PENDING':
-                entry_touched = False
-                tp_touched = False
-                sl_touched = False
-                entry_candle_ts = None
+                n_stat = 'PENDING'
 
-                if is_sim and candles:
-                    # Only candles belonging to/after the minute in which the
-                    # setup was created are eligible. This avoids filling from
-                    # an old candle that existed before the signal was created.
-                    try:
-                        created_dt = datetime.strptime(
-                            str(created_at)[:19], '%Y-%m-%d %H:%M:%S'
-                        ).replace(tzinfo=timezone.utc)
-                        created_minute_ms = int(created_dt.timestamp() * 1000) // 60000 * 60000
-                    except Exception:
-                        created_minute_ms = int(candles[-1][0])
+                if (side == 'BUY' and curr_price <= en) or (side == 'SELL' and curr_price >= en):
+                    n_stat = 'OPEN'
+                    send_telegram(f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!")
 
-                    eligible = [x for x in candles if int(x[0]) >= created_minute_ms]
-                    for row in eligible:
-                        cts, op, hi, lo, cl, *rest = row
-                        cts, op, hi, lo, cl = int(cts), float(op), float(hi), float(lo), float(cl)
+                elif side == 'BUY':
+                    if curr_price >= tp:
+                        n_stat = 'MISSED (TP First)'
+                    elif curr_price <= sl:
+                        n_stat = 'CANCELLED (SL First)'
+                    elif n_bars > 30:
+                        n_stat = 'INVALID (>30 Bars)'
 
-                        touches_entry = lo <= en <= hi
-                        if touches_entry:
-                            # Entry wins when the same 1m candle also contains
-                            # TP/SL because OHLC does not reveal intrabar order.
-                            entry_touched = True
-                            entry_candle_ts = cts
-                            break
+                elif side == 'SELL':
+                    if curr_price <= tp:
+                        n_stat = 'MISSED (TP First)'
+                    elif curr_price >= sl:
+                        n_stat = 'CANCELLED (SL First)'
+                    elif n_bars > 30:
+                        n_stat = 'INVALID (>30 Bars)'
 
-                        if side == 'BUY':
-                            if hi >= tp:
-                                tp_touched = True
-                                break
-                            if lo <= sl:
-                                sl_touched = True
-                                break
-                        else:
-                            if lo <= tp:
-                                tp_touched = True
-                                break
-                            if hi >= sl:
-                                sl_touched = True
-                                break
-                else:
-                    # Real order: use the exchange order state whenever possible.
-                    try:
-                        order = ex.fetch_order(ord_id, sym)
-                        order_status = str(order.get('status', '')).lower()
-                        filled_amount = float(order.get('filled') or 0)
-                        if order_status == 'closed' or filled_amount > 0:
-                            entry_touched = True
-                        elif order_status in ('canceled', 'cancelled', 'expired', 'rejected'):
-                            n_stat = f'CANCELLED ({order_status.upper()})'
-                            _mark_trade_status(
-                                c, t_id, n_stat, n_bars,
-                                last_price=curr_price,
-                                last_bar_ts=closed_15m_ts
-                            )
-                            send_telegram(
-                                f"⚪ <b>ORDER CANCELED</b> {sym} di {ex_id.upper()}\n"
-                                f"Status exchange: {order_status.upper()}"
-                            )
-                            continue
-                    except Exception:
-                        entry_touched = (
-                            (side == 'BUY' and curr_price <= en) or
-                            (side == 'SELL' and curr_price >= en)
-                        )
+                if n_stat != 'PENDING':
+                    if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
+                        try:
+                            exchanges[ex_id].cancel_order(ord_id, sym)
+                        except Exception:
+                            pass
 
-                    if side == 'BUY':
-                        tp_touched = curr_price >= tp
-                        sl_touched = curr_price <= sl
-                    else:
-                        tp_touched = curr_price <= tp
-                        sl_touched = curr_price >= sl
-
-                if entry_touched:
-                    now_stamp = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
-                    _mark_trade_status(
-                        c, t_id, 'OPEN', n_bars,
-                        filled_at=now_stamp,
-                        last_price=curr_price,
-                        last_bar_ts=closed_15m_ts,
-                        entry_bar_ts=entry_candle_ts
+                    send_telegram(f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\nAlasan: {n_stat}")
+                    c.execute(
+                        "UPDATE trades SET status=?, bars_count=? WHERE id=?",
+                        (n_stat, n_bars, t_id)
                     )
-                    send_telegram(
-                        f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!\n"
-                        f"Entry: {en:.8f}"
-                    )
-                    continue
-
-                if tp_touched:
-                    n_stat = 'MISSED (TP First)'
-                elif sl_touched:
-                    n_stat = 'CANCELLED (SL First)'
-                elif n_bars > 30:
-                    n_stat = 'INVALID (>30 Bars)'
                 else:
                     c.execute(
-                        "UPDATE trades SET last_price=?, bars_count=?, "
-                        "last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
-                        (curr_price, n_bars, closed_15m_ts, t_id)
+                        "UPDATE trades SET bars_count=? WHERE id=?",
+                        (n_bars, t_id)
                     )
-                    continue
-
-                if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
-                    try:
-                        ex.cancel_order(ord_id, sym)
-                    except Exception:
-                        pass
-
-                _mark_trade_status(
-                    c, t_id, n_stat, n_bars,
-                    last_price=curr_price,
-                    last_bar_ts=closed_15m_ts
-                )
-                send_telegram(
-                    f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\n"
-                    f"Alasan: {n_stat}"
-                )
 
             elif status == 'OPEN':
-                hit_tp = False
-                hit_sl = False
-
-                if is_sim and candles:
-                    # Do not evaluate the candle that triggered the entry again;
-                    # we cannot know whether its high/low happened before or after
-                    # the simulated fill.
-                    for row in candles:
-                        cts, op, hi, lo, cl, *rest = row
-                        cts, op, hi, lo, cl = int(cts), float(op), float(hi), float(lo), float(cl)
-                        if entry_bar_ts and cts <= int(entry_bar_ts):
-                            continue
-
-                        this_tp = hi >= tp if side == 'BUY' else lo <= tp
-                        this_sl = lo <= sl if side == 'BUY' else hi >= sl
-
-                        if this_tp and this_sl:
-                            if side == 'BUY':
-                                this_tp = cl >= op
-                                this_sl = not this_tp
-                            else:
-                                this_tp = cl <= op
-                                this_sl = not this_tp
-
-                        if this_tp:
-                            hit_tp = True
-                            break
-                        if this_sl:
-                            hit_sl = True
-                            break
-                else:
-                    hit_tp = (curr_price >= tp) if side == 'BUY' else (curr_price <= tp)
-                    hit_sl = (curr_price <= sl) if side == 'BUY' else (curr_price >= sl)
-
-                if hit_tp:
-                    _mark_trade_status(
-                        c, t_id, 'CLOSED (TP)', n_bars,
-                        last_price=curr_price,
-                        last_bar_ts=closed_15m_ts
+                if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
+                    c.execute(
+                        "UPDATE trades SET status='CLOSED (TP)' WHERE id=?",
+                        (t_id,)
                     )
                     send_telegram(f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | +1R 🚀")
 
-                elif hit_sl:
-                    _mark_trade_status(
-                        c, t_id, 'CLOSED (SL)', n_bars,
-                        last_price=curr_price,
-                        last_bar_ts=closed_15m_ts
+                elif (side == 'BUY' and curr_price <= sl) or (side == 'SELL' and curr_price >= sl):
+                    c.execute(
+                        "UPDATE trades SET status='CLOSED (SL)' WHERE id=?",
+                        (t_id,)
                     )
                     send_telegram(f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻")
-                else:
-                    c.execute(
-                        "UPDATE trades SET last_price=?, bars_count=?, "
-                        "last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
-                        (curr_price, n_bars, closed_15m_ts, t_id)
-                    )
 
-        except Exception as e:
-            send_error_alert(f"Lifecycle [{ex_id} {sym}]: {e}")
+        except Exception:
+            pass
 
     conn.commit()
     conn.close()
@@ -611,28 +391,6 @@ def update_orders_and_positions():
 # =================================================================
 # MARKET SCANNER
 # =================================================================
-# Scanner/API protection only. Does not change the SMC entry/SL/TP formulas.
-def is_exchange_retryable_error(ex_id, exc):
-    text = str(exc).lower()
-    return (
-        ex_id.lower() == 'bingx' and
-        ('100410' in text or '请稍后重试' in text or 'try again later' in text)
-    )
-
-
-def mark_exchange_backoff(ex_id, seconds):
-    until = time.time() + seconds
-    EXCHANGE_BACKOFF_UNTIL[ex_id] = until
-    # Only one informational message per cooldown period.
-    if EXCHANGE_BACKOFF_NOTICE.get(ex_id, 0) <= time.time():
-        send_telegram(
-            f"⚠️ <b>{ex_id.upper()} MARKET DATA COOLDOWN</b>\n"
-            f"Exchange sedang membatasi/menunda request market data.\n"
-            f"Scanner {ex_id.upper()} dijeda sekitar {seconds} detik; CEX lain tetap berjalan."
-        )
-        EXCHANGE_BACKOFF_NOTICE[ex_id] = until
-
-
 # LOGIC TRADE TIDAK DIUBAH
 def scan_markets():
     conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -658,28 +416,7 @@ def scan_markets():
 
     for ex_id, ex in exchanges.items():
         try:
-            now_ts = time.time()
-
-            # The strategy uses 15m candles, so rescanning the whole market every
-            # 15 seconds only creates unnecessary API traffic. Keep the existing
-            # lifecycle/position monitor at 15s, but scan each exchange at 30s.
-            if now_ts < EXCHANGE_BACKOFF_UNTIL.get(ex_id, 0):
-                continue
-            if now_ts < EXCHANGE_SCAN_NEXT.get(ex_id, 0):
-                continue
-
-            try:
-                tickers = ex.fetch_tickers()
-            except Exception as e:
-                if is_exchange_retryable_error(ex_id, e):
-                    mark_exchange_backoff(ex_id, BINGX_BACKOFF_SECONDS)
-                    EXCHANGE_SCAN_NEXT[ex_id] = time.time() + BINGX_BACKOFF_SECONDS
-                    continue
-                raise
-
-            EXCHANGE_SCAN_NEXT[ex_id] = time.time() + EXCHANGE_SCAN_INTERVAL
-
-            for sym in [s for s in tickers.keys()
+            for sym in [s for s in ex.fetch_tickers().keys()
                         if s.endswith('/USDT:USDT') or s.endswith('/USDT')][:60]:
 
                 if is_manual_alert_symbol(sym):
@@ -721,20 +458,6 @@ def scan_markets():
                 )
 
                 if sig:
-                    # Do not create duplicate orders for the same pair while an
-                    # existing setup is still pending/open. This does not alter
-                    # the SMC signal itself; it only prevents duplicate lifecycle
-                    # records during the 15-second scan loop.
-                    existing = sqlite3.connect(DB_FILE, timeout=10)
-                    already_active = existing.cursor().execute(
-                        "SELECT 1 FROM trades WHERE exchange_id=? AND symbol=? "
-                        "AND status IN ('PENDING', 'OPEN') LIMIT 1",
-                        (ex_id, sym)
-                    ).fetchone()
-                    existing.close()
-                    if already_active:
-                        continue
-
                     lev = CONFIG['LEVERAGE'].get(ex_id, 50)
                     qty = (CONFIG['MARGIN_PER_TRADE'] * lev) / en
                     mode = "[DRY RUN]" if CONFIG['DRY_RUN'] else "[REAL TRADE]"
@@ -781,10 +504,6 @@ def scan_markets():
                     act_count += 1
 
         except Exception as e:
-            if is_exchange_retryable_error(ex_id, e):
-                mark_exchange_backoff(ex_id, BINGX_BACKOFF_SECONDS)
-                EXCHANGE_SCAN_NEXT[ex_id] = time.time() + BINGX_BACKOFF_SECONDS
-                continue
             send_error_alert(f"Scan Ex [{ex_id}]: {e}")
 
 
@@ -809,43 +528,39 @@ def is_allowed_chat(message_or_callback):
 
 
 def main_keyboard():
-    # Tombol dibuat 1 baris penuh agar lebih besar dan mudah disentuh di HP.
-    # Telegram tidak menyediakan API untuk mengubah warna background inline button,
-    # jadi status/warna divisualisasikan dengan emoji.
+    # Semua fitur yang memang sudah ada di script dipusatkan di inline keyboard.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions")],
-        [InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
-        [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings")],
-        [InlineKeyboardButton(text="🏆 PAIR PERFORMANCE", callback_data="pairperf")],
-        [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status")],
-        [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
-        [InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")],
+        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"),
+         InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
+        [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings"),
+         InlineKeyboardButton(text="🏆 PAIR PERF", callback_data="pairperf")],
+        [InlineKeyboardButton(text="🏦 CEX", callback_data="cex_status"),
+         InlineKeyboardButton(text="🔐 API", callback_data="api_menu")],
+        [InlineKeyboardButton(text="⏯ BOT CONTROL", callback_data="bot_control")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
     ])
 
 
 def bot_control_keyboard():
-    dry = "🟢 DRY RUN: ON" if CONFIG['DRY_RUN'] else "🔴 DRY RUN: OFF / REAL"
-    loss = "🟢 DAILY LOSS: ON (2 SL)" if CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True) else "🔴 DAILY LOSS: OFF"
-    pause = "▶️ RESUME TRADING" if IS_BOT_PAUSED else "⏸️ PAUSE TRADING"
+    dry = "🧪 DRY RUN 🟢" if CONFIG['DRY_RUN'] else "🧪 DRY RUN 🔴"
+    pause = "▶️ RESUME" if IS_BOT_PAUSED else "⏸ PAUSE"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=dry, callback_data="dryrun_toggle")],
-        [InlineKeyboardButton(text=loss, callback_data="daily_loss_toggle")],
         [InlineKeyboardButton(text=pause, callback_data="resume" if IS_BOT_PAUSED else "pause")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
-        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
+        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
     ])
 
 
 def settings_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 MARGIN / TRADE", callback_data="set_margin_menu")],
-        [InlineKeyboardButton(text="📊 MAX POSISI", callback_data="set_maxpos_menu")],
-        [InlineKeyboardButton(text="🎯 MINIMUM WIN RATE", callback_data="set_minwr_menu")],
-        [InlineKeyboardButton(text="📈 MINIMUM TRADES", callback_data="set_mintrades_menu")],
+        [InlineKeyboardButton(text="💵 MARGIN", callback_data="set_margin_menu"),
+         InlineKeyboardButton(text="📊 MAX POS", callback_data="set_maxpos_menu")],
+        [InlineKeyboardButton(text="🎯 MIN WR", callback_data="set_minwr_menu"),
+         InlineKeyboardButton(text="📈 MIN TRADES", callback_data="set_mintrades_menu")],
         [InlineKeyboardButton(text="⚡ LEVERAGE", callback_data="set_lev_menu")],
-        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
+        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
     ])
 
 
@@ -859,15 +574,15 @@ def preset_keyboard(title, values, prefix, back="settings"):
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data=back)])
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=back)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cex_api_keyboard():
     rows = []
     for ex_id in DEFAULT_CEX:
-        rows.append([InlineKeyboardButton(text=f"🔑 SET / GANTI {ex_id.upper()}", callback_data=f"api_setup:{ex_id}")])
-    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="api_menu")])
+        rows.append([InlineKeyboardButton(text=f"🔑 {ex_id.upper()}", callback_data=f"api_setup:{ex_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="api_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -877,19 +592,20 @@ def cex_control_keyboard():
     for ex_id, enabled, api_key, account_label in db_rows:
         state = "🟢 ON" if enabled else "🔴 OFF"
         toggle_action = "off" if enabled else "on"
-        label = account_label or "Akun belum terdeteksi"
-        rows.append([InlineKeyboardButton(text=f"{ex_id.upper()} — {state} | {label}", callback_data=f"cex_toggle:{ex_id}:{toggle_action}")])
-        rows.append([InlineKeyboardButton(text=f"🔑 API {ex_id.upper()}", callback_data=f"api_setup:{ex_id}")])
-    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="api_menu")])
+        rows.append([
+            InlineKeyboardButton(text=f"{ex_id.upper()} {state}", callback_data=f"cex_toggle:{ex_id}:{toggle_action}"),
+            InlineKeyboardButton(text="🔑 API", callback_data=f"api_setup:{ex_id}")
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="api_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def api_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 SET / GANTI API", callback_data="api_setup_menu")],
+        [InlineKeyboardButton(text="🔑 Set / Ganti API", callback_data="api_setup_menu")],
         [InlineKeyboardButton(text="🏦 ON / OFF CEX", callback_data="cex_control")],
-        [InlineKeyboardButton(text="📋 LIHAT API & INFO AKUN", callback_data="api_status")],
-        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
+        [InlineKeyboardButton(text="📋 Lihat API & Akun", callback_data="api_status")],
+        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
     ])
 
 
@@ -897,11 +613,11 @@ def leverage_keyboard():
     rows = []
     for ex_id in DEFAULT_CEX:
         rows.append([InlineKeyboardButton(
-            text=f"⚡ {ex_id.upper()} — {CONFIG['LEVERAGE'].get(ex_id, 50)}x",
+            text=f"⚡ {ex_id.upper()} ({CONFIG['LEVERAGE'].get(ex_id, 50)}x)",
             callback_data=f"lev_ex:{ex_id}"
         )])
     rows.append([InlineKeyboardButton(text="⚡ SEMUA CEX", callback_data="lev_all")])
-    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="settings")])
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -914,7 +630,7 @@ def leverage_value_keyboard(target):
         if len(row) == 3:
             rows.append(row); row=[]
     if row: rows.append(row)
-    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="set_lev_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="set_lev_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1189,6 +905,10 @@ def build_api_status_text():
             f"🔑 API: {'✅ Tersimpan' if api else '❌ Belum ada'}",
             f"👤 Akun: {html.escape(account_label) if account_label else 'Belum diverifikasi'}"
         ]
+        if ex_id == 'bitget':
+            pw = db_read("SELECT password FROM cex_settings WHERE ex_id=?", (ex_id,))
+            has_passphrase = bool(pw and pw[0][0])
+            lines.insert(2, f"🔐 Passphrase: {'✅ Tersimpan' if has_passphrase else '❌ Belum ada'}")
         if account_info:
             try:
                 info = json.loads(account_info)
@@ -1208,19 +928,24 @@ def build_api_status_text():
     return "🔐 <b>API & INFORMASI AKUN</b>\n\n" + "\n\n".join(blocks)
 
 
-def validate_cex_api(ex_id, api, secret):
+def validate_cex_api(ex_id, api, secret, password=''):
     if ex_id not in DEFAULT_CEX:
         return False, "CEX tidak dikenal.", None
     if not api or not secret:
         return False, "API key/secret kosong.", None
+    if ex_id == 'bitget' and not password:
+        return False, "Bitget membutuhkan API Passphrase.", None
     try:
-        ex = getattr(ccxt, ex_id)({
+        params = {
             'apiKey': api,
             'secret': secret,
             'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
             'enableRateLimit': True,
             'timeout': 8000
-        })
+        }
+        if ex_id == 'bitget':
+            params['password'] = password
+        ex = getattr(ccxt, ex_id)(params)
         balance = ex.fetch_balance()
         details = extract_account_details(ex, balance)
         details = enrich_account_details(ex, details)
@@ -1409,7 +1134,7 @@ async def cmd_setapi(message: Message):
     if not is_allowed_chat(message):
         return
     await message.answer(
-        "🔐 <b>SET API</b>\n\nPilih CEX dulu. Setelah itu bot akan meminta <b>API Key</b> lalu <b>Secret Key</b> secara terpisah.",
+        "🔐 <b>SET API</b>\n\nPilih CEX dulu. Bot akan meminta <b>API Key</b> lalu <b>Secret Key</b>. Untuk <b>BITGET</b>, bot juga meminta <b>API Passphrase</b>.",
         reply_markup=cex_api_keyboard()
     )
 
@@ -1429,7 +1154,7 @@ async def cb_api_setup_menu(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
     await callback.message.edit_text(
-        "🔑 <b>PILIH CEX</b>\n\nBot akan meminta API Key dan Secret Key satu per satu.",
+        "🔑 <b>PILIH CEX</b>\n\nBot akan meminta API Key dan Secret Key satu per satu. <b>BITGET</b> juga membutuhkan API Passphrase.",
         reply_markup=cex_api_keyboard()
     )
 
@@ -1449,10 +1174,13 @@ async def cb_api_setup(callback: CallbackQuery):
     }
     await safe_answer(callback, f"Pilih {ex_id.upper()}")
     await callback.message.edit_text(
-        f"🔑 <b>SET API — {ex_id.upper()}</b>\n\n"
-        "Kirim <b>API Key</b> saja di pesan berikutnya.\n"
-        "Bot akan langsung meminta Secret Key setelahnya.\n\n"
-        "⚠️ Jangan kirim API key ke chat lain.",
+        (
+            f"🔑 <b>SET API — {ex_id.upper()}</b>\n\n"
+            "Kirim <b>API Key</b> saja di pesan berikutnya.\n"
+            "Bot akan langsung meminta Secret Key setelahnya.\n"
+            + ("Untuk BITGET, setelah Secret Key bot akan meminta <b>API Passphrase</b>.\n" if ex_id == 'bitget' else "")
+            + "\n⚠️ Jangan kirim credential ke chat lain."
+        ),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Batal", callback_data="api_cancel")]
         ])
@@ -1490,13 +1218,13 @@ async def cb_cex_control(callback: CallbackQuery):
 async def cb_cex_toggle(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     _, ex_id, action = callback.data.split(":", 2)
-    row = db_read("SELECT api_key, secret FROM cex_settings WHERE ex_id=?", (ex_id,))
+    row = db_read("SELECT api_key, secret, password FROM cex_settings WHERE ex_id=?", (ex_id,))
     if not row:
         await safe_answer(callback, "CEX tidak ditemukan", True)
         return
-    api, secret = row[0]
-    if action == 'on' and (not api or not secret):
-        await safe_answer(callback, "Set API dulu sebelum ON", True)
+    api, secret, password = row[0]
+    if action == 'on' and (not api or not secret or (ex_id == 'bitget' and not password)):
+        await safe_answer(callback, "Set API + Passphrase Bitget dulu sebelum ON" if ex_id == 'bitget' else "Set API dulu sebelum ON", True)
         return
     conn = sqlite3.connect(DB_FILE, timeout=5)
     conn.cursor().execute("UPDATE cex_settings SET enabled=? WHERE ex_id=?", (1 if action == 'on' else 0, ex_id))
@@ -1545,24 +1273,43 @@ async def handle_api_setup_message(message: Message):
         state['ack_message_id'] = ack.message_id
         return
 
+    if state['stage'] == 'secret' and ex_id == 'bitget':
+        state['stage'] = 'passphrase'
+        state['secret'] = text
+        ack = await bot.send_message(
+            chat_id,
+            "🔐 <b>Secret Key diterima</b> untuk BITGET.\n"
+            "🗑️ Pesan Secret Key sudah dihapus.\n\n"
+            "Sekarang kirim <b>API Passphrase</b> yang dibuat saat API Bitget dibuat.\n"
+            "⚠️ Ini <b>bukan password login Bitget</b>. Pesan Passphrase juga akan otomatis dihapus.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ BATAL & HAPUS SESI", callback_data="api_cancel")]
+            ])
+        )
+        state['ack_message_id'] = ack.message_id
+        return
+
     api = state.get('api', '')
-    secret = text
-    original_api, original_secret = api, secret
-    # Remove setup state before validation so no credential stays in memory longer than needed.
+    if ex_id == 'bitget':
+        secret = state.get('secret', '')
+        password = text
+    else:
+        secret = text
+        password = ''
+
+    original_api, original_secret, original_password = api, secret, password
     PENDING_API_SETUP.pop(chat_id, None)
 
-    # Delete the bot's API acknowledgement and setup prompt from chat history too.
     for mid in (state.get('ack_message_id'), state.get('prompt_message_id')):
         if mid:
             try: await bot.delete_message(chat_id, mid)
             except Exception: pass
 
     status_msg = await bot.send_message(chat_id, f"🔄 <b>Memvalidasi API {ex_id.upper()}...</b>")
-
-    ok, detail, account_details = await asyncio.to_thread(validate_cex_api, ex_id, api, secret)
-    # Explicitly drop local secret references as soon as validation returns.
+    ok, detail, account_details = await asyncio.to_thread(validate_cex_api, ex_id, api, secret, password)
     secret = ''
     api = ''
+    password = ''
 
     if not ok:
         safe_detail = html.escape(detail)
@@ -1602,14 +1349,14 @@ async def handle_api_setup_message(message: Message):
 
     conn = sqlite3.connect(DB_FILE, timeout=5)
     conn.cursor().execute(
-        "UPDATE cex_settings SET api_key=?, secret=?, account_label=?, account_info=? WHERE ex_id=?",
-        (original_api, original_secret, account_label, json.dumps(stored_info, ensure_ascii=False), ex_id)
+        "UPDATE cex_settings SET api_key=?, secret=?, password=?, account_label=?, account_info=? WHERE ex_id=?",
+        (original_api, original_secret, original_password if ex_id == 'bitget' else '', account_label, json.dumps(stored_info, ensure_ascii=False), ex_id)
     )
     conn.commit(); conn.close()
     reload_exchanges()
 
     # Clear local credential references after persistence.
-    original_api, original_secret = '', ''
+    original_api, original_secret, original_password = '', '', ''
 
     await status_msg.edit_text(
         f"✅ <b>API {ex_id.upper()} VALID</b>\n\n"
@@ -1699,8 +1446,7 @@ async def cb_bot_control(callback: CallbackQuery):
     await callback.message.edit_text(
         "🤖 <b>BOT CONTROL</b>\n\n"
         f"Status: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}\n"
-        f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n"
-        f"Daily Loss Limit: {'🟢 ON (2 SL)' if CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True) else '🔴 OFF'}\n\n"
+        f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n\n"
         "Gunakan tombol di bawah untuk mengubah kontrol yang memang tersedia di script.",
         reply_markup=bot_control_keyboard()
     )
@@ -1719,33 +1465,6 @@ async def cb_dryrun_toggle(callback: CallbackQuery):
         reply_markup=bot_control_keyboard()
     )
     send_telegram("🧪 <b>MODE BERUBAH</b> — " + ("DRY RUN aktif. Tidak ada order real." if value else "⚠️ REAL MONEY aktif. Order real diizinkan."))
-
-
-@dp.callback_query(F.data == "daily_loss_toggle")
-async def cb_daily_loss_toggle(callback: CallbackQuery):
-    global IS_BOT_PAUSED, daily_loss_limit_triggered
-    if not is_allowed_chat(callback):
-        return
-
-    value = not CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True)
-    CONFIG['DAILY_LOSS_LIMIT_ENABLED'] = value
-    update_db_setting('daily_loss_limit', 1.0 if value else 0.0)
-
-    if not value and daily_loss_limit_triggered:
-        daily_loss_limit_triggered = False
-        IS_BOT_PAUSED = False
-
-    await safe_answer(callback, "DAILY LOSS ON" if value else "DAILY LOSS OFF")
-    await callback.message.edit_text(
-        f"{'🟢 <b>DAILY LOSS LIMIT AKTIF</b>' if value else '🔴 <b>DAILY LOSS LIMIT MATI</b>'}\n\n"
-        f"Batas: <b>{MAX_DAILY_SL} SL / hari</b>\n"
-        f"Status bot: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}",
-        reply_markup=bot_control_keyboard()
-    )
-    send_telegram(
-        "🛡️ <b>DAILY LOSS LIMIT</b> — "
-        + (f"ON ({MAX_DAILY_SL} SL/hari)." if value else "OFF. Bot tidak akan auto-pause karena jumlah SL harian.")
-    )
 
 
 @dp.callback_query(F.data == "cancelall")
@@ -1888,79 +1607,6 @@ app = Flask(__name__, template_folder='templates')
 def dashboard():
     return render_template('index.html')
 
-@app.route('/api/cex-monitor')
-def api_cex_monitor():
-    """Return live CEX configuration/connection state for the web dashboard.
-
-    This endpoint only reads local bot state/database metadata. It does not
-    call private exchange endpoints on every dashboard refresh.
-    """
-    try:
-        rows = db_read(
-            "SELECT ex_id, api_key, enabled, account_label, account_info "
-            "FROM cex_settings ORDER BY ex_id"
-        )
-
-        items = []
-        for ex_id, api_key, enabled, account_label, account_info in rows:
-            info = {}
-            if account_info:
-                try:
-                    info = json.loads(account_info)
-                except Exception:
-                    info = {}
-
-            configured = bool(api_key)
-            loaded = ex_id in exchanges
-            enabled = bool(enabled)
-
-            if not enabled:
-                state = 'OFF'
-                state_icon = '🔴'
-            elif not configured:
-                state = 'API NOT SET'
-                state_icon = '🟠'
-            elif loaded:
-                state = 'ON / READY'
-                state_icon = '🟢'
-            else:
-                state = 'ON / NOT LOADED'
-                state_icon = '🟡'
-
-            items.append({
-                'id': ex_id,
-                'name': ex_id.upper(),
-                'enabled': enabled,
-                'configured': configured,
-                'loaded': loaded,
-                'state': state,
-                'state_icon': state_icon,
-                'leverage': CONFIG['LEVERAGE'].get(ex_id, 50),
-                'account': account_label or 'Belum diverifikasi',
-                'account_type': info.get('Account Type', '-'),
-                'market': info.get('Market', '-'),
-                'private_api': info.get('Private API', '-'),
-                'usdt_free': info.get('USDT Free'),
-                'usdt_total': info.get('USDT Total'),
-                'open_positions': info.get('Open Positions', 'N/A'),
-                'open_orders': info.get('Open Orders', 'N/A'),
-                'trade_permission': info.get('Trade Permission', '-'),
-                'read_only': info.get('Read Only', '-')
-            })
-
-        return jsonify({
-            'ok': True,
-            'bot_paused': bool(IS_BOT_PAUSED),
-            'dry_run': bool(CONFIG.get('DRY_RUN', True)),
-            'scanning': bool(exchanges) and not IS_BOT_PAUSED and is_kill_zone(),
-            'last_runtime_status': last_runtime_status or 'UNKNOWN',
-            'updated': datetime.now(WIB).strftime('%d/%m/%Y, %H:%M:%S'),
-            'cex': items
-        })
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e), 'cex': []}), 500
-
-
 @app.route('/api/stats')
 def api_stats():
     conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -1982,9 +1628,7 @@ def api_stats():
             'wins': 0,
             'losses': 0,
             'net_pnl': 0,
-            'recent': [],
-            'daily_pnl': {},
-            'daily_trades': {}
+            'recent': []
         })
 
     margin = CONFIG.get('MARGIN_PER_TRADE', 2.0)
@@ -1992,27 +1636,9 @@ def api_stats():
         lambda x: margin if 'TP' in x else -margin
     )
     df['cum_pnl'] = df['pnl_value'].cumsum()
-    dt = pd.to_datetime(df['created_at'], errors='coerce')
-    df['date_only'] = dt.dt.strftime('%d %b %H:%M')
-    df['day_key'] = dt.dt.strftime('%Y-%m-%d')
-
-    # Daily PnL for the calendar heatmap.
-    daily = (
-        df.dropna(subset=['day_key'])
-          .groupby('day_key', as_index=False)['pnl_value']
-          .sum()
-    )
-    daily_pnl = {
-        str(row['day_key']): round(float(row['pnl_value']), 2)
-        for _, row in daily.iterrows()
-    }
-    daily_trades = (
-        df.dropna(subset=['day_key'])
-          .groupby('day_key')
-          .size()
-          .to_dict()
-    )
-    daily_trades = {str(k): int(v) for k, v in daily_trades.items()}
+    df['date_only'] = pd.to_datetime(
+        df['created_at']
+    ).dt.strftime('%d %b %H:%M')
 
     wins = len(df[df['status'] == 'CLOSED (TP)'])
     losses = len(df[df['status'] == 'CLOSED (SL)'])
@@ -2029,9 +1655,7 @@ def api_stats():
         'wins': wins,
         'losses': losses,
         'net_pnl': net_pnl,
-        'recent': recent,
-        'daily_pnl': daily_pnl,
-        'daily_trades': daily_trades
+        'recent': recent
     })
 
 
@@ -2043,7 +1667,7 @@ def notify_runtime_status(new_status, text):
 
 
 def main_loop():
-    global daily_sl_count, IS_BOT_PAUSED, daily_loss_limit_triggered
+    global daily_sl_count, IS_BOT_PAUSED
 
     last_hb = time.time()
     send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>\n🟢 Trading engine siap. Menunggu kondisi scan.")
@@ -2054,7 +1678,6 @@ def main_loop():
 
             if now.hour == 7 and now.minute == 0 and now.second < 15:
                 daily_sl_count = 0
-                daily_loss_limit_triggered = False
                 if IS_BOT_PAUSED:
                     IS_BOT_PAUSED = False
                     send_telegram("🌅 <b>NEW DAY RESET</b>\nBot otomatis kembali aktif.")
@@ -2064,7 +1687,6 @@ def main_loop():
                     "💓 <b>SYSTEM PING</b>\n"
                     f"Bot: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}\n"
                     f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n"
-                    f"Daily Loss: {'ON' if CONFIG.get('DAILY_LOSS_LIMIT_ENABLED', True) else 'OFF'}\n"
                     f"CEX aktif: {len(exchanges)}"
                 )
                 last_hb = time.time()
