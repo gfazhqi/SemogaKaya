@@ -2719,6 +2719,7 @@ async def cb_api_setup(callback: CallbackQuery):
     PENDING_API_SETUP[str(callback.message.chat.id)] = {
         'stage': 'api_key',
         'ex_id': ex_id,
+        'user_id': str(_account_user_id(callback.message.chat.id)),
         'prompt_message_id': None,
         'ack_message_id': None
     }
@@ -3212,7 +3213,10 @@ async def handle_text(message: Message):
         return
 
     chat_id = message.chat.id
-    state = PENDING_API_SETUP.get(chat_id)
+    # PENDING_API_SETUP uses string chat IDs everywhere (callbacks also use str()).
+    # Keep the same key type here so VIP/Owner API setup sessions are found.
+    chat_key = str(chat_id)
+    state = PENDING_API_SETUP.get(chat_key)
     if not state:
         return
 
@@ -3221,6 +3225,11 @@ async def handle_text(message: Message):
         return
 
     ex_id = state['ex_id']
+
+    # Never allow a pending API session to be consumed by another account.
+    if str(state.get('user_id', _account_user_id(chat_id))) != str(_account_user_id(chat_id)):
+        PENDING_API_SETUP.pop(chat_key, None)
+        return
 
     # Delete the user's credential message immediately.
     try:
@@ -3267,7 +3276,7 @@ async def handle_text(message: Message):
     api = state.get('api', '')
     secret = state.get('secret', '')
     password = text if ex_id == 'bitget' else ''
-    PENDING_API_SETUP.pop(chat_id, None)
+    PENDING_API_SETUP.pop(chat_key, None)
 
     for mid in (state.get('ack_message_id'), state.get('prompt_message_id')):
         if mid:
