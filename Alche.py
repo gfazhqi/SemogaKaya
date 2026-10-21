@@ -6,7 +6,6 @@ import threading
 import pandas as pd
 import requests
 import ccxt
-import json
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, jsonify
 
@@ -107,14 +106,13 @@ def update_db_setting(key, value):
     conn.commit(); conn.close()
 
 # =================================================================
-# HELPERS (DENGAN DUKUNGAN INLINE KEYBOARD)
+# HELPERS (ANTI-BUNGKAM & AUTO DELETE)
 # =================================================================
 def send_telegram(message, reply_markup=None):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
+        if reply_markup: payload["reply_markup"] = reply_markup
         r = requests.post(url, json=payload, timeout=5)
         if r.status_code != 200:
             payload.pop("parse_mode", None)
@@ -285,7 +283,7 @@ def scan_markets():
         except Exception as e: send_error_alert(f"Scan Ex [{ex_id}]: {e}")
 
 # =================================================================
-# TELEGRAM POLLING & CALLBACK QUERIES
+# TELEGRAM POLLING & INLINE KEYBOARDS
 # =================================================================
 def telegram_polling():
     global IS_BOT_PAUSED
@@ -296,26 +294,20 @@ def telegram_polling():
             if res.get("ok"):
                 for r in res.get("result", []):
                     last_id = r["update_id"]
-                    
                     text, msg_id = "", ""
                     
-                    # 1. TANGKAP TOMBOL YANG DIPENCET (CALLBACK QUERY)
                     if "callback_query" in r:
                         cb = r["callback_query"]
                         msg = cb.get("message", {})
                         if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID): continue
-                        
-                        text = cb.get("data", "") # Isi teks tersembunyi dari tombol (misal: /posisi)
+                        text = cb.get("data", "")
                         msg_id = msg.get("message_id")
-                        answer_callback(cb["id"]) # Matikan animasi loading di tombol
-                        
-                    # 2. TANGKAP PESAN KETIKAN BIASA
+                        answer_callback(cb["id"])
                     elif "message" in r:
                         msg = r["message"]
                         if str(msg.get("chat", {}).get("id", "")) != str(TELEGRAM_CHAT_ID): continue
                         text = msg.get("text", "").strip()
                         msg_id = msg.get("message_id")
-                    
                     else: continue
                     
                     parts = text.split(" ")
@@ -346,13 +338,57 @@ def telegram_polling():
                         continue
 
                     # -------------------------------------------------------------
-                    # NORMAL COMMANDS
+                    # NORMAL COMMANDS & MENUS
                     # -------------------------------------------------------------
                     if text.startswith("/"):
                         if not text.startswith("/setapi"): SETUP_STATE["status"] = "IDLE"
                             
-                        if text.startswith("/setapi"):
-                            delete_telegram_message(msg_id)
+                        # MENU UTAMA
+                        if text in ["/start", "/help", "/menu"]:
+                            keyboard = {
+                                "inline_keyboard": [
+                                    [{"text": "📊 Posisi", "callback_data": "/posisi"}, {"text": "⚙️ Info Setting", "callback_data": "/setting"}],
+                                    [{"text": "🔑 Setup API", "callback_data": "/menu_api"}, {"text": "🔌 Nyalakan CEX", "callback_data": "/menu_cex"}],
+                                    [{"text": "📈 Statistik", "callback_data": "/stat"}, {"text": "🏆 Performa", "callback_data": "/pairperf"}],
+                                    [{"text": "🎚️ Set Lev/Margin", "callback_data": "/menu_margin"}, {"text": "🔄 Simulasi/Real", "callback_data": "/dryrun_toggle"}],
+                                    [{"text": "⏸️ Pause/Resume Bot", "callback_data": "/pause_toggle"}]
+                                ]
+                            }
+                            send_telegram("🤖 <b>ALCHEMIST CONTROL PANEL</b>\nPilih menu di bawah ini:", reply_markup=keyboard)
+                            
+                        # SUB-MENU API
+                        elif text == "/menu_api":
+                            kb = {"inline_keyboard": [
+                                [{"text": "BingX", "callback_data": "/setapi bingx"}, {"text": "Bitget", "callback_data": "/setapi bitget"}],
+                                [{"text": "Bybit", "callback_data": "/setapi bybit"}, {"text": "Binance", "callback_data": "/setapi binance"}]
+                            ]}
+                            send_telegram("🔑 <b>Pilih Bursa untuk Setup API:</b>", reply_markup=kb)
+
+                        # SUB-MENU ON/OFF CEX
+                        elif text == "/menu_cex":
+                            kb = {"inline_keyboard": [
+                                [{"text": "🟢 ON BingX", "callback_data": "/cex on bingx"}, {"text": "🔴 OFF BingX", "callback_data": "/cex off bingx"}],
+                                [{"text": "🟢 ON Bitget", "callback_data": "/cex on bitget"}, {"text": "🔴 OFF Bitget", "callback_data": "/cex off bitget"}],
+                                [{"text": "🟢 ON Bybit", "callback_data": "/cex on bybit"}, {"text": "🔴 OFF Bybit", "callback_data": "/cex off bybit"}],
+                                [{"text": "🟢 ON Binance", "callback_data": "/cex on binance"}, {"text": "🔴 OFF Binance", "callback_data": "/cex off binance"}]
+                            ]}
+                            send_telegram("🔌 <b>Pilih Bursa yang mau dinyalakan/dimatikan:</b>", reply_markup=kb)
+
+                        # SUB-MENU LEVERAGE & MARGIN
+                        elif text == "/menu_margin":
+                            msg_text = ("🎚️ <b>PENGATURAN MARGIN & LEVERAGE</b>\n\n"
+                                   "Karena butuh angka spesifik, silakan balas dengan mengetik perintah ini:\n\n"
+                                   "<b>1. Ubah Leverage:</b>\n"
+                                   "<code>/setlev bingx 50</code> (khusus BingX)\n"
+                                   "<code>/setlev 50</code> (semua bursa)\n\n"
+                                   "<b>2. Ubah Margin per Trade:</b>\n"
+                                   "<code>/setmargin 5.0</code> (artinya $5)\n\n"
+                                   "<b>3. Ubah Max Posisi:</b>\n"
+                                   "<code>/setmaxpos 3</code> (maksimal 3 posisi bersamaan)")
+                            send_telegram(msg_text)
+
+                        elif text.startswith("/setapi"):
+                            if "callback_query" in r: delete_telegram_message(msg_id)
                             if len(parts) == 2:
                                 ex_id = parts[1].lower()
                                 if ex_id in DEFAULT_CEX:
@@ -363,6 +399,7 @@ def telegram_polling():
                             else: send_telegram("⚠️ Gunakan format: <code>/setapi bingx</code>")
                         
                         elif text.startswith("/cex ") and len(parts) == 3:
+                            if "callback_query" in r: delete_telegram_message(msg_id)
                             action, ex_id = parts[1].lower(), parts[2].lower()
                             if ex_id in DEFAULT_CEX and action in ['on', 'off']:
                                 conn = sqlite3.connect(DB_FILE)
@@ -378,6 +415,13 @@ def telegram_polling():
                         elif text.startswith("/setmargin ") and len(parts)==2: CONFIG['MARGIN_PER_TRADE']=float(parts[1]); update_db_setting('margin',float(parts[1])); send_telegram(f"✅ Margin: ${parts[1]}")
                         elif text.startswith("/setmaxpos ") and len(parts)==2: CONFIG['MAX_CONCURRENT_POSITIONS']=int(parts[1]); update_db_setting('max_pos',int(parts[1])); send_telegram(f"✅ Max Posisi: {parts[1]}")
                         elif text.startswith("/setminwr ") and len(parts)==2: CONFIG['MIN_WR']=float(parts[1]); update_db_setting('min_wr',float(parts[1])); send_telegram(f"✅ Min WinRate: {parts[1]}%")
+                        elif text.startswith("/setmintrades ") and len(parts)==2: CONFIG['MIN_TRADES']=int(parts[1]); update_db_setting('min_trades',int(parts[1])); send_telegram(f"✅ Min Trade: {parts[1]}x")
+                        elif text.startswith("/setlev "):
+                            if len(parts) == 2:
+                                for ex in DEFAULT_CEX.keys(): CONFIG['LEVERAGE'][ex]=int(parts[1]); update_db_setting(f'lev_{ex}',int(parts[1]))
+                                send_telegram(f"✅ Semua leverage: {parts[1]}x")
+                            elif len(parts) == 3 and parts[1].lower() in DEFAULT_CEX:
+                                CONFIG['LEVERAGE'][parts[1].lower()]=int(parts[2]); update_db_setting(f'lev_{parts[1].lower()}',int(parts[2])); send_telegram(f"✅ Lev {parts[1].upper()}: {parts[2]}x")
                         
                         elif text == "/pairperf":
                             conn = sqlite3.connect(DB_FILE); c = conn.cursor()
@@ -387,7 +431,6 @@ def telegram_polling():
                                 if 'TP' in stat: pair_perf[sym]['w'] += 1
                                 else: pair_perf[sym]['l'] += 1
                             conn.close()
-                            
                             gacor, blist, eval_wait = "", "", ""
                             for sym, data in pair_perf.items():
                                 t = data['w'] + data['l']
@@ -398,7 +441,6 @@ def telegram_polling():
                                 if t < CONFIG['MIN_TRADES']: eval_wait += line
                                 elif is_core or wr >= CONFIG['MIN_WR']: gacor += line
                                 else: blist += line
-                            
                             msg = f"🏆 <b>PERFORMA KOIN</b>\n\n🔥 <b>AKTIF</b>\n{gacor or 'Belum ada'}\n\n⏳ <b>EVALUASI</b>\n{eval_wait or 'Belum ada'}\n\n🗑️ <b>BLACKLIST</b>\n{blist or 'Belum ada'}"
                             send_telegram(msg)
                             
@@ -412,17 +454,6 @@ def telegram_polling():
                                 msg = f"⚙️ <b>SETTING BOT</b>\n\nMode: {mode_text}\nMargin: ${CONFIG['MARGIN_PER_TRADE']}\nMax Pos: {CONFIG['MAX_CONCURRENT_POSITIONS']}\n\n<b>BURSA:</b>\n{cex_info or 'Belum ada'}"
                                 send_telegram(msg)
                             except Exception as e: send_telegram(f"⚠️ ERROR: {e}")
-
-                        # FITUR UTAMA INLINE KEYBOARD (CONTROL PANEL)
-                        elif text in ["/start", "/help", "/menu"]:
-                            keyboard = {
-                                "inline_keyboard": [
-                                    [{"text": "📊 Posisi", "callback_data": "/posisi"}, {"text": "⚙️ Setting", "callback_data": "/setting"}],
-                                    [{"text": "📈 Statistik", "callback_data": "/stat"}, {"text": "🏆 Performa Koin", "callback_data": "/pairperf"}],
-                                    [{"text": "🔄 Mode Simulasi", "callback_data": "/dryrun_toggle"}, {"text": "⏸️ Pause/Resume", "callback_data": "/pause_toggle"}]
-                                ]
-                            }
-                            send_telegram("🤖 <b>ALCHEMIST CONTROL PANEL</b>\nPilih menu di bawah ini:", reply_markup=keyboard)
                         
                         elif text == "/posisi":
                             try:
