@@ -222,6 +222,68 @@ def update_db_setting(key, value):
     conn.close()
 
 
+
+# =================================================================
+# TEMPORARY TELEGRAM BACKUP
+# Backup files are created only in the system temp directory.
+# They are deleted automatically after the Telegram message is
+# removed (default: 5 minutes). No permanent backup is kept on VPS.
+# =================================================================
+BACKUP_MESSAGE_TTL_SECONDS = 300
+
+async def create_temp_db_backup():
+    """Create a consistent SQLite backup in the OS temp directory."""
+    import sqlite3
+    fd, temp_path = tempfile.mkstemp(prefix="alche_backup_", suffix=".db")
+    os.close(fd)
+    try:
+        src_conn = sqlite3.connect(DB_FILE, timeout=15)
+        dst_conn = sqlite3.connect(temp_path, timeout=15)
+        with dst_conn:
+            src_conn.backup(dst_conn)
+        dst_conn.close()
+        src_conn.close()
+        return temp_path
+    except Exception:
+        try:
+            src_conn.close()
+        except Exception:
+            pass
+        try:
+            Path(temp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+async def send_temporary_backup(chat_id):
+    """Send DB backup to Telegram and delete both message/file after 5 min."""
+    temp_path = await create_temp_db_backup()
+    backup_message = None
+    try:
+        from aiogram.types import FSInputFile
+        backup_message = await bot.send_document(
+            chat_id=chat_id,
+            document=FSInputFile(temp_path),
+            caption=(
+                "💾 <b>BACKUP DATABASE</b>\n\n"
+                "⚠️ Backup ini hanya sementara.\n"
+                "🗑️ Pesan dan file temporary akan dihapus otomatis "
+                "setelah <b>5 menit</b>.\n"
+                "📥 Simpan/download sekarang jika diperlukan untuk migrasi VPS."
+            ),
+        )
+        await asyncio.sleep(BACKUP_MESSAGE_TTL_SECONDS)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=backup_message.message_id)
+        except Exception:
+            pass
+    finally:
+        try:
+            Path(temp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 # =================================================================
 # HELPERS
 # =================================================================
