@@ -880,13 +880,16 @@ def build_runtime_status_text(user_id='OWNER'):
     return "\n".join(lines)
 
 
-def runtime_status_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
+def runtime_status_keyboard(obj=None):
+    # BOT CONTROL is an Owner-only control. Never expose it in a VIP runtime view.
+    rows = [
         [InlineKeyboardButton(text="🔄 REFRESH", callback_data="runtime_status")],
         [InlineKeyboardButton(text="📊 POSISI", callback_data="positions")],
-        [InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")],
-        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
-    ])
+    ]
+    if obj is not None and is_owner(obj):
+        rows.append([InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")])
+    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # =================================================================
@@ -2471,6 +2474,10 @@ async def cmd_menu(message: Message):
 @dp.message(Command("start"))
 @dp.message(Command("help"))
 async def cmd_start(message: Message):
+    # Resolve the role directly on every /start and /help call.
+    # This prevents a stale Owner keyboard from being shown to a VIP user.
+    if not is_allowed_chat(message):
+        return
     await send_main_menu(message, delete_trigger=False)
 
 
@@ -3453,7 +3460,7 @@ async def cb_runtime_status(callback: CallbackQuery):
     user_id = _account_user_id(callback.message.chat.id)
     await callback.message.edit_text(
         build_runtime_status_text(user_id),
-        reply_markup=runtime_status_keyboard()
+        reply_markup=runtime_status_keyboard(callback)
     )
 
 
@@ -3543,10 +3550,14 @@ async def cb_cancelall(callback: CallbackQuery):
         else "Semua pending order diproses."
     )
 
-    await callback.message.edit_text(
-        build_positions_text(str(callback.message.chat.id)),
-        reply_markup=positions_keyboard(str(callback.message.chat.id))
-    )
+    try:
+        await callback.message.edit_text(
+            build_positions_text(str(callback.message.chat.id)),
+            reply_markup=positions_keyboard(str(callback.message.chat.id))
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 
 @dp.callback_query(F.data.startswith("closepos:"))
