@@ -49,6 +49,9 @@ exchanges = {}
 # Serialize trade-state DB operations so Telegram cleanup cannot race with
 # the background position updater and resurrect a cancelled queue item.
 DB_LOCK = threading.RLock()
+MAIN_ASYNC_LOOP = None
+PUBLIC_LAST_DAILY_REPORT_DATE = None
+PUBLIC_LAST_WEEKLY_REPORT_DATE = None
 
 # Scanner runtime state.
 # M15 strategy is evaluated on closed candles; there is no reason to hammer
@@ -771,7 +774,7 @@ def build_runtime_status_text():
         "",
         f"{engine} | {mode}",
         f"⏱ Uptime: {_fmt_uptime(time.time() - BOT_STARTED_AT)}",
-        f"🧠 Strategy: SMC M15 / H1 / D1",
+        f"🧠 Strategy: SMC M15 + H1 EMA50 + Daily Open",
         f"🕐 Kill Zone: {kill}",
         "",
         "🔎 <b>SCANNER PER CEX</b>",
@@ -825,15 +828,60 @@ PUBLIC_STATE = {
     'signals': []
 }
 
+def _public_target_path():
+    return Path("public_signal_target.json")
+
+def _public_get_target(today):
+    path = _public_target_path()
+    try:
+        obj = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+        if obj.get('date') == today:
+            target = int(obj.get('target', 0))
+            if PUBLIC_DAILY_MIN <= target <= PUBLIC_DAILY_MAX:
+                return target
+    except Exception:
+        pass
+    import random
+    target = random.randint(PUBLIC_DAILY_MIN, PUBLIC_DAILY_MAX)
+    try:
+        path.write_text(json.dumps({'date': today, 'target': target}), encoding='utf-8')
+    except Exception:
+        pass
+    return target
+
 def _public_reset_if_new_day():
     today = datetime.now(WIB).date().isoformat()
     if PUBLIC_STATE['date'] != today:
-        import random
         PUBLIC_STATE['date'] = today
-        PUBLIC_STATE['target'] = random.randint(PUBLIC_DAILY_MIN, PUBLIC_DAILY_MAX)
+        PUBLIC_STATE['target'] = _public_get_target(today)
         PUBLIC_STATE['published'] = 0
         PUBLIC_STATE['signals'] = []
+        hist = _public_load_history()
+        today_items = [x for x in hist if x.get('date') == today]
+        if today_items:
+            PUBLIC_STATE['signals'] = today_items
+            PUBLIC_STATE['published'] = len(today_items)
     return PUBLIC_STATE
+
+def _public_save_history():
+    path = Path("public_signal_history.json")
+    try:
+        path.write_text(json.dumps(PUBLIC_STATE['signals'], ensure_ascii=False, indent=2), encoding='utf-8')
+    except Exception:
+        pass
+
+def _public_load_history():
+    path = Path("public_signal_history.json")
+    try:
+        data = json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+def _public_record_outcome(signal, status, r):
+    signal['status'] = status
+    signal['r'] = float(r)
+    _public_save_history()
 
 def _public_crypto_symbol(sym):
     s = str(sym).upper()
@@ -906,6 +954,7 @@ async def publish_public_signal(sym, side, ex_id, entry, sl):
         'message_id': getattr(sent, 'message_id', None),
         'date': state['date']
     })
+    _public_save_history()
     return sent
 
 def _public_daily_report_text():
@@ -937,26 +986,72 @@ def _public_daily_report_text():
         f"Public signal akan kembali tersedia besok."
     )
 
-async def send_public_daily_report():
+async def update_public_signal_outcomes():
+    """Evaluate unresolved public signals: 1R/2R = WIN, SL = LOSS."""
+    state = _public_reset_if_new_day()
+    for sig in state['signals']:
+        if sig.get('status') != 'UNRESOLVED':
+            continue
+        ex = exchanges.get(sig.get('exchange'))
+        sym = sig.get('symbol')
+        if ex is None or not sym:
+            continue
+        try:
+            px = float(ex.fetch_ticker(sym)['last'])
+            side = sig.get('side')
+            if side == 'BUY':
+                if px <= float(sig['sl']):
+                    _public_record_outcome(sig, 'LOSS', -1)
+                elif px >= float(sig['tp2']):
+                    _public_record_outcome(sig, 'WIN', 2)
+                elif px >= float(sig['tp1']):
+                    _public_record_outcome(sig, 'WIN', 1)
+            elif side == 'SELL':
+                if px >= float(sig['sl']):
+                    _public_record_outcome(sig, 'LOSS', -1)
+                elif px <= float(sig['tp2']):
+                    _public_record_outcome(sig, 'WIN', 2)
+                elif px <= float(sig['tp1']):
+                    _public_record_outcome(sig, 'WIN', 1)
+        except Exception:
+            continue
+
+async def send_public_daily_report(force=False):
+    global PUBLIC_LAST_DAILY_REPORT_DATE
     if not PUBLIC_CHANNEL_ID:
         return
-    text_msg = _public_daily_report_text()
+    state = _public_reset_if_new_day()
+    if not state['signals']:
+        return
+    if not force:
+        if state['published'] < state['target']:
+            return
+        if any(x.get('status') == 'UNRESOLVED' for x in state['signals']):
+            return
+    today = state['date']
+    if PUBLIC_LAST_DAILY_REPORT_DATE == today and not force:
+        return
+    PUBLIC_LAST_DAILY_REPORT_DATE = today
+    kwargs = {'chat_id': PUBLIC_CHANNEL_ID, 'text': _public_daily_report_text()}
     kb = _public_keyboard()
-    kwargs = {'chat_id': PUBLIC_CHANNEL_ID, 'text': text_msg}
     if kb:
         kwargs['reply_markup'] = kb
     try:
         await bot.send_message(**kwargs)
     except Exception:
-        pass
+        PUBLIC_LAST_DAILY_REPORT_DATE = None
 
 async def _public_weekly_report():
+    global PUBLIC_LAST_WEEKLY_REPORT_DATE
     """Weekly report is sent Sunday morning from the persisted public history."""
     # Uses only signals recorded by this public-channel layer.
     if not PUBLIC_CHANNEL_ID:
         return
     now = datetime.now(WIB)
     if now.weekday() != 6:
+        return
+    sunday_key = now.date().isoformat()
+    if PUBLIC_LAST_WEEKLY_REPORT_DATE == sunday_key:
         return
     # Weekly aggregation can be populated by the daily history hook below.
     wins = losses = unresolved = 0
@@ -1004,9 +1099,28 @@ async def _public_weekly_report():
         if kb:
             kwargs['reply_markup'] = kb
         await bot.send_message(**kwargs)
+        PUBLIC_LAST_WEEKLY_REPORT_DATE = sunday_key
     except Exception:
         pass
 
+
+def _submit_async(coro):
+    """Submit a coroutine from the synchronous trading worker to aiogram's loop."""
+    loop = MAIN_ASYNC_LOOP
+    if loop is None or not loop.is_running():
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return None
+    try:
+        return asyncio.run_coroutine_threadsafe(coro, loop)
+    except Exception:
+        try:
+            coro.close()
+        except Exception:
+            pass
+        return None
 
 # =================================================================
 # MARKET SCANNER
@@ -1251,7 +1365,7 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
             )
             try:
                 # Public channel is broadcast-only; this never opens or changes a trade.
-                await publish_public_signal(sym, sig, ex_id, en, sl)
+                _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
             except Exception:
                 pass
 
@@ -3164,6 +3278,11 @@ def main_loop():
 
             check_and_update_daily_sl()
             update_orders_and_positions()
+            _submit_async(update_public_signal_outcomes())
+            if now.hour == 7 and now.minute == 0 and now.second < 15:
+                _submit_async(send_public_daily_report())
+                if now.weekday() == 6:
+                    _submit_async(_public_weekly_report())
 
             if IS_BOT_PAUSED:
                 notify_runtime_status(
@@ -3196,6 +3315,8 @@ def main_loop():
 
 
 async def app_main():
+    global MAIN_ASYNC_LOOP
+    MAIN_ASYNC_LOOP = asyncio.get_running_loop()
     # Initialize shared state before any worker starts.
     init_db()
     load_settings()
