@@ -9,12 +9,15 @@ import ccxt
 import asyncio
 import html
 import json
+import zipfile
+import shutil
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from aiogram.exceptions import TelegramBadRequest
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, jsonify
@@ -75,6 +78,10 @@ BOT_STARTED_AT = time.time()
 EXCHANGE_RUNTIME = {}
 LAST_EVENT_TEXT = 'Bot initialized'
 LAST_EVENT_TIME = time.time()
+
+# Track the latest Telegram main-menu message per chat so /menu can
+# replace the previous menu instead of stacking messages.
+LAST_MENU_MESSAGE = {}
 
 # =================================================================
 # DATABASE & SETTINGS
@@ -1004,6 +1011,9 @@ dp = Dispatcher()
 # {chat_id: {stage, ex_id, api, secret, password, prompt_message_id, ack_message_id}}
 # Prompt/ack message IDs are tracked so the API setup conversation can be cleaned up.
 PENDING_API_SETUP = {}
+PENDING_RESTORE = set()
+BACKUP_DIR = Path("backups")
+BACKUP_DIR.mkdir(exist_ok=True)
 
 
 def is_allowed_chat(message_or_callback):
@@ -1022,6 +1032,7 @@ def main_keyboard():
         [InlineKeyboardButton(text="🏆 PAIR PERFORMANCE", callback_data="pairperf")],
         [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status")],
         [InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
+        [InlineKeyboardButton(text="💾 BACKUP / RESTORE", callback_data="backup_menu")],
         [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
         [InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
@@ -1505,14 +1516,317 @@ async def safe_answer(callback: CallbackQuery, text=None, show_alert=False):
         pass
 
 
+async def send_main_menu(message: Message, delete_trigger: bool = False):
+    """Show one clean main menu per chat.
+
+    When /menu is used, the command message is removed and the previous
+    bot-generated main menu is removed before sending the new one.
+    """
+    if not is_allowed_chat(message):
+        return
+
+    chat_id = message.chat.id
+
+    # Remove the previous bot menu, if we know its message id.
+    previous_id = LAST_MENU_MESSAGE.get(chat_id)
+    if previous_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=previous_id)
+        except Exception:
+            pass
+
+    # Remove the /menu command itself when requested.
+    if delete_trigger:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    sent = await bot.send_message(
+        chat_id=chat_id,
+        text="🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:",
+        reply_markup=main_keyboard()
+    )
+    LAST_MENU_MESSAGE[chat_id] = sent.message_id
+    return sent
+
+
+
+async def delete_backup_message_later(chat_id: int, message_id: int, delay: int = 300):
+    """Delete only the Telegram backup message after 5 minutes.
+    The local backup file is intentionally kept on the VPS for migration/restore.
+    """
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+def create_database_backup():
+    """Create a consistent SQLite backup without copying a live WAL file blindly."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    raw_db = BACKUP_DIR / f"trades_{ts}.db"
+    zip_path = BACKUP_DIR / f"alchemist_backup_{ts}.zip"
+    src = sqlite3.connect(DB_FILE, timeout=20)
+    try:
+        # Force WAL contents into the main DB before making the backup.
+        try:
+            src.execute("PRAGMA wal_checkpoint(FULL)")
+        except Exception:
+            pass
+        dst = sqlite3.connect(str(raw_db), timeout=20)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+    readme = (
+        "ALCHEMIST BACKUP\n"
+        "================\n"
+        f"Created: {datetime.now().isoformat()}\n"
+        "Contains: trades.db database (settings, CEX configuration, trade history, pending/open state).\n\n"
+        "Migration:\n"
+        "1. Stop the old bot before final cutover.\n"
+        "2. Copy this backup to the new VPS.\n"
+        "3. Restore it as trades.db (or use /restore in the bot).\n"
+        "4. Copy the latest source code/config separately from your Git repo/VPS.\n"
+        "5. Start only ONE bot instance.\n"
+    )
+    readme_path = BACKUP_DIR / f"MIGRATION_{ts}.txt"
+    readme_path.write_text(readme, encoding="utf-8")
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            z.write(raw_db, arcname="trades.db")
+            z.write(readme_path, arcname="MIGRATION.txt")
+    finally:
+        for f in (raw_db, readme_path):
+            try: f.unlink()
+            except Exception: pass
+    return zip_path
+
+
+def validate_restore_db(path):
+    """Validate that an uploaded file is an Alchemist SQLite DB before replacing it."""
+    conn = sqlite3.connect(str(path), timeout=10)
+    try:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        required = {"trades", "settings", "cex_settings"}
+        if not required.issubset(tables):
+            return False, f"Tabel wajib kurang: {', '.join(sorted(required - tables))}"
+        # Basic integrity check.
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if str(integrity).lower() != "ok":
+            return False, f"SQLite integrity_check: {integrity}"
+        return True, "OK"
+    finally:
+        conn.close()
+
+
+def restore_database_from_file(source_path):
+    """Safely replace the live DB after validation and create a rollback backup first."""
+    global IS_BOT_PAUSED
+    ok, detail = validate_restore_db(source_path)
+    if not ok:
+        return False, detail
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rollback = BACKUP_DIR / f"before_restore_{ts}.db"
+    try:
+        # Backup current live DB first.
+        src = sqlite3.connect(DB_FILE, timeout=20)
+        try:
+            try: src.execute("PRAGMA wal_checkpoint(FULL)")
+            except Exception: pass
+            dst = sqlite3.connect(str(rollback), timeout=20)
+            try: src.backup(dst)
+            finally: dst.close()
+        finally:
+            src.close()
+
+        IS_BOT_PAUSED = True
+        time.sleep(1.0)
+        # Remove stale WAL/SHM sidecars before atomic replacement.
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(DB_FILE + suffix)
+            try: sidecar.unlink()
+            except FileNotFoundError: pass
+        os.replace(str(source_path), DB_FILE)
+        init_db()
+        load_settings()
+        reload_exchanges()
+        return True, str(rollback)
+    except Exception as e:
+        return False, str(e)
+
+
+@dp.callback_query(F.data == "backup_menu")
+async def cb_backup_menu(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💾 BUAT BACKUP", callback_data="backup_create")],
+        [InlineKeyboardButton(text="♻️ RESTORE BACKUP", callback_data="backup_restore")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
+    ])
+    await callback.message.edit_text(
+        "💾 <b>BACKUP / RESTORE</b>\n\n"
+        "Backup berisi database bot: setting, konfigurasi CEX, history, pending/open state.\n"
+        "Source code/config tetap perlu disimpan dari Git/VPS secara terpisah.\n\n"
+        "⚠️ Saat migrasi, jalankan hanya satu instance bot.",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query(F.data == "backup_create")
+async def cb_backup_create(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback, "Membuat backup...")
+    try:
+        path = await asyncio.to_thread(create_database_backup)
+        sent = await bot.send_document(
+            chat_id=callback.message.chat.id,
+            document=FSInputFile(str(path)),
+            caption=(
+                "💾 <b>BACKUP BERHASIL</b>\n\n"
+                "Simpan file ini untuk migrasi VPS/restore.\n"
+                "Database berisi konfigurasi CEX dan history trading.\n\n"
+                "🗑️ Pesan backup ini akan otomatis dihapus dalam <b>5 menit</b>.\n"
+                "💾 File backup tetap tersimpan di VPS."
+            )
+        )
+        asyncio.create_task(delete_backup_message_later(
+            callback.message.chat.id, sent.message_id, 300
+        ))
+    except Exception as e:
+        await callback.message.answer(f"❌ Backup gagal: <code>{html.escape(str(e))}</code>")
+
+
+@dp.callback_query(F.data == "backup_restore")
+async def cb_backup_restore(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    PENDING_RESTORE.add(callback.message.chat.id)
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "♻️ <b>RESTORE BACKUP</b>\n\n"
+        "Kirim file <code>.db</code> backup Alchemist sekarang.\n\n"
+        "⚠️ Database aktif akan diganti. Bot akan otomatis PAUSE setelah restore.\n"
+        "Sebelum mengganti, database saat ini dibuatkan rollback backup.\n\n"
+        "Kirim hanya backup yang kamu percaya.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ BATAL", callback_data="restore_cancel")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "restore_cancel")
+async def cb_restore_cancel(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    PENDING_RESTORE.discard(callback.message.chat.id)
+    await safe_answer(callback, "Restore dibatalkan")
+    await callback.message.edit_text("🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:", reply_markup=main_keyboard())
+
+
+@dp.message(F.document)
+async def handle_restore_document(message: Message):
+    if not is_allowed_chat(message): return
+    chat_id = message.chat.id
+    if chat_id not in PENDING_RESTORE:
+        return
+    doc = message.document
+    name = (doc.file_name or "").lower()
+    if not (name.endswith(".db") or name.endswith(".zip")):
+        await message.answer("❌ Kirim file backup <code>.zip</code> atau database SQLite <code>.db</code> saja.")
+        return
+
+    PENDING_RESTORE.discard(chat_id)
+    temp_path = BACKUP_DIR / f"incoming_restore_{int(time.time())}.db"
+    downloaded_path = BACKUP_DIR / f"incoming_{int(time.time())}{Path(name).suffix}"
+    status = await message.answer("♻️ <b>Memeriksa backup...</b>")
+    try:
+        tg_file = await bot.get_file(doc.file_id)
+        await bot.download_file(tg_file.file_path, destination=str(downloaded_path))
+        if name.endswith(".zip"):
+            with zipfile.ZipFile(downloaded_path, "r") as z:
+                members = [m for m in z.namelist() if not m.endswith("/")]
+                db_members = [m for m in members if Path(m).name.lower() == "trades.db"]
+                if not db_members:
+                    raise ValueError("Backup ZIP tidak berisi trades.db")
+                member = db_members[0]
+                if Path(member).is_absolute() or ".." in Path(member).parts:
+                    raise ValueError("Path trades.db di ZIP tidak aman")
+                with z.open(member) as src, open(temp_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+        else:
+            shutil.copy2(downloaded_path, temp_path)
+        ok, detail = await asyncio.to_thread(restore_database_from_file, temp_path)
+        if ok:
+            await status.edit_text(
+                "✅ <b>RESTORE BERHASIL</b>\n\n"
+                "Database sudah diganti dan bot sekarang <b>PAUSED</b>.\n"
+                "Cek <b>RUNTIME STATUS</b> / posisi terlebih dahulu sebelum RESUME.\n\n"
+                f"Rollback otomatis dibuat: <code>{html.escape(str(detail))}</code>",
+                reply_markup=main_keyboard()
+            )
+        else:
+            await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(detail))}</code>", reply_markup=main_keyboard())
+    except Exception as e:
+        await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(e))}</code>", reply_markup=main_keyboard())
+    finally:
+        for cleanup_path in (temp_path, downloaded_path):
+            try: cleanup_path.unlink()
+            except Exception: pass
+
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    await send_main_menu(message, delete_trigger=True)
+
+
 @dp.message(Command("start"))
 @dp.message(Command("help"))
 async def cmd_start(message: Message):
-    if not is_allowed_chat(message):
-        return
-    await message.answer(
-        "🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:",
-        reply_markup=main_keyboard()
+    await send_main_menu(message, delete_trigger=False)
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: Message):
+    if not is_allowed_chat(message): return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    try:
+        path = await asyncio.to_thread(create_database_backup)
+        sent = await bot.send_document(
+            chat_id=message.chat.id,
+            document=FSInputFile(str(path)),
+            caption=(
+                "💾 <b>BACKUP BERHASIL</b>\n"
+                "Simpan file ini untuk migrasi VPS/restore.\n\n"
+                "🗑️ Pesan backup ini akan otomatis dihapus dalam <b>5 menit</b>.\n"
+                "💾 File backup tetap tersimpan di VPS."
+            )
+        )
+        asyncio.create_task(delete_backup_message_later(
+            message.chat.id, sent.message_id, 300
+        ))
+    except Exception as e:
+        await bot.send_message(message.chat.id, f"❌ Backup gagal: <code>{html.escape(str(e))}</code>")
+
+
+@dp.message(Command("restore"))
+async def cmd_restore(message: Message):
+    if not is_allowed_chat(message): return
+    PENDING_RESTORE.add(message.chat.id)
+    try: await message.delete()
+    except Exception: pass
+    await bot.send_message(
+        message.chat.id,
+        "♻️ <b>RESTORE BACKUP</b>\n\nKirim file <code>.db</code> backup Alchemist sekarang.\n\n⚠️ Database aktif akan diganti dan bot akan PAUSED setelah restore.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ BATAL", callback_data="restore_cancel")]])
     )
 
 
@@ -1941,6 +2255,7 @@ async def cb_menu(callback: CallbackQuery):
     await safe_answer(callback)
     try:
         await callback.message.edit_text("🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:", reply_markup=main_keyboard())
+        LAST_MENU_MESSAGE[callback.message.chat.id] = callback.message.message_id
     except TelegramBadRequest:
         pass
 
