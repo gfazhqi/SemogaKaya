@@ -38,225 +38,69 @@ VIP_RECOMMENDED_LEVERAGE = 20
 VIP_RECOMMENDED_MAX_OPEN_POSITIONS = 3
 VIP_RECOMMENDED_MAX_TRADES_PER_DAY = 10
 
-def vip_recommended_settings_text():
+def vip_recommended_settings_text(user_id=None):
+    uid = str(user_id or '')
+    cfg = get_user_settings(uid) if uid and uid != 'OWNER' else {
+        'margin': 2.0, 'max_pos': 3, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1
+    }
     return (
-        "💎 <b>RECOMMENDED VIP SETTINGS</b>\n\n"
-        "💵 <b>Margin / Trade:</b> $2\n"
-        "⚡ <b>Leverage:</b> 20x\n"
-        "📊 <b>Max Open Positions:</b> 3\n"
-        "📅 <b>Max Trades / Day:</b> 10\n"
-        "🏦 <b>Exchange:</b> Bitget + BingX\n"
-        "🤖 <b>Auto Trade:</b> ON\n\n"
-        "ℹ️ <b>Penjelasan</b>\n"
-        "• Margin $2 adalah margin yang dialokasikan untuk satu posisi.\n"
-        "• Leverage 20x memperbesar nilai nominal posisi dan juga memperbesar risiko.\n"
-        "• Maksimal 3 posisi aktif membatasi jumlah posisi bersamaan.\n"
-        "• Maksimal 10 trade/hari membatasi jumlah pembukaan trade dalam satu hari.\n"
-        "• Bitget + BingX adalah exchange rekomendasi awal; user tetap dapat mengatur exchange yang tersedia di akun VIP.\n\n"
-        "⚠️ <b>WARNING</b>\n"
-        "Auto trading dan leverage memiliki risiko kerugian. Leverage 20x dapat memperbesar dampak pergerakan harga dan tetap memiliki risiko likuidasi.\n\n"
-        "Gunakan dana yang siap untuk kehilangan. Pastikan API exchange "
-        "<b>tidak memiliki permission withdrawal/penarikan dana</b>.\n\n"
-        "❗ Recommended Settings bukan jaminan profit, win rate, atau hasil trading tertentu."
+        "💎 <b>VIP SETTINGS</b>\n\n"
+        f"💵 Margin / Trade: <b>${cfg['margin']:.2f}</b>\n"
+        f"⚡ Leverage: <b>{cfg['leverage']}x</b>\n"
+        f"📊 Max Posisi: <b>{cfg['max_pos']}</b>\n"
+        f"📅 Max Trade / Hari: <b>{cfg['max_trades_day']}</b>\n"
+        f"🤖 Auto Trade: <b>{'🟢 ON' if cfg['auto_trade'] else '🔴 OFF'}</b>\n\n"
+        "ℹ️ Default rekomendasi: <b>$2 / 20x / 3 posisi / 10 trade per hari</b>.\n\n"
+        + VIP_WARNING_TEXT
     )
 
 
-SL_BUFFER_PERCENT = 0.0005
-MAX_DAILY_SL = 2
-DB_FILE = "trades.db"
-WIB = timezone(timedelta(hours=7))
-
-MANUAL_ALERT_PAIRS = []
-CORE_PAIRS = ['BTC/USDT', 'ETH/USDT']
-
-DEFAULT_CEX = {
-    'bingx': {'type': 'swap'},
-    'bitget': {'type': 'swap'},
-    'bybit': {'type': 'linear'},
-    'binance': {'type': 'future'}
-}
-
-exchanges = {}
-
-# Serialize trade-state DB operations so Telegram cleanup cannot race with
-# the background position updater and resurrect a cancelled queue item.
-DB_LOCK = threading.RLock()
-MAIN_ASYNC_LOOP = None
-PUBLIC_LAST_DAILY_REPORT_DATE = None
-PUBLIC_LAST_WEEKLY_REPORT_DATE = None
-
-# Scanner runtime state.
-# M15 strategy is evaluated on closed candles; there is no reason to hammer
-# the exchange every 15 seconds with hundreds of OHLCV requests.
-EXCHANGE_SCAN_NEXT = {}
-EXCHANGE_MARKETS = {}
-EXCHANGE_LAST_CANDLE = {}
-EXCHANGE_SCAN_CURSOR = {}
-EXCHANGE_REQUEST_NEXT = {}
-BINGX_BACKOFF_SECONDS = 30
-BINGX_REQUEST_SPACING = 0.35
-SCANNER_MIN_INTERVAL = 15
-
-
-CONFIG = {
-    'MARGIN_PER_TRADE': 2.0,
-    'MAX_CONCURRENT_POSITIONS': 2,
-    'LEVERAGE': {ex: 50 for ex in DEFAULT_CEX.keys()},
-    'DRY_RUN': True,
-    'MIN_TRADES': 5,
-    'MIN_WR': 40.0,
-    'DAILY_LOSS_LIMIT': True
-}
-
-IS_BOT_PAUSED = False
-daily_sl_count = 0
-last_error_time = 0
-ERROR_COOLDOWN = 300
-last_runtime_status = None
-ERROR_HISTORY = []
-ERROR_HISTORY_MAX = 50
-BOT_STARTED_AT = time.time()
-EXCHANGE_RUNTIME = {}
-LAST_EVENT_TEXT = 'Bot initialized'
-LAST_EVENT_TIME = time.time()
-
-# Track the latest Telegram main-menu message per chat so /menu can
-# replace the previous menu instead of stacking messages.
-LAST_MENU_MESSAGE = {}
-
-# =================================================================
-# DATABASE & SETTINGS
-# =================================================================
-def init_db():
+def ensure_user_settings(user_id):
+    uid = str(user_id)
     conn = sqlite3.connect(DB_FILE, timeout=10)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        exchange_id TEXT,
-        symbol TEXT,
-        order_type TEXT,
-        side TEXT,
-        entry_price REAL,
-        sl_price REAL,
-        tp_price REAL,
-        order_id TEXT,
-        bars_count INTEGER DEFAULT 0,
-        status TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )''')
     try:
-        c.execute("ALTER TABLE trades ADD COLUMN user_id TEXT DEFAULT 'OWNER'")
-    except sqlite3.OperationalError:
-        pass
-    c.execute("UPDATE trades SET user_id='OWNER' WHERE user_id IS NULL OR user_id=''")
-
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value REAL
-    )''')
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS vip_members (
-            telegram_id TEXT PRIMARY KEY,
-            username TEXT DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'ACTIVE',
-            expires_at TEXT,
-            added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        conn.execute(
+            "INSERT OR IGNORE INTO user_settings "
+            "(user_id, margin, max_pos, max_trades_day, leverage, auto_trade) "
+            "VALUES (?, 2.0, 3, 10, 20, 1)",
+            (uid,)
         )
-    """)
-    c.execute('''CREATE TABLE IF NOT EXISTS cex_settings (
-        ex_id TEXT PRIMARY KEY,
-        api_key TEXT,
-        secret TEXT,
-        enabled INTEGER DEFAULT 0,
-        account_label TEXT DEFAULT ''
-    )''')
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_user_settings(user_id):
+    uid = str(user_id)
+    ensure_user_settings(uid)
+    rows = db_read(
+        "SELECT margin, max_pos, max_trades_day, leverage, auto_trade "
+        "FROM user_settings WHERE user_id=?",
+        (uid,)
+    )
+    if not rows:
+        return {'margin': 2.0, 'max_pos': 3, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1}
+    r = rows[0]
+    return {
+        'margin': float(r[0]),
+        'max_pos': int(r[1]),
+        'max_trades_day': int(r[2]),
+        'leverage': int(r[3]),
+        'auto_trade': int(r[4]),
+    }
+
+
+def set_user_setting(user_id, field, value):
+    allowed = {'margin', 'max_pos', 'max_trades_day', 'leverage', 'auto_trade'}
+    if field not in allowed:
+        raise ValueError('Setting tidak valid')
+    ensure_user_settings(user_id)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     try:
-        c.execute("ALTER TABLE cex_settings ADD COLUMN enabled INTEGER DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE cex_settings ADD COLUMN account_label TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE cex_settings ADD COLUMN account_info TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        c.execute("ALTER TABLE cex_settings ADD COLUMN password TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS user_cex_settings (
-            user_id TEXT NOT NULL,
-            ex_id TEXT NOT NULL,
-            api_key TEXT DEFAULT '',
-            secret TEXT DEFAULT '',
-            password TEXT DEFAULT '',
-            enabled INTEGER DEFAULT 0,
-            account_label TEXT DEFAULT '',
-            account_info TEXT DEFAULT '',
-            PRIMARY KEY (user_id, ex_id)
-        )
-    """)
-    # Normalize any earlier build that stored the Owner under the numeric Telegram ID.
-    for ex in DEFAULT_CEX.keys():
-        legacy = c.execute(
-            "SELECT api_key, secret, password, enabled, account_label, account_info "
-            "FROM user_cex_settings WHERE user_id=? AND ex_id=?",
-            (str(TELEGRAM_CHAT_ID), ex)
-        ).fetchone()
-        owner_exists = c.execute(
-            "SELECT 1 FROM user_cex_settings WHERE user_id='OWNER' AND ex_id=?", (ex,)
-        ).fetchone()
-        if legacy and not owner_exists:
-            c.execute(
-                """INSERT INTO user_cex_settings
-                   (user_id, ex_id, api_key, secret, password, enabled, account_label, account_info)
-                   VALUES ('OWNER', ?, ?, ?, ?, ?, ?, ?)""",
-                (ex, legacy[0] or '', legacy[1] or '', legacy[2] or '', int(legacy[3] or 0), legacy[4] or '', legacy[5] or '')
-            )
-        if legacy:
-            c.execute(
-                "DELETE FROM user_cex_settings WHERE user_id=? AND ex_id=?",
-                (str(TELEGRAM_CHAT_ID), ex)
-            )
-
-    # Migrate existing global CEX credentials to the Owner namespace.
-    for ex in DEFAULT_CEX.keys():
-        row = c.execute(
-            "SELECT api_key, secret, enabled, account_label, account_info, password "
-            "FROM cex_settings WHERE ex_id=?", (ex,)
-        ).fetchone()
-        if row:
-            c.execute(
-                """INSERT OR IGNORE INTO user_cex_settings
-                   (user_id, ex_id, api_key, secret, password, enabled, account_label, account_info)
-                   VALUES ('OWNER', ?, ?, ?, ?, ?, ?, ?)""",
-                (ex, row[0] or '', row[1] or '', row[5] or '',
-                 int(row[2] or 0), row[3] or '', row[4] or '')
-            )
-
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('margin', 2.0)")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_pos', 2.0)")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dry_run', 1.0)")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_trades', 5.0)")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_wr', 40.0)")
-    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('daily_loss_limit', 1.0)")
-
-    for ex in DEFAULT_CEX.keys():
-        c.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, 50.0)",
-            (f'lev_{ex}',)
-        )
-        c.execute(
-            "INSERT OR IGNORE INTO cex_settings (ex_id, api_key, secret, enabled, account_label, account_info, password) VALUES (?, '', '', 0, '', '', '')",
-            (ex,)
-        )
-
-    conn.commit()
-    conn.close()
+        conn.execute(f"UPDATE user_settings SET {field}=? WHERE user_id=?", (value, str(user_id)))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def load_settings():
@@ -1371,13 +1215,28 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             scan_symbols = symbols
 
         user_is_owner = (str(user_id) == 'OWNER')
+        user_cfg = get_user_settings(user_id) if not user_is_owner else None
+        if not user_is_owner and not user_cfg['auto_trade']:
+            runtime['last_reason'] = 'VIP Auto Trade OFF'
+            EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
+            return 0
         active_count = db_read(
             "SELECT COUNT(*) FROM trades "
             "WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')",
             (user_id, ex_id)
         )[0][0]
-        user_max_pos = 2 if user_is_owner else 3
+        user_max_pos = CONFIG.get('MAX_CONCURRENT_POSITIONS', 2) if user_is_owner else user_cfg['max_pos']
         slots = max(0, user_max_pos - active_count)
+        if not user_is_owner:
+            today_trades = db_read(
+                "SELECT COUNT(*) FROM trades WHERE user_id=? "
+                "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
+                (user_id,)
+            )[0][0]
+            if today_trades >= user_cfg['max_trades_day']:
+                runtime['last_reason'] = f"Max trade/hari tercapai ({today_trades}/{user_cfg['max_trades_day']})"
+                EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
+                return 0
 
         if slots <= 0:
             runtime['last_reason'] = 'Max posisi CEX tercapai'
@@ -1392,22 +1251,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 break
 
             if is_manual_alert_symbol(sym):
-                try:
-                    m15 = _bingx_ohlcv(ex, sym, '15m', 50) if ex_id == 'bingx' else ex.fetch_ohlcv(sym, '15m', limit=50)
-                    h1 = _bingx_ohlcv(ex, sym, '1h', 60) if ex_id == 'bingx' else ex.fetch_ohlcv(sym, '1h', limit=60)
-                    d1 = _bingx_ohlcv(ex, sym, '1d', 2) if ex_id == 'bingx' else ex.fetch_ohlcv(sym, '1d', limit=2)
-                    if m15 and h1 and d1:
-                        sig, _, _, _ = analyze_smc_retrace(
-                            pd.DataFrame(m15, columns=['time','open','high','low','close','vol']),
-                            pd.DataFrame(h1, columns=['time','open','high','low','close','vol']),
-                            d1[-1][1]
-                        )
-                        if sig:
-                            send_telegram(f"📢 <b>FX ALERT</b> {sym} | {sig}")
-                except Exception as e:
-                    if _is_retryable_market_error(ex_id, e):
-                        rate_limited += 1
-                    continue
+                # Crypto-only engine: ignore legacy FX/manual-alert symbols.
                 continue
 
             if sym in pair_perf and sym not in CORE_PAIRS:
@@ -1459,8 +1303,8 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 runtime['last_reason'] = f'{sym}: duplicate setup'
                 continue
 
-            lev = CONFIG['LEVERAGE'].get(ex_id, 20 if not user_is_owner else 50)
-            margin = 2.0 if not user_is_owner else CONFIG['MARGIN_PER_TRADE']
+            lev = CONFIG['LEVERAGE'].get(ex_id, 50) if user_is_owner else user_cfg['leverage']
+            margin = CONFIG['MARGIN_PER_TRADE'] if user_is_owner else user_cfg['margin']
             dry_run = CONFIG['DRY_RUN'] if user_is_owner else False
             qty = (margin * lev) / en
             mode = "[DRY RUN]" if dry_run else "[REAL TRADE]"
@@ -1509,7 +1353,8 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             )
             try:
                 # Public channel is broadcast-only; this never opens or changes a trade.
-                _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
+                if user_is_owner:
+                    _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
             except Exception:
                 pass
 
@@ -1640,32 +1485,82 @@ def is_allowed_chat(message_or_callback):
 def require_owner(obj):
     return is_owner(obj)
 
+
+def get_owner_eligible_pairs():
+    """Global pair universe controlled by Owner and shared by all VIP users."""
+    pairs = OWNER_PAIR_FILTER.get("eligible_pairs") or DEFAULT_OWNER_ELIGIBLE_PAIRS
+    return sorted(set(str(p).upper() for p in pairs if "/" in str(p)))
+
+def is_pair_owner_eligible(symbol):
+    if not OWNER_PAIR_FILTER.get("enabled", True):
+        return True
+    return symbol.upper() in set(get_owner_eligible_pairs())
+
+def owner_pair_filter_text():
+    pairs = get_owner_eligible_pairs()
+    return (
+        "📊 <b>OWNER PAIR PERFORMANCE FILTER</b>\n\n"
+        f"Status: {'🟢 ON' if OWNER_PAIR_FILTER.get('enabled', True) else '🔴 OFF'}\n"
+        f"Pair eligible: <b>{len(pairs)}</b>\n\n"
+        + "\n".join(f"• {p}" for p in pairs)
+        + "\n\n⚠️ Filter ini global. Semua VIP mengikuti daftar pair Owner."
+    )
+
+def owner_pair_filter_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 FILTER ON/OFF", callback_data="owner_pair_toggle")],
+        [InlineKeyboardButton(text="🔄 DEFAULT PAIRS", callback_data="owner_pair_default")],
+        [InlineKeyboardButton(text="✏️ SET PAIR", callback_data="owner_pair_set")],
+        [InlineKeyboardButton(text="➖ REMOVE PAIR", callback_data="owner_pair_remove")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="owner_menu")]
+    ])
+
 def owner_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 PAIR PERFORMANCE", callback_data="owner_pair_filter")],
         [InlineKeyboardButton(text="👥 MANAGE VIP", callback_data="owner_vip")],
         [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"),
          InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
         [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings"),
-         InlineKeyboardButton(text="🏦 CEX", callback_data="cex_status")],
+         InlineKeyboardButton(text="🏆 PAIR PERFORMANCE", callback_data="pairperf")],
+        [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status"),
+         InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
+        [InlineKeyboardButton(text="💾 BACKUP / RESTORE", callback_data="backup_menu")],
         [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
-        [InlineKeyboardButton(text="⏯ BOT CONTROL", callback_data="bot_control")],
+        [InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
     ])
+
+
+def vip_settings_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💵 MARGIN", callback_data="vip_set_margin")],
+        [InlineKeyboardButton(text="⚡ LEVERAGE", callback_data="vip_set_lev")],
+        [InlineKeyboardButton(text="📊 MAX POSISI", callback_data="vip_set_maxpos")],
+        [InlineKeyboardButton(text="📅 MAX TRADE / HARI", callback_data="vip_set_maxtrades")],
+        [InlineKeyboardButton(text="🤖 AUTO TRADE", callback_data="vip_auto_trade")],
+        [InlineKeyboardButton(text="♻️ KEMBALIKAN DEFAULT", callback_data="vip_reset_settings")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
+    ])
+
 
 def vip_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"),
          InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
         [InlineKeyboardButton(text="💎 VIP SETTINGS", callback_data="vip_settings")],
+        [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status"),
+         InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
         [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
-        [InlineKeyboardButton(text="⏯ AUTO TRADE", callback_data="vip_auto_trade")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
     ])
 
+
 def role_keyboard(obj):
     return owner_keyboard() if is_owner(obj) else vip_keyboard()
+
 
 def vip_management_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1677,11 +1572,20 @@ def vip_management_keyboard():
     ])
 
 PENDING_VIP_ACTION = {}
+PENDING_VIP_SETTING = {}
+
+DEFAULT_OWNER_ELIGIBLE_PAIRS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+    "XRP/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT"
+]
+OWNER_PAIR_FILTER = {
+    "enabled": True,
+    "eligible_pairs": list(DEFAULT_OWNER_ELIGIBLE_PAIRS),
+    "updated_at": None,
+}
 
 def main_keyboard(obj=None):
-    if obj is not None:
-        return role_keyboard(obj)
-    return owner_keyboard()
+    return role_keyboard(obj) if obj is not None else owner_keyboard()
 
 
 def bot_control_keyboard():
@@ -1898,13 +1802,18 @@ def positions_keyboard(user_id='OWNER'):
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def build_stats_text():
-    rows = db_read("SELECT status, COUNT(*) FROM trades GROUP BY status")
+def build_stats_text(user_id='OWNER'):
+    user_id = _account_user_id(user_id)
+    if str(user_id) == 'OWNER':
+        rows = db_read("SELECT status, COUNT(*) FROM trades GROUP BY status")
+    else:
+        rows = db_read("SELECT status, COUNT(*) FROM trades WHERE user_id=? GROUP BY status", (str(user_id),))
     wins = sum(n for status, n in rows if status == 'CLOSED (TP)')
     losses = sum(n for status, n in rows if status == 'CLOSED (SL)')
     total = wins + losses
     wr = (wins / total * 100) if total else 0
-    net = (wins - losses) * CONFIG.get('MARGIN_PER_TRADE', 2.0)
+    margin = CONFIG.get('MARGIN_PER_TRADE', 2.0) if str(user_id) == 'OWNER' else get_user_settings(user_id)['margin']
+    net = (wins - losses) * margin
     detail = "\n".join(f"• {status}: {n}" for status, n in rows) or "Belum ada data"
     return (
         "📈 <b>STATISTIK</b>\n\n"
@@ -2338,7 +2247,9 @@ def restore_database_from_file(source_path):
 
 @dp.callback_query(F.data == "backup_menu")
 async def cb_backup_menu(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💾 BUAT BACKUP", callback_data="backup_create")],
@@ -2356,31 +2267,16 @@ async def cb_backup_menu(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "backup_create")
 async def cb_backup_create(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
-    await safe_answer(callback, "Membuat backup...")
-    try:
-        path = await asyncio.to_thread(create_database_backup)
-        sent = await bot.send_document(
-            chat_id=callback.message.chat.id,
-            document=FSInputFile(str(path)),
-            caption=(
-                "💾 <b>BACKUP BERHASIL</b>\n\n"
-                "Simpan file ini untuk migrasi VPS/restore.\n"
-                "Database berisi konfigurasi CEX dan history trading.\n\n"
-                "🗑️ Pesan backup ini akan otomatis dihapus dalam <b>5 menit</b>.\n"
-                "💾 File backup tetap tersimpan di VPS."
-            )
-        )
-        asyncio.create_task(delete_backup_message_later(
-            callback.message.chat.id, sent.message_id, 300
-        ))
-    except Exception as e:
-        await callback.message.answer(f"❌ Backup gagal: <code>{html.escape(str(e))}</code>")
-
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True); return
+    await safe_answer(callback, "Backup sedang dibuat...")
+    asyncio.create_task(send_temporary_backup(callback.message.chat.id))
 
 @dp.callback_query(F.data == "backup_restore")
 async def cb_backup_restore(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     PENDING_RESTORE.add(callback.message.chat.id)
     await safe_answer(callback)
     await callback.message.edit_text(
@@ -2397,10 +2293,12 @@ async def cb_backup_restore(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "restore_cancel")
 async def cb_restore_cancel(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     PENDING_RESTORE.discard(callback.message.chat.id)
     await safe_answer(callback, "Restore dibatalkan")
-    await callback.message.edit_text("🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:", reply_markup=role_keyboard(message))
+    await callback.message.edit_text("🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:", reply_markup=role_keyboard(callback))
 
 
 @dp.message(F.document)
@@ -2467,33 +2365,19 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("backup"))
 async def cmd_backup(message: Message):
-    if not is_allowed_chat(message): return
+    if not require_owner(message): return
     try:
         await message.delete()
     except Exception:
         pass
-    try:
-        path = await asyncio.to_thread(create_database_backup)
-        sent = await bot.send_document(
-            chat_id=message.chat.id,
-            document=FSInputFile(str(path)),
-            caption=(
-                "💾 <b>BACKUP BERHASIL</b>\n"
-                "Simpan file ini untuk migrasi VPS/restore.\n\n"
-                "🗑️ Pesan backup ini akan otomatis dihapus dalam <b>5 menit</b>.\n"
-                "💾 File backup tetap tersimpan di VPS."
-            )
-        )
-        asyncio.create_task(delete_backup_message_later(
-            message.chat.id, sent.message_id, 300
-        ))
-    except Exception as e:
-        await bot.send_message(message.chat.id, f"❌ Backup gagal: <code>{html.escape(str(e))}</code>")
+    await message.answer("💾 Backup sedang dibuat... File hanya disimpan sementara di VPS dan akan dihapus otomatis.")
+    asyncio.create_task(send_temporary_backup(message.chat.id))
 
 
 @dp.message(Command("restore"))
 async def cmd_restore(message: Message):
-    if not is_allowed_chat(message): return
+    if not require_owner(message):
+        return
     PENDING_RESTORE.add(message.chat.id)
     try: await message.delete()
     except Exception: pass
@@ -2506,61 +2390,66 @@ async def cmd_restore(message: Message):
 
 @dp.message(Command("settings", "setting"))
 async def cmd_settings(message: Message):
-    if not is_allowed_chat(message):
+    if not require_owner(message):
         return
-    await message.answer(build_settings_text(), reply_markup=role_keyboard(callback))
+        return
+    await message.answer(build_settings_text(), reply_markup=role_keyboard(message))
 
 
 @dp.message(Command("posisi"))
 async def cmd_posisi(message: Message):
     if not is_allowed_chat(message):
         return
-    await message.answer(build_positions_text(str(callback.message.chat.id)), reply_markup=positions_keyboard(str(callback.message.chat.id)))
+    await message.answer(build_positions_text(str(message.chat.id)), reply_markup=positions_keyboard(str(message.chat.id)))
 
 
 @dp.message(Command("stat"))
 async def cmd_stat(message: Message):
     if not is_allowed_chat(message):
         return
-    await message.answer(build_stats_text(), reply_markup=role_keyboard(callback))
+    await message.answer(build_stats_text(_account_user_id(message.chat.id)), reply_markup=role_keyboard(message))
 
 
 @dp.message(Command("pairperf"))
 async def cmd_pairperf(message: Message):
-    if not is_allowed_chat(message):
+    if not require_owner(message):
         return
-    await message.answer(build_pairperf_text(), reply_markup=role_keyboard(callback))
+        return
+    await message.answer(build_pairperf_text(), reply_markup=role_keyboard(message))
 
 
 @dp.message(Command("pause"))
 async def cmd_pause(message: Message):
     global IS_BOT_PAUSED
-    if not is_allowed_chat(message):
+    if not require_owner(message):
+        return
         return
     IS_BOT_PAUSED = True
-    await message.answer("⏸️ <b>Bot PAUSED</b>", reply_markup=role_keyboard(callback))
+    await message.answer("⏸️ <b>Bot PAUSED</b>", reply_markup=role_keyboard(message))
 
 
 @dp.message(Command("resume"))
 async def cmd_resume(message: Message):
     global IS_BOT_PAUSED
-    if not is_allowed_chat(message):
+    if not require_owner(message):
+        return
         return
     IS_BOT_PAUSED = False
-    await message.answer("▶️ <b>Bot RESUMED</b>", reply_markup=role_keyboard(callback))
+    await message.answer("▶️ <b>Bot RESUMED</b>", reply_markup=role_keyboard(message))
 
 
 @dp.message(Command("cancelall"))
 async def cmd_cancelall(message: Message):
     if not is_allowed_chat(message):
         return
-    cancel_all_pending_orders_on_pause(str(message.chat.id))
-    await message.answer(build_positions_text(str(message.chat.id)), reply_markup=role_keyboard(callback))
+    cancel_all_pending_orders_on_pause(_account_user_id(message.chat.id))
+    await message.answer(build_positions_text(str(message.chat.id)), reply_markup=role_keyboard(message))
 
 
 @dp.message(Command("dryrun"))
 async def cmd_dryrun(message: Message):
-    if not is_allowed_chat(message):
+    if not require_owner(message):
+        return
         return
     parts = (message.text or '').split()
     if len(parts) != 2 or parts[1].lower() not in ('on', 'off'):
@@ -2569,60 +2458,65 @@ async def cmd_dryrun(message: Message):
     value = parts[1].lower() == 'on'
     CONFIG['DRY_RUN'] = value
     update_db_setting('dry_run', 1.0 if value else 0.0)
-    await message.answer("✅ DRY RUN AKTIF" if value else "⚠️ REAL MONEY AKTIF", reply_markup=role_keyboard(callback))
+    await message.answer("✅ DRY RUN AKTIF" if value else "⚠️ REAL MONEY AKTIF", reply_markup=role_keyboard(message))
 
 
 @dp.message(Command("setmargin"))
 async def cmd_setmargin(message: Message):
-    if not is_allowed_chat(message): return
+    if not require_owner(message):
+        return
     try:
         value = float((message.text or '').split()[1])
         CONFIG['MARGIN_PER_TRADE'] = value
         update_db_setting('margin', value)
-        await message.answer(f"✅ Margin: ${value}", reply_markup=role_keyboard(callback))
+        await message.answer(f"✅ Margin: ${value}", reply_markup=role_keyboard(message))
     except Exception:
         await message.answer("⚠️ Format: /setmargin 2")
 
 
 @dp.message(Command("setmaxpos"))
 async def cmd_setmaxpos(message: Message):
-    if not is_allowed_chat(message): return
+    if not require_owner(message):
+        return
     try:
         value = int((message.text or '').split()[1])
         CONFIG['MAX_CONCURRENT_POSITIONS'] = value
         update_db_setting('max_pos', value)
-        await message.answer(f"✅ Max Posisi: {value}", reply_markup=role_keyboard(callback))
+        await message.answer(f"✅ Max Posisi: {value}", reply_markup=role_keyboard(message))
     except Exception:
         await message.answer("⚠️ Format: /setmaxpos 2")
 
 
 @dp.message(Command("setminwr"))
 async def cmd_setminwr(message: Message):
-    if not is_allowed_chat(message): return
+    if not require_owner(message):
+        return
     try:
         value = float((message.text or '').split()[1])
         CONFIG['MIN_WR'] = value
         update_db_setting('min_wr', value)
-        await message.answer(f"✅ Min WinRate: {value}%", reply_markup=role_keyboard(callback))
+        await message.answer(f"✅ Min WinRate: {value}%", reply_markup=role_keyboard(message))
     except Exception:
         await message.answer("⚠️ Format: /setminwr 40")
 
 
 @dp.message(Command("setmintrades"))
 async def cmd_setmintrades(message: Message):
-    if not is_allowed_chat(message): return
+    if not require_owner(message):
+        return
     try:
         value = int((message.text or '').split()[1])
         CONFIG['MIN_TRADES'] = value
         update_db_setting('min_trades', value)
-        await message.answer(f"✅ Min Trade: {value}x", reply_markup=role_keyboard(callback))
+        await message.answer(f"✅ Min Trade: {value}x", reply_markup=role_keyboard(message))
     except Exception:
         await message.answer("⚠️ Format: /setmintrades 5")
 
 
 @dp.message(Command("setlev"))
 async def cmd_setlev(message: Message):
-    if not is_allowed_chat(message): return
+    if not require_owner(message):
+        return
     try:
         parts = (message.text or '').split()
         if len(parts) == 2:
@@ -2630,14 +2524,14 @@ async def cmd_setlev(message: Message):
             for ex_id in DEFAULT_CEX:
                 CONFIG['LEVERAGE'][ex_id] = value
                 update_db_setting(f'lev_{ex_id}', value)
-            await message.answer(f"✅ Semua leverage: {value}x", reply_markup=role_keyboard(callback))
+            await message.answer(f"✅ Semua leverage: {value}x", reply_markup=role_keyboard(message))
         elif len(parts) == 3:
             ex_id, value = parts[1].lower(), int(parts[2])
             if ex_id not in DEFAULT_CEX:
                 raise ValueError("CEX tidak dikenal")
             CONFIG['LEVERAGE'][ex_id] = value
             update_db_setting(f'lev_{ex_id}', value)
-            await message.answer(f"✅ Lev {ex_id.upper()}: {value}x", reply_markup=role_keyboard(callback))
+            await message.answer(f"✅ Lev {ex_id.upper()}: {value}x", reply_markup=role_keyboard(message))
         else:
             raise ValueError
     except Exception:
@@ -2652,7 +2546,7 @@ async def cmd_cex(message: Message):
         action, ex_id = parts[1].lower(), parts[2].lower()
         if ex_id not in DEFAULT_CEX or action not in ('on', 'off'):
             raise ValueError
-        user_id = str(message.chat.id)
+        user_id = _account_user_id(message.chat.id)
         conn = sqlite3.connect(DB_FILE, timeout=5)
         conn.cursor().execute(
             "UPDATE user_cex_settings SET enabled=? WHERE user_id=? AND ex_id=?",
@@ -2660,7 +2554,7 @@ async def cmd_cex(message: Message):
         )
         conn.commit(); conn.close()
         reload_exchanges()
-        await message.answer(f"✅ CEX {ex_id.upper()} di-{action.upper()}!", reply_markup=role_keyboard(callback))
+        await message.answer(f"✅ CEX {ex_id.upper()} di-{action.upper()}!", reply_markup=role_keyboard(message))
     except Exception:
         await message.answer("⚠️ Format: /cex on/off <cex>")
 
@@ -2871,68 +2765,257 @@ async def cb_vip_remove(callback: CallbackQuery):
         "Kirim <b>Telegram ID</b> member yang ingin dinonaktifkan."
     )
 
-@dp.callback_query(F.data == "vip_settings")
-async def cb_vip_settings(callback: CallbackQuery):
+@dp.callback_query(F.data == "vip_set_margin")
+async def cb_vip_set_margin(callback: CallbackQuery):
     if not is_vip(callback):
-        await safe_answer(callback, "Fitur VIP saja.", True)
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "💵 <b>MARGIN / TRADE VIP</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="$1", callback_data="vip_margin:1"),
+             InlineKeyboardButton(text="⭐ $2 DEFAULT", callback_data="vip_margin:2")],
+            [InlineKeyboardButton(text="$5", callback_data="vip_margin:5"),
+             InlineKeyboardButton(text="$10", callback_data="vip_margin:10")],
+            [InlineKeyboardButton(text="✏️ CUSTOM", callback_data="vip_custom_setting:margin")],
+            [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="vip_settings")]
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("vip_margin:"))
+async def cb_vip_margin(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    value=float(callback.data.split(':',1)[1])
+    set_user_setting(_chat_id(callback), 'margin', value)
+    await safe_answer(callback, f"Margin ${value}")
+    await callback.message.edit_text(vip_recommended_settings_text(_chat_id(callback)), reply_markup=vip_settings_keyboard())
+
+@dp.callback_query(F.data == "vip_set_lev")
+async def cb_vip_set_lev(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "⚡ <b>LEVERAGE VIP</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="10x", callback_data="vip_lev:10"),
+             InlineKeyboardButton(text="⭐ 20x DEFAULT", callback_data="vip_lev:20")],
+            [InlineKeyboardButton(text="25x", callback_data="vip_lev:25"),
+             InlineKeyboardButton(text="50x", callback_data="vip_lev:50")],
+            [InlineKeyboardButton(text="✏️ CUSTOM", callback_data="vip_custom_setting:leverage")],
+            [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="vip_settings")]
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("vip_lev:"))
+async def cb_vip_lev(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    value=int(callback.data.split(':',1)[1])
+    set_user_setting(_chat_id(callback), 'leverage', value)
+    await safe_answer(callback, f"Leverage {value}x")
+    await callback.message.edit_text(vip_recommended_settings_text(_chat_id(callback)), reply_markup=vip_settings_keyboard())
+
+@dp.callback_query(F.data == "vip_set_maxpos")
+async def cb_vip_set_maxpos(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "📊 <b>MAX POSISI VIP</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="1", callback_data="vip_maxpos:1"),
+             InlineKeyboardButton(text="2", callback_data="vip_maxpos:2")],
+            [InlineKeyboardButton(text="⭐ 3 DEFAULT", callback_data="vip_maxpos:3"),
+             InlineKeyboardButton(text="5", callback_data="vip_maxpos:5")],
+            [InlineKeyboardButton(text="✏️ CUSTOM", callback_data="vip_custom_setting:max_pos")],
+            [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="vip_settings")]
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("vip_maxpos:"))
+async def cb_vip_maxpos(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    value=int(callback.data.split(':',1)[1])
+    set_user_setting(_chat_id(callback), 'max_pos', value)
+    await safe_answer(callback, f"Max posisi {value}")
+    await callback.message.edit_text(vip_recommended_settings_text(_chat_id(callback)), reply_markup=vip_settings_keyboard())
+
+@dp.callback_query(F.data == "vip_set_maxtrades")
+async def cb_vip_set_maxtrades(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "📅 <b>MAX TRADE / HARI VIP</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="3", callback_data="vip_maxtrades:3"),
+             InlineKeyboardButton(text="5", callback_data="vip_maxtrades:5")],
+            [InlineKeyboardButton(text="⭐ 10 DEFAULT", callback_data="vip_maxtrades:10"),
+             InlineKeyboardButton(text="20", callback_data="vip_maxtrades:20")],
+            [InlineKeyboardButton(text="✏️ CUSTOM", callback_data="vip_custom_setting:max_trades_day")],
+            [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="vip_settings")]
+        ])
+    )
+
+@dp.callback_query(F.data.startswith("vip_maxtrades:"))
+async def cb_vip_maxtrades(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    value=int(callback.data.split(':',1)[1])
+    set_user_setting(_chat_id(callback), 'max_trades_day', value)
+    await safe_answer(callback, f"Max trade/hari {value}")
+    await callback.message.edit_text(vip_recommended_settings_text(_chat_id(callback)), reply_markup=vip_settings_keyboard())
+
+
+@dp.callback_query(F.data == "owner_pair_filter")
+async def cb_owner_pair_filter(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
         return
     await safe_answer(callback)
     await callback.message.edit_text(
-        "💎 <b>RECOMMENDED VIP SETTINGS</b>\n\n"
-        "💵 Margin / Trade: <b>$2</b>\n"
-        "⚡ Leverage: <b>20x</b>\n"
-        "📊 Max Open Positions: <b>3</b>\n"
-        "📅 Max Trades / Day: <b>10</b>\n"
-        "🏦 Exchange: <b>Bitget + BingX</b>\n"
-        "🤖 Auto Trade: <b>ON</b>\n\n"
-        "ℹ️ Margin $2 adalah margin per posisi. Leverage 20x memperbesar "
-        "nilai posisi sekaligus risiko. Max posisi dan max trade membatasi "
-        "jumlah eksekusi.\n\n"
-        "⚠️ <b>WARNING</b>\n"
-        "Auto trading dan leverage memiliki risiko kerugian dan risiko "
-        "likuidasi. Gunakan dana yang siap untuk kehilangan dan pastikan "
-        "API exchange <b>tidak memiliki permission withdrawal</b>.\n\n"
-        "❗ Setting rekomendasi bukan jaminan profit atau win rate.",
-        reply_markup=vip_keyboard()
+        owner_pair_filter_text(),
+        reply_markup=owner_pair_filter_keyboard()
     )
+
+@dp.callback_query(F.data == "owner_pair_toggle")
+async def cb_owner_pair_toggle(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    OWNER_PAIR_FILTER["enabled"] = not OWNER_PAIR_FILTER.get("enabled", True)
+    await safe_answer(callback, "Filter diperbarui.")
+    await callback.message.edit_text(
+        owner_pair_filter_text(),
+        reply_markup=owner_pair_filter_keyboard()
+    )
+
+@dp.callback_query(F.data == "owner_pair_default")
+async def cb_owner_pair_default(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    OWNER_PAIR_FILTER["eligible_pairs"] = list(DEFAULT_OWNER_ELIGIBLE_PAIRS)
+    OWNER_PAIR_FILTER["updated_at"] = datetime.now(WIB).isoformat(timespec="seconds")
+    await safe_answer(callback, "Default pair dipulihkan.")
+    await callback.message.edit_text(
+        owner_pair_filter_text(),
+        reply_markup=owner_pair_filter_keyboard()
+    )
+
+@dp.callback_query(F.data == "owner_pair_set")
+async def cb_owner_pair_set(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    PENDING_VIP_ACTION[str(callback.message.chat.id)] = {"action": "owner_pair_set"}
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "✏️ <b>SET PAIR OWNER</b>\n\n"
+        "Kirim pair crypto, contoh:\n"
+        "<code>BTC/USDT</code>\n\n"
+        "Untuk beberapa pair, pisahkan dengan koma."
+    )
+
+@dp.callback_query(F.data == "owner_pair_remove")
+async def cb_owner_pair_remove(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    PENDING_VIP_ACTION[str(callback.message.chat.id)] = {"action": "owner_pair_remove"}
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "➖ <b>REMOVE PAIR OWNER</b>\n\n"
+        "Kirim pair yang ingin dikeluarkan.\n"
+        "Contoh: <code>DOGE/USDT</code>"
+    )
+
+@dp.callback_query(F.data.startswith("vip_custom_setting:"))
+async def cb_vip_custom_setting(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True)
+        return
+
+    field = callback.data.split(":", 1)[1]
+    labels = {
+        'margin': ('💵 MARGIN', 'USD', '2.5'),
+        'leverage': ('⚡ LEVERAGE', 'x', '20'),
+        'max_pos': ('📊 MAX POSISI', 'posisi', '4'),
+        'max_trades_day': ('📅 MAX TRADE / HARI', 'trade', '15'),
+    }
+    if field not in labels:
+        await safe_answer(callback, "Setting tidak valid.", True)
+        return
+
+    title, unit, example = labels[field]
+    PENDING_VIP_SETTING[str(callback.message.chat.id)] = field
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        f"✏️ <b>CUSTOM {title}</b>\n\n"
+        f"Kirim nilai yang kamu inginkan ({unit}).\n"
+        f"Contoh: <code>{example}</code>\n\n"
+        "⚠️ Nilai ini hanya berlaku untuk akun VIP kamu."
+    )
+
+
+@dp.callback_query(F.data == "vip_reset_settings")
+async def cb_vip_reset_settings(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True)
+        return
+
+    uid = _chat_id(callback)
+    ensure_user_settings(uid)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    try:
+        conn.execute(
+            """UPDATE user_settings
+               SET margin=2.0, max_pos=3, max_trades_day=10, leverage=20, auto_trade=1
+               WHERE user_id=?""",
+            (uid,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    PENDING_VIP_SETTING.pop(str(uid), None)
+    await safe_answer(callback, "Default dikembalikan.")
+    await callback.message.edit_text(
+        vip_recommended_settings_text(uid),
+        reply_markup=vip_settings_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "vip_settings")
+async def cb_vip_settings(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    await safe_answer(callback)
+    uid=_chat_id(callback)
+    await callback.message.edit_text(vip_recommended_settings_text(uid), reply_markup=vip_settings_keyboard())
 
 @dp.callback_query(F.data == "vip_auto_trade")
 async def cb_vip_auto_trade(callback: CallbackQuery):
     if not is_vip(callback):
-        await safe_answer(callback, "Fitur VIP saja.", True)
-        return
-    await safe_answer(callback)
-    await callback.message.edit_text(
-        "🤖 <b>AUTO TRADE VIP</b>\n\n"
-        "Untuk keamanan, sebelum real trade aktif pastikan API sudah "
-        "terpasang dan permission withdrawal dimatikan.\n\n"
-        "Recommended:\n"
-        "💵 $2 margin/trade\n⚡ 20x leverage\n📊 3 posisi\n📅 10 trade/hari\n\n"
-        "⚠️ Real trading memiliki risiko kerugian dan likuidasi.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ SAYA PAHAM & AKTIFKAN", callback_data="vip_auto_confirm")],
-            [InlineKeyboardButton(text="❌ BATAL", callback_data="menu")]
-        ])
-    )
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    uid=_chat_id(callback)
+    cfg=get_user_settings(uid)
+    new_value=0 if cfg['auto_trade'] else 1
+    set_user_setting(uid, 'auto_trade', new_value)
+    await safe_answer(callback, "Auto Trade ON" if new_value else "Auto Trade OFF")
+    await callback.message.edit_text(vip_recommended_settings_text(uid), reply_markup=vip_settings_keyboard())
 
 @dp.callback_query(F.data == "vip_auto_confirm")
 async def cb_vip_auto_confirm(callback: CallbackQuery):
     if not is_vip(callback):
-        await safe_answer(callback, "Fitur VIP saja.", True)
-        return
-    await safe_answer(callback, "Konfirmasi diterima.")
-    # Do not toggle the global owner dry-run engine here. This callback is
-    # intentionally only a VIP authorization acknowledgement until the
-    # per-user execution layer is enabled.
-    await callback.message.edit_text(
-        "⚠️ <b>VIP BELUM AKTIF UNTUK REAL TRADE</b>\n\n"
-        "Konfirmasi tersimpan secara UI, tetapi engine trading saat ini "
-        "masih menggunakan execution/account layer global Owner.\n\n"
-        "Jangan gunakan tombol ini sebagai indikasi bahwa akun VIP sudah "
-        "terisolasi dari akun lain.",
-        reply_markup=vip_keyboard()
-    )
-
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    uid=_chat_id(callback)
+    set_user_setting(uid, 'auto_trade', 1)
+    await safe_answer(callback, "Auto Trade ON")
+    await callback.message.edit_text(vip_recommended_settings_text(uid), reply_markup=vip_settings_keyboard())
 
 @dp.callback_query(F.data.startswith("vip_duration:"))
 async def cb_vip_duration(callback: CallbackQuery):
@@ -2965,6 +3048,7 @@ async def cb_vip_duration(callback: CallbackQuery):
     finally:
         conn.close()
 
+    ensure_user_settings(telegram_id)
     PENDING_VIP_ACTION.pop(str(callback.message.chat.id), None)
     await safe_answer(callback, "VIP berhasil diaktifkan.")
     await callback.message.edit_text(
@@ -3001,6 +3085,79 @@ async def handle_text(message: Message):
         return
 
     chat_id = str(message.chat.id)
+
+    vip_action = PENDING_VIP_ACTION.get(chat_id)
+
+    if is_owner(message) and vip_action and vip_action.get("action") in ("owner_pair_set", "owner_pair_remove"):
+        raw = (message.text or "").strip().upper()
+        pairs = [x.strip().replace("-", "/") for x in raw.split(",") if x.strip()]
+        valid = [x for x in pairs if "/" in x and x.endswith("/USDT") and len(x) >= 7]
+
+        if not valid:
+            await message.answer("❌ Format pair tidak valid. Gunakan contoh <code>BTC/USDT</code>.")
+            return
+
+        current = set(get_owner_eligible_pairs())
+        if vip_action["action"] == "owner_pair_set":
+            current.update(valid)
+            action_text = "ditambahkan"
+        else:
+            current.difference_update(valid)
+            action_text = "dihapus"
+
+        OWNER_PAIR_FILTER["eligible_pairs"] = sorted(current)
+        OWNER_PAIR_FILTER["updated_at"] = datetime.now(WIB).isoformat(timespec="seconds")
+        PENDING_VIP_ACTION.pop(chat_id, None)
+
+        await message.answer(
+            f"✅ Pair berhasil {action_text}.\n\n" + owner_pair_filter_text(),
+            reply_markup=owner_pair_filter_keyboard()
+        )
+        return
+
+    custom_field = PENDING_VIP_SETTING.get(chat_id)
+    if custom_field and is_vip(message):
+        text = (message.text or '').strip().replace(',', '.')
+        try:
+            if custom_field == 'margin':
+                value = float(text)
+                if not (0.1 <= value <= 1000):
+                    raise ValueError("Margin harus antara $0.10 sampai $1000.")
+            elif custom_field == 'leverage':
+                if not text.isdigit():
+                    raise ValueError("Leverage harus 1-125x.")
+                value = int(text)
+                if not (1 <= value <= 125):
+                    raise ValueError("Leverage harus 1x sampai 125x.")
+            elif custom_field == 'max_pos':
+                if not text.isdigit():
+                    raise ValueError("Max posisi harus berupa angka.")
+                value = int(text)
+                if not (1 <= value <= 20):
+                    raise ValueError("Max posisi harus 1-20.")
+            elif custom_field == 'max_trades_day':
+                if not text.isdigit():
+                    raise ValueError("Max trade/hari harus berupa angka.")
+                value = int(text)
+                if not (1 <= value <= 100):
+                    raise ValueError("Max trade/hari harus 1-100.")
+            else:
+                raise ValueError("Setting VIP tidak valid.")
+
+            set_user_setting(chat_id, custom_field, value)
+            PENDING_VIP_SETTING.pop(chat_id, None)
+            await message.answer(
+                "✅ <b>SETTING VIP DIPERBARUI</b>\n\n"
+                + vip_recommended_settings_text(chat_id),
+                reply_markup=vip_settings_keyboard()
+            )
+        except Exception as e:
+            await message.answer(
+                f"❌ {html.escape(str(e))}\n\n"
+                "Kirim nilai yang valid atau tekan tombol kembali."
+            )
+        return
+
     vip_action = PENDING_VIP_ACTION.get(chat_id)
 
     if vip_action and is_owner(message):
@@ -3095,6 +3252,7 @@ async def handle_text(message: Message):
                     conn.commit()
                 finally:
                     conn.close()
+                ensure_user_settings(text)
                 PENDING_VIP_ACTION.pop(chat_id, None)
                 await message.answer(
                     f"✅ VIP diperpanjang.\n\nID: <code>{tid}</code>\n"
@@ -3312,7 +3470,9 @@ async def cb_positions(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "settings")
 async def cb_settings(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     await callback.message.edit_text(build_settings_text(str(callback.message.chat.id)), reply_markup=settings_keyboard())
 
@@ -3321,12 +3481,14 @@ async def cb_settings(callback: CallbackQuery):
 async def cb_stats(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
-    await callback.message.edit_text(build_stats_text(), reply_markup=role_keyboard(callback))
+    await callback.message.edit_text(build_stats_text(_account_user_id(callback.message.chat.id)), reply_markup=role_keyboard(callback))
 
 
 @dp.callback_query(F.data == "pairperf")
 async def cb_pairperf(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     await callback.message.edit_text(build_pairperf_text(), reply_markup=role_keyboard(callback))
 
@@ -3348,7 +3510,9 @@ async def cb_api_status(callback: CallbackQuery):
 @dp.callback_query(F.data == "pause")
 async def cb_pause(callback: CallbackQuery):
     global IS_BOT_PAUSED
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     IS_BOT_PAUSED = True
     notify_runtime_status("PAUSED", "⏸️ <b>TRADING PAUSED</b>\nPembukaan trade baru dihentikan. Monitoring posisi tetap berjalan.")
     await safe_answer(callback, "Bot di-pause")
@@ -3358,7 +3522,9 @@ async def cb_pause(callback: CallbackQuery):
 @dp.callback_query(F.data == "resume")
 async def cb_resume(callback: CallbackQuery):
     global IS_BOT_PAUSED
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     IS_BOT_PAUSED = False
     notify_runtime_status("RESUMED", "▶️ <b>TRADING RESUMED</b>\nBot kembali boleh mencari setup baru.")
     await safe_answer(callback, "Bot dilanjutkan")
@@ -3375,7 +3541,9 @@ async def cb_runtime_status(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "bot_control")
 async def cb_bot_control(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     await callback.message.edit_text(
         "🤖 <b>BOT CONTROL</b>\n\n"
@@ -3388,7 +3556,9 @@ async def cb_bot_control(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "dryrun_toggle")
 async def cb_dryrun_toggle(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     value = not CONFIG['DRY_RUN']
     CONFIG['DRY_RUN'] = value
     update_db_setting('dry_run', 1.0 if value else 0.0)
@@ -3404,7 +3574,8 @@ async def cb_dryrun_toggle(callback: CallbackQuery):
 @dp.callback_query(F.data == "daily_loss_toggle")
 async def cb_daily_loss_toggle(callback: CallbackQuery):
     global IS_BOT_PAUSED
-    if not is_allowed_chat(callback):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
         return
 
     value = not CONFIG.get('DAILY_LOSS_LIMIT', True)
@@ -3439,9 +3610,21 @@ async def cb_daily_loss_toggle(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "cancelall")
 async def cb_cancelall(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
-    cancel_all_pending_orders_on_pause()
-    await safe_answer(callback, "Pending order diproses")
+    if not is_allowed_chat(callback):
+        return
+
+    # OWNER may cancel all accounts.
+    # VIP may cancel ONLY its own pending orders.
+    requester_id = "OWNER" if is_owner(callback) else str(callback.message.chat.id)
+    cancel_all_pending_orders_on_pause(requester_id)
+
+    await safe_answer(
+        callback,
+        "Pending order akun kamu diproses."
+        if requester_id != "OWNER"
+        else "Semua pending order diproses."
+    )
+
     await callback.message.edit_text(
         build_positions_text(str(callback.message.chat.id)),
         reply_markup=positions_keyboard(str(callback.message.chat.id))
@@ -3518,7 +3701,9 @@ async def cb_close_all_open(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "set_margin_menu")
 async def cb_set_margin_menu(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     await callback.message.edit_text("💵 <b>PILIH MARGIN / TRADE</b>", reply_markup=preset_keyboard("", [(1,'$1'),(2,'$2'),(5,'$5'),(10,'$10')], 'set_margin'))
 
@@ -3535,7 +3720,9 @@ async def cb_set_margin(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "set_maxpos_menu")
 async def cb_set_maxpos_menu(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     await callback.message.edit_text("📊 <b>PILIH MAX POSISI</b>", reply_markup=preset_keyboard("", [(1,'1'),(2,'2'),(3,'3'),(5,'5')], 'set_maxpos'))
 
@@ -3552,7 +3739,9 @@ async def cb_set_maxpos(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "set_minwr_menu")
 async def cb_set_minwr_menu(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     await callback.message.edit_text("🎯 <b>PILIH MINIMUM WIN RATE</b>", reply_markup=preset_keyboard("", [(30,'30%'),(40,'40%'),(50,'50%'),(60,'60%'),(70,'70%')], 'set_minwr'))
 
@@ -3569,7 +3758,9 @@ async def cb_set_minwr(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "set_mintrades_menu")
 async def cb_set_mintrades_menu(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     await callback.message.edit_text("📈 <b>PILIH MINIMUM TRADE</b>", reply_markup=preset_keyboard("", [(3,'3'),(5,'5'),(10,'10'),(20,'20')], 'set_mintrades'))
 
@@ -3586,14 +3777,18 @@ async def cb_set_mintrades(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "set_lev_menu")
 async def cb_set_lev_menu(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     await callback.message.edit_text("⚡ <b>PILIH CEX UNTUK LEVERAGE</b>", reply_markup=leverage_keyboard())
 
 
 @dp.callback_query(F.data == "lev_all")
 async def cb_lev_all(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
     await safe_answer(callback)
     await callback.message.edit_text("⚡ <b>LEVERAGE SEMUA CEX</b>", reply_markup=leverage_value_keyboard('all'))
 
