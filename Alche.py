@@ -202,6 +202,35 @@ def update_db_setting(key, value):
 # =================================================================
 # HELPERS
 # =================================================================
+def telegram_api(method, payload=None, timeout=10):
+    """Call Telegram Bot API and ALWAYS return a dict instead of raising."""
+    payload = payload or {}
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        r = requests.post(url, json=payload, timeout=timeout)
+        try:
+            data = r.json()
+        except Exception:
+            data = {
+                "ok": False,
+                "description": f"HTTP {r.status_code}: {r.text[:500]}"
+            }
+
+        if not data.get("ok"):
+            print(
+                f"[TELEGRAM API ERROR] {method}: "
+                f"{data.get('description', 'unknown error')}",
+                flush=True
+            )
+        return data
+    except requests.RequestException as e:
+        print(f"[TELEGRAM NETWORK ERROR] {method}: {e}", flush=True)
+        return {"ok": False, "description": str(e)}
+    except Exception as e:
+        print(f"[TELEGRAM ERROR] {method}: {e}", flush=True)
+        return {"ok": False, "description": str(e)}
+
+
 def send_telegram(message):
     """Send Telegram message. If HTML fails, retry as plain text."""
     payload = {
