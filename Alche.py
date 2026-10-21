@@ -2657,7 +2657,7 @@ async def cb_vip_add(callback: CallbackQuery):
     if not require_owner(callback):
         await safe_answer(callback, "Akses Owner saja.", True)
         return
-    PENDING_VIP_ACTION[callback.message.chat.id] = {'action': 'add'}
+    PENDING_VIP_ACTION[str(callback.message.chat.id)] = {'action': 'add'}
     await safe_answer(callback)
     await callback.message.edit_text(
         "➕ <b>ADD VIP MEMBER</b>\n\n"
@@ -2694,7 +2694,7 @@ async def cb_vip_extend(callback: CallbackQuery):
     if not require_owner(callback):
         await safe_answer(callback, "Akses Owner saja.", True)
         return
-    PENDING_VIP_ACTION[callback.message.chat.id] = {'action': 'extend'}
+    PENDING_VIP_ACTION[str(callback.message.chat.id)] = {'action': 'extend'}
     await safe_answer(callback)
     await callback.message.edit_text(
         "⏳ <b>EXTEND VIP</b>\n\n"
@@ -2708,7 +2708,7 @@ async def cb_vip_remove(callback: CallbackQuery):
     if not require_owner(callback):
         await safe_answer(callback, "Akses Owner saja.", True)
         return
-    PENDING_VIP_ACTION[callback.message.chat.id] = {'action': 'remove'}
+    PENDING_VIP_ACTION[str(callback.message.chat.id)] = {'action': 'remove'}
     await safe_answer(callback)
     await callback.message.edit_text(
         "🚫 <b>REMOVE VIP</b>\n\n"
