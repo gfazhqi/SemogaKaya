@@ -868,21 +868,17 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
             EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
             return 0
 
-        # One lightweight closed-candle probe per exchange. If the M15 candle
-        # has not changed, there is no reason to recalculate every pair.
-        probe = symbols[0]
-        probe_bars = ex.fetch_ohlcv(probe, '15m', limit=3)
-        if not probe_bars or len(probe_bars) < 2:
-            EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
-            return 0
-
-        closed_candle_ts = probe_bars[-2][0]
-        if EXCHANGE_LAST_CANDLE.get(ex_id) == closed_candle_ts:
+        # Do NOT gate an entire CEX on one probe symbol. A single bad/stale
+        # BingX market can otherwise make the whole exchange look dead while
+        # every other market is healthy. M15 candles are time-aligned, so use
+        # the wall-clock 15m bucket as the exchange scan gate instead.
+        closed_bucket = int(time.time() // 900) - 1
+        if EXCHANGE_LAST_CANDLE.get(ex_id) == closed_bucket:
             runtime['last_reason'] = 'Menunggu candle M15 baru'
             EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
             return 0
 
-        EXCHANGE_LAST_CANDLE[ex_id] = closed_candle_ts
+        EXCHANGE_LAST_CANDLE[ex_id] = closed_bucket
 
         # MAX positions is applied per active CEX. This prevents the first CEX
         # in the dictionary (usually BingX) from consuming the global quota and
