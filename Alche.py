@@ -26,7 +26,6 @@ from flask import Flask, render_template, jsonify
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 SL_BUFFER_PERCENT = 0.0005
-MAX_DAILY_SL = 2
 DB_FILE = "trades.db"
 LOCK_FILE = "alchemist_v2.lock"
 WIB = timezone(timedelta(hours=7))
@@ -49,7 +48,8 @@ CONFIG = {
     'LEVERAGE': {ex: 50 for ex in DEFAULT_CEX.keys()},
     'DRY_RUN': True,
     'MIN_TRADES': 5,
-    'MIN_WR': 40.0
+    'MIN_WR': 40.0,
+    'MAX_DAILY_SL': 2 # Default 2x SL per hari (0 = OFF)
 }
 
 IS_BOT_PAUSED = False
@@ -64,7 +64,6 @@ last_runtime_status = None
 def init_db():
     conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
-    # FIX 2: Aktifkan WAL mode agar SQLite kebal Multi-Threading
     c.execute("PRAGMA journal_mode=WAL;")
     
     c.execute('''CREATE TABLE IF NOT EXISTS trades (
@@ -94,6 +93,8 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('dry_run', 1.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_trades', 5.0)")
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('min_wr', 40.0)")
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('max_daily_sl', 2.0)")
+    
     for ex in DEFAULT_CEX.keys():
         c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, 50.0)", (f'lev_{ex}',))
         c.execute("INSERT OR IGNORE INTO cex_settings (ex_id, api_key, secret, password, enabled, account_label, account_info) VALUES (?, '', '', '', 0, '', '')", (ex,))
@@ -109,6 +110,7 @@ def load_settings():
         elif row[0] == 'dry_run': CONFIG['DRY_RUN'] = bool(row[1])
         elif row[0] == 'min_trades': CONFIG['MIN_TRADES'] = int(row[1])
         elif row[0] == 'min_wr': CONFIG['MIN_WR'] = float(row[1])
+        elif row[0] == 'max_daily_sl': CONFIG['MAX_DAILY_SL'] = int(row[1])
         elif row[0].startswith('lev_'): CONFIG['LEVERAGE'][row[0].split('_', 1)[1]] = int(row[1])
     conn.close()
 
@@ -120,7 +122,6 @@ def reload_exchanges():
     ).fetchall()
     conn.close()
     
-    # FIX 3: Atomic Reassignment cegah bot Crash saat ngabsen harga
     new_exchanges = {}
     for ex_id, api, sec, password, en in rows:
         if en == 1:
@@ -209,6 +210,9 @@ def cancel_all_pending_orders_on_pause():
 
 def check_and_update_daily_sl():
     global daily_sl_count, IS_BOT_PAUSED
+    limit = CONFIG.get('MAX_DAILY_SL', 2)
+    if limit <= 0: return # Fitur Daily SL dimatikan (OFF)
+
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         daily_sl_count = conn.cursor().execute(
@@ -217,18 +221,19 @@ def check_and_update_daily_sl():
             "AND status LIKE '%SL%'"
         ).fetchone()[0]
         conn.close()
-        if daily_sl_count >= MAX_DAILY_SL and not IS_BOT_PAUSED:
+        
+        if daily_sl_count >= limit and not IS_BOT_PAUSED:
             IS_BOT_PAUSED = True
             cancel_all_pending_orders_on_pause()
             send_telegram(
-                f"🛑 <b>DAILY LOSS LIMIT</b>\n"
-                f"Kena {daily_sl_count}x SL. Bot PAUSE!"
+                f"🛑 <b>DAILY LOSS LIMIT TERCAPAI</b>\n"
+                f"Kena {daily_sl_count}x SL (Batas: {limit}x).\nBot otomatis di-PAUSE!"
             )
     except Exception:
         pass
 
 # =================================================================
-# SMC STRATEGY & LIFECYCLE (Logic Asli 100% Tidak Diubah)
+# SMC STRATEGY & LIFECYCLE
 # =================================================================
 def analyze_smc_retrace(df_m15, df_h1, daily_open):
     ema50 = df_h1['close'].ewm(span=50, adjust=False).mean().iloc[-2]
@@ -460,7 +465,7 @@ def settings_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💵 MARGIN", callback_data="set_margin_menu"), InlineKeyboardButton(text="📊 MAX POS", callback_data="set_maxpos_menu")],
         [InlineKeyboardButton(text="🎯 MIN WR", callback_data="set_minwr_menu"), InlineKeyboardButton(text="📈 MIN TRADES", callback_data="set_mintrades_menu")],
-        [InlineKeyboardButton(text="⚡ LEVERAGE", callback_data="set_lev_menu")],
+        [InlineKeyboardButton(text="🛑 DAILY SL", callback_data="set_dailysl_menu"), InlineKeyboardButton(text="⚡ LEVERAGE", callback_data="set_lev_menu")],
         [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
     ])
 
@@ -538,6 +543,9 @@ def db_read(query, params=()):
 def build_settings_text():
     cex_db = db_read("SELECT ex_id, api_key, enabled, account_label, account_info FROM cex_settings")
     mode_text = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL MONEY"
+    limit_sl = CONFIG.get('MAX_DAILY_SL', 2)
+    daily_sl_str = f"{limit_sl}x SL" if limit_sl > 0 else "OFF (Anti-Pause)"
+    
     lines = []
     for ex_id, api, en, account_label, account_info in cex_db:
         loaded = ex_id in exchanges
@@ -555,7 +563,8 @@ def build_settings_text():
         f"Margin: ${CONFIG['MARGIN_PER_TRADE']}\n"
         f"Max Pos: {CONFIG['MAX_CONCURRENT_POSITIONS']}\n"
         f"Min Trade: {CONFIG['MIN_TRADES']}\n"
-        f"Min WR: {CONFIG['MIN_WR']}%\n\n"
+        f"Min WR: {CONFIG['MIN_WR']}%\n"
+        f"Daily Limit: {daily_sl_str}\n\n"
         f"<b>BURSA:</b>\n{chr(10).join(lines) if lines else 'Belum ada'}"
     )
 
@@ -860,7 +869,6 @@ async def cmd_resume(message: Message):
 @dp.message(Command("cancelall"))
 async def cmd_cancelall(message: Message):
     if not is_allowed_chat(message): return
-    # FIX 1: Lempar proses berat ke Thread agar Aiogram gak Freeze
     await asyncio.to_thread(cancel_all_pending_orders_on_pause)
     await message.answer("🧹 Semua pending order diproses untuk dibatalkan.", reply_markup=main_keyboard())
 
@@ -914,6 +922,17 @@ async def cmd_setmintrades(message: Message):
         update_db_setting('min_trades', value)
         await message.answer(f"✅ Min Trade: {value}x", reply_markup=main_keyboard())
     except Exception: await message.answer("⚠️ Format: /setmintrades 5")
+
+@dp.message(Command("setdailysl"))
+async def cmd_setdailysl(message: Message):
+    if not is_allowed_chat(message): return
+    try:
+        value = int((message.text or '').split()[1])
+        CONFIG['MAX_DAILY_SL'] = value
+        update_db_setting('max_daily_sl', value)
+        txt = f"{value}x SL" if value > 0 else "OFF (Anti-Pause)"
+        await message.answer(f"✅ Daily SL Limit disetel ke: {txt}", reply_markup=main_keyboard())
+    except Exception: await message.answer("⚠️ Format: /setdailysl 2 (Ketik 0 untuk mematikan limit)")
 
 @dp.message(Command("setlev"))
 async def cmd_setlev(message: Message):
@@ -1215,7 +1234,6 @@ async def cb_dryrun_toggle(callback: CallbackQuery):
 @dp.callback_query(F.data == "cancelall")
 async def cb_cancelall(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
-    # FIX 1: Lempar proses ke Thread biar gak freeze
     await asyncio.to_thread(cancel_all_pending_orders_on_pause)
     await safe_answer(callback, "Pending order diproses")
     await callback.message.edit_text(
@@ -1282,6 +1300,25 @@ async def cb_set_mintrades(callback: CallbackQuery):
     update_db_setting('min_trades', value)
     await safe_answer(callback, f"Min trades {value}")
     await callback.message.edit_text(f"✅ <b>Min Trades:</b> {value}", reply_markup=settings_keyboard())
+
+@dp.callback_query(F.data == "set_dailysl_menu")
+async def cb_set_dailysl_menu(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "🛑 <b>PILIH DAILY SL LIMIT</b>\n\n(Pilih OFF untuk mematikan fitur auto-pause)", 
+        reply_markup=preset_keyboard("", [(0,'OFF'),(1,'1x SL'),(2,'2x SL'),(3,'3x SL'),(5,'5x SL')], 'set_dailysl')
+    )
+
+@dp.callback_query(F.data.startswith("set_dailysl:"))
+async def cb_set_dailysl(callback: CallbackQuery):
+    if not is_allowed_chat(callback): return
+    value = int(callback.data.split(':')[1])
+    CONFIG['MAX_DAILY_SL'] = value
+    update_db_setting('max_daily_sl', value)
+    txt = f"{value}x SL" if value > 0 else "OFF"
+    await safe_answer(callback, f"Daily SL {txt}")
+    await callback.message.edit_text(f"✅ <b>Daily SL Limit:</b> {txt}", reply_markup=settings_keyboard())
 
 @dp.callback_query(F.data == "set_lev_menu")
 async def cb_set_lev_menu(callback: CallbackQuery):
