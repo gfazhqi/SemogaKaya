@@ -52,6 +52,7 @@ CONFIG = {
 
 IS_BOT_PAUSED = False
 daily_sl_count = 0
+DAILY_LOSS_ENABLED = True
 last_error_time = 0
 ERROR_COOLDOWN = 300
 last_runtime_status = None
@@ -187,6 +188,16 @@ def update_db_setting(key, value):
 # =================================================================
 # HELPERS
 # =================================================================
+
+def get_db_setting(key, default=1.0):
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        row = conn.cursor().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        conn.close()
+        return float(row[0]) if row else default
+    except Exception:
+        return default
+
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -260,6 +271,8 @@ def cancel_all_pending_orders_on_pause():
 
 def check_and_update_daily_sl():
     global daily_sl_count, IS_BOT_PAUSED
+    if not DAILY_LOSS_ENABLED:
+        return
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         daily_sl_count = conn.cursor().execute(
@@ -544,9 +557,11 @@ def main_keyboard():
 
 def bot_control_keyboard():
     dry = "🧪 DRY RUN 🟢" if CONFIG['DRY_RUN'] else "🧪 DRY RUN 🔴"
+    daily = "🛑 DAILY LOSS 🟢" if DAILY_LOSS_ENABLED else "🛑 DAILY LOSS 🔴"
     pause = "▶️ RESUME" if IS_BOT_PAUSED else "⏸ PAUSE"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=dry, callback_data="dryrun_toggle")],
+        [InlineKeyboardButton(text=daily, callback_data="daily_loss_toggle")],
         [InlineKeyboardButton(text=pause, callback_data="resume" if IS_BOT_PAUSED else "pause")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
@@ -1570,6 +1585,21 @@ async def cb_dryrun_toggle(callback: CallbackQuery):
     send_telegram("🧪 <b>MODE BERUBAH</b> — " + ("DRY RUN aktif. Tidak ada order real." if value else "⚠️ REAL MONEY aktif. Order real diizinkan."))
 
 
+@dp.callback_query(F.data == "daily_loss_toggle")
+async def cb_daily_loss_toggle(callback: CallbackQuery):
+    global DAILY_LOSS_ENABLED
+    if not is_allowed_chat(callback):
+        return
+    DAILY_LOSS_ENABLED = not DAILY_LOSS_ENABLED
+    update_db_setting('daily_loss_enabled', 1.0 if DAILY_LOSS_ENABLED else 0.0)
+    await safe_answer(callback, "DAILY LOSS ON" if DAILY_LOSS_ENABLED else "DAILY LOSS OFF")
+    await callback.message.edit_text(
+        f"🛑 <b>DAILY LOSS LIMIT {'AKTIF' if DAILY_LOSS_ENABLED else 'NONAKTIF'}</b>\n\n"
+        + (f"Batas: {MAX_DAILY_SL}x SL per hari.\nJika tercapai, pembukaan trade baru dipause." if DAILY_LOSS_ENABLED else "Proteksi daily loss dimatikan. Bot tidak akan auto-pause setelah batas SL harian tercapai."),
+        reply_markup=bot_control_keyboard()
+    )
+
+
 @dp.callback_query(F.data == "cancelall")
 async def cb_cancelall(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
@@ -1770,7 +1800,8 @@ def notify_runtime_status(new_status, text):
 
 
 def main_loop():
-    global daily_sl_count, IS_BOT_PAUSED
+    global daily_sl_count, IS_BOT_PAUSED, DAILY_LOSS_ENABLED
+    DAILY_LOSS_ENABLED = bool(get_db_setting('daily_loss_enabled', 1.0))
 
     last_hb = time.time()
     send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>\n🟢 Trading engine siap. Menunggu kondisi scan.")
