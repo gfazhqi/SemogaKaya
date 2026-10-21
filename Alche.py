@@ -9,6 +9,7 @@ import ccxt
 import asyncio
 import html
 import json
+import fcntl
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -27,6 +28,7 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 SL_BUFFER_PERCENT = 0.0005
 MAX_DAILY_SL = 2
 DB_FILE = "trades.db"
+LOCK_FILE = "alchemist_v2.lock"
 WIB = timezone(timedelta(hours=7))
 
 MANUAL_ALERT_PAIRS = ['XAU/USDT', 'EUR/USDT', 'GBP/USDT', 'USOIL/USDT', 'WTI/USDT', 'USO/USDT']
@@ -52,7 +54,6 @@ CONFIG = {
 
 IS_BOT_PAUSED = False
 daily_sl_count = 0
-DAILY_LOSS_ENABLED = True
 last_error_time = 0
 ERROR_COOLDOWN = 300
 last_runtime_status = None
@@ -188,16 +189,6 @@ def update_db_setting(key, value):
 # =================================================================
 # HELPERS
 # =================================================================
-
-def get_db_setting(key, default=1.0):
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        row = conn.cursor().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        conn.close()
-        return float(row[0]) if row else default
-    except Exception:
-        return default
-
 def send_telegram(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -271,8 +262,6 @@ def cancel_all_pending_orders_on_pause():
 
 def check_and_update_daily_sl():
     global daily_sl_count, IS_BOT_PAUSED
-    if not DAILY_LOSS_ENABLED:
-        return
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         daily_sl_count = conn.cursor().execute(
@@ -319,6 +308,51 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
     return sig, en, sl, tp
 
 
+def _fetch_last_closed_m15(ex_instance, symbol):
+    """Return the latest CLOSED M15 candle; avoids low-TF/ticker noise."""
+    try:
+        bars = ex_instance.fetch_ohlcv(symbol, '15m', limit=3)
+        if not bars or len(bars) < 2:
+            return None
+        return bars[-2]
+    except Exception:
+        return None
+
+
+def _pending_price_state(ex_instance, symbol, side, entry, sl, tp):
+    """Validate a pending setup using the latest closed M15 candle.
+
+    Entry has priority if the same closed candle contains Entry and TP/SL.
+    TP-first/SL-first is only declared when Entry was not touched.
+    """
+    candle = _fetch_last_closed_m15(ex_instance, symbol)
+    if candle is None:
+        return 'PENDING'
+
+    high = float(candle[2])
+    low = float(candle[3])
+    entry = float(entry)
+    sl = float(sl)
+    tp = float(tp)
+
+    if side == 'BUY':
+        entry_hit = low <= entry
+        tp_crossed = high >= tp
+        sl_crossed = low <= sl
+    else:
+        entry_hit = high >= entry
+        tp_crossed = low <= tp
+        sl_crossed = high >= sl
+
+    if entry_hit:
+        return 'OPEN'
+    if tp_crossed:
+        return 'MISSED (TP First)'
+    if sl_crossed:
+        return 'CANCELLED (SL First)'
+    return 'PENDING'
+
+
 def update_orders_and_positions():
     conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
@@ -334,52 +368,48 @@ def update_orders_and_positions():
             continue
 
         try:
-            curr_price = exchanges[ex_id].fetch_ticker(sym)['last']
-            n_bars, is_sim = bars + 1, str(ord_id).startswith('sim_')
+            ex = exchanges[ex_id]
+            n_bars = bars + 1
+            is_sim = str(ord_id).startswith('sim_')
             tag = " (DRY RUN)" if is_sim else ""
 
             if status == 'PENDING':
-                n_stat = 'PENDING'
+                n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
 
-                if (side == 'BUY' and curr_price <= en) or (side == 'SELL' and curr_price >= en):
-                    n_stat = 'OPEN'
-                    send_telegram(f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!")
-
-                elif side == 'BUY':
-                    if curr_price >= tp:
-                        n_stat = 'MISSED (TP First)'
-                    elif curr_price <= sl:
-                        n_stat = 'CANCELLED (SL First)'
-                    elif n_bars > 30:
-                        n_stat = 'INVALID (>30 Bars)'
-
-                elif side == 'SELL':
-                    if curr_price <= tp:
-                        n_stat = 'MISSED (TP First)'
-                    elif curr_price >= sl:
-                        n_stat = 'CANCELLED (SL First)'
-                    elif n_bars > 30:
-                        n_stat = 'INVALID (>30 Bars)'
-
-                if n_stat != 'PENDING':
-                    if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
+                if n_stat == 'OPEN':
+                    # FILL PATH: OPEN is never an auto-cancel state.
+                    c.execute(
+                        "UPDATE trades SET status='OPEN', bars_count=? WHERE id=?",
+                        (n_bars, t_id)
+                    )
+                    send_telegram(
+                        f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!"
+                    )
+                elif n_stat in ('MISSED (TP First)', 'CANCELLED (SL First)'):
+                    # Only these two states are valid pending-order cancellations.
+                    if not is_sim:
                         try:
-                            exchanges[ex_id].cancel_order(ord_id, sym)
+                            ex.cancel_order(ord_id, sym)
                         except Exception:
                             pass
-
-                    send_telegram(f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\nAlasan: {n_stat}")
                     c.execute(
                         "UPDATE trades SET status=?, bars_count=? WHERE id=?",
                         (n_stat, n_bars, t_id)
                     )
+                    send_telegram(
+                        f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\n"
+                        f"Alasan: {n_stat}"
+                    )
                 else:
+                    # Defensive fallback: never turn an unexpected state such as
+                    # OPEN into AUTO-CANCEL. Keep it pending until next cycle.
                     c.execute(
                         "UPDATE trades SET bars_count=? WHERE id=?",
                         (n_bars, t_id)
                     )
 
             elif status == 'OPEN':
+                curr_price = ex.fetch_ticker(sym)['last']
                 if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
                     c.execute(
                         "UPDATE trades SET status='CLOSED (TP)' WHERE id=?",
@@ -457,6 +487,19 @@ def scan_markets():
                         if wr < CONFIG['MIN_WR']:
                             continue
 
+                # Never create another active setup for the same CEX/symbol/side.
+                # This prevents duplicate queue entries while an order is pending/open.
+                active_same = c.execute(
+                    "SELECT 1 FROM trades WHERE exchange_id=? AND symbol=? AND side=? "
+                    "AND status IN ('PENDING','OPEN') LIMIT 1",
+                    (ex_id, sym, 'BUY')
+                ).fetchone()
+                active_same_sell = c.execute(
+                    "SELECT 1 FROM trades WHERE exchange_id=? AND symbol=? AND side=? "
+                    "AND status IN ('PENDING','OPEN') LIMIT 1",
+                    (ex_id, sym, 'SELL')
+                ).fetchone()
+
                 m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
                 h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
                 d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
@@ -471,6 +514,9 @@ def scan_markets():
                 )
 
                 if sig:
+                    if (sig == 'BUY' and active_same) or (sig == 'SELL' and active_same_sell):
+                        continue
+
                     lev = CONFIG['LEVERAGE'].get(ex_id, 50)
                     qty = (CONFIG['MARGIN_PER_TRADE'] * lev) / en
                     mode = "[DRY RUN]" if CONFIG['DRY_RUN'] else "[REAL TRADE]"
@@ -557,11 +603,9 @@ def main_keyboard():
 
 def bot_control_keyboard():
     dry = "🧪 DRY RUN 🟢" if CONFIG['DRY_RUN'] else "🧪 DRY RUN 🔴"
-    daily = "🛑 DAILY LOSS 🟢" if DAILY_LOSS_ENABLED else "🛑 DAILY LOSS 🔴"
     pause = "▶️ RESUME" if IS_BOT_PAUSED else "⏸ PAUSE"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=dry, callback_data="dryrun_toggle")],
-        [InlineKeyboardButton(text=daily, callback_data="daily_loss_toggle")],
         [InlineKeyboardButton(text=pause, callback_data="resume" if IS_BOT_PAUSED else "pause")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
@@ -944,57 +988,35 @@ def build_api_status_text():
 
 
 def validate_cex_api(ex_id, api, secret, password=''):
-    """Validate credentials without placing an order.
-
-    Bitget calls its third API credential an API Passphrase, while CCXT
-    exposes that credential through the unified `password` field.
-    """
-    api = (api or '').strip()
-    secret = (secret or '').strip()
-    password = (password or '').strip()
-
     if ex_id not in DEFAULT_CEX:
         return False, "CEX tidak dikenal.", None
-
     if not api or not secret:
         return False, "API key/secret kosong.", None
-
     if ex_id == 'bitget' and not password:
         return False, "Bitget membutuhkan API Passphrase.", None
-
     try:
         params = {
             'apiKey': api,
             'secret': secret,
-            'options': {
-                'defaultType': DEFAULT_CEX[ex_id]['type']
-            },
+            'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
             'enableRateLimit': True,
-            'timeout': 10000
+            'timeout': 8000
         }
-
-        # IMPORTANT:
-        # CCXT maps Bitget's API Passphrase to `password`.
         if ex_id == 'bitget':
             params['password'] = password
-
         ex = getattr(ccxt, ex_id)(params)
-
-        # Fail early with a clear local error if CCXT still sees a
-        # missing credential instead of producing a vague API error.
-        if hasattr(ex, 'check_required_credentials'):
-            ex.check_required_credentials()
-
         balance = ex.fetch_balance()
         details = extract_account_details(ex, balance)
         details = enrich_account_details(ex, details)
-
-        return True, (
-            "API valid dan private endpoint berhasil diakses."
-        ), details
-
+        return True, "API valid dan private endpoint berhasil diakses.", details
     except Exception as e:
-        return False, str(e)[:1200], None
+        detail = str(e)
+        if ex_id == 'bitget' and ('40014' in detail or 'Incorrect permissions' in detail or 'future pos' in detail.lower()):
+            detail += (
+                " | Bitget API key harus memiliki izin Futures/UTA trading "
+                "read & write (posisi/order), bukan read-only. Pastikan Passphrase API juga benar."
+            )
+        return False, detail[:1600], None
 
 
 async def safe_answer(callback: CallbackQuery, text=None, show_alert=False):
@@ -1177,7 +1199,7 @@ async def cmd_setapi(message: Message):
     if not is_allowed_chat(message):
         return
     await message.answer(
-        "🔐 <b>SET API</b>\n\nPilih CEX dulu. Bot akan meminta <b>API Key</b> lalu <b>Secret Key</b>. Untuk <b>BITGET</b>, bot juga meminta <b>API Passphrase</b> (bukan password login).",
+        "🔐 <b>SET API</b>\n\nPilih CEX dulu. Bot akan meminta <b>API Key</b> lalu <b>Secret Key</b>. Untuk <b>BITGET</b>, bot juga meminta <b>API Passphrase</b>.",
         reply_markup=cex_api_keyboard()
     )
 
@@ -1280,207 +1302,132 @@ async def cb_cex_toggle(callback: CallbackQuery):
     )
 
 
-async def safe_delete_message(chat_id, message_id):
-    """Best-effort deletion for credential/prompt messages."""
-    if not message_id:
-        return False
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        return True
-    except Exception:
-        return False
-
-
 @dp.message(F.text)
 async def handle_api_setup_message(message: Message):
     if not is_allowed_chat(message):
         return
-
     chat_id = message.chat.id
     state = PENDING_API_SETUP.get(chat_id)
     if not state:
         return
 
-    text = (message.text or "").strip()
+    text = (message.text or '').strip()
     if not text:
         return
 
-    ex_id = state.get("ex_id")
+    ex_id = state['ex_id']
 
     # Delete the user's credential message immediately.
-    # Telegram supports deleting user messages sent to the bot in private
-    # chats within the Bot API's deletion window.
-    await safe_delete_message(chat_id, message.message_id)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
+    except Exception:
+        pass
 
-    # -------------------------------------------------------------
-    # STEP 1: API KEY
-    # -------------------------------------------------------------
-    if state.get("stage") == "api_key":
-        state["stage"] = "secret"
-        state["api"] = text
-
+    if state['stage'] == 'api_key':
+        state['stage'] = 'secret'
+        state['api'] = text
         ack = await bot.send_message(
             chat_id,
-            f"🔐 <b>API Key diterima</b> untuk {ex_id.upper()}\n"
+            f"🔐 <b>API Key diterima</b> untuk {ex_id.upper()}.\n"
             "🗑️ Pesan API Key sudah dihapus.\n\n"
-            "Sekarang kirim <b>Secret Key</b> saja.\n"
-            "Pesan Secret Key akan langsung dihapus juga.",
+            "Sekarang kirim <b>Secret Key</b> saja. Pesan Secret Key juga akan dihapus otomatis.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="❌ BATAL & HAPUS SESI",
-                    callback_data="api_cancel"
-                )]
+                [InlineKeyboardButton(text="❌ BATAL & HAPUS SESI", callback_data="api_cancel")]
             ])
         )
-        state["ack_message_id"] = ack.message_id
+        state['ack_message_id'] = ack.message_id
         return
 
-    # -------------------------------------------------------------
-    # STEP 2: SECRET KEY
-    # -------------------------------------------------------------
-    if state.get("stage") == "secret":
-        state["secret"] = text
+    if state['stage'] == 'secret' and ex_id == 'bitget':
+        state['stage'] = 'passphrase'
+        state['secret'] = text
+        ack = await bot.send_message(
+            chat_id,
+            "🔐 <b>Secret Key diterima</b> untuk BITGET.\n"
+            "🗑️ Pesan Secret Key sudah dihapus.\n\n"
+            "Sekarang kirim <b>API Passphrase</b> yang dibuat saat API Bitget dibuat.\n"
+            "⚠️ Ini <b>bukan password login Bitget</b>. Pesan Passphrase juga akan otomatis dihapus.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ BATAL & HAPUS SESI", callback_data="api_cancel")]
+            ])
+        )
+        state['ack_message_id'] = ack.message_id
+        return
 
-        if ex_id == "bitget":
-            state["stage"] = "passphrase"
-
-            ack = await bot.send_message(
-                chat_id,
-                "🔐 <b>Secret Key BITGET diterima</b>\n"
-                "🗑️ Pesan Secret Key sudah dihapus.\n\n"
-                "Sekarang kirim <b>API Passphrase</b> Bitget.\n"
-                "⚠️ Ini adalah <b>Passphrase API</b> yang dibuat "
-                "saat API Bitget dibuat, <b>bukan password login akun</b>.\n"
-                "🗑️ Pesan Passphrase juga akan langsung dihapus.",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(
-                        text="❌ BATAL & HAPUS SESI",
-                        callback_data="api_cancel"
-                    )]
-                ])
-            )
-            state["ack_message_id"] = ack.message_id
-            return
-
-        # Non-Bitget: secret is the final credential.
-        api = state.get("api", "")
-        secret = state.get("secret", "")
-        password = ""
-
-    # -------------------------------------------------------------
-    # STEP 3: BITGET API PASSPHRASE
-    # -------------------------------------------------------------
-    elif state.get("stage") == "passphrase" and ex_id == "bitget":
-        api = state.get("api", "")
-        secret = state.get("secret", "")
+    api = state.get('api', '')
+    if ex_id == 'bitget':
+        secret = state.get('secret', '')
         password = text
-
     else:
-        return
+        secret = text
+        password = ''
 
-    # Snapshot the complete credential set before clearing the session.
-    credentials = (api, secret, password)
-
+    original_api, original_secret, original_password = api, secret, password
     PENDING_API_SETUP.pop(chat_id, None)
 
-    # Remove the bot's previous prompts/acknowledgements too.
-    for mid in (
-        state.get("ack_message_id"),
-        state.get("prompt_message_id")
-    ):
-        await safe_delete_message(chat_id, mid)
+    for mid in (state.get('ack_message_id'), state.get('prompt_message_id')):
+        if mid:
+            try: await bot.delete_message(chat_id, mid)
+            except Exception: pass
 
-    status_msg = await bot.send_message(
-        chat_id,
-        f"🔄 <b>Memvalidasi API {ex_id.upper()}...</b>"
-    )
-
-    ok, detail, account_details = await asyncio.to_thread(
-        validate_cex_api,
-        ex_id,
-        *credentials
-    )
+    status_msg = await bot.send_message(chat_id, f"🔄 <b>Memvalidasi API {ex_id.upper()}...</b>")
+    ok, detail, account_details = await asyncio.to_thread(validate_cex_api, ex_id, api, secret, password)
+    secret = ''
+    api = ''
+    password = ''
 
     if not ok:
-        safe_detail = html.escape(str(detail))
+        safe_detail = html.escape(detail)
         await status_msg.edit_text(
             f"❌ <b>API {ex_id.upper()} TIDAK VALID</b>\n\n"
             f"Alasan: <code>{safe_detail}</code>\n\n"
-            "API <b>tidak disimpan</b>.\n"
-            "Jika BITGET, pastikan yang dimasukkan adalah "
-            "<b>API Passphrase</b>, bukan password login.",
+            "API <b>tidak disimpan</b>.",
             reply_markup=api_menu_keyboard()
         )
         return
 
-    username = account_details.get("username", "-")
-    uid = account_details.get("uid", "-")
-    alias = account_details.get("alias", "-")
-
+    username = account_details.get('username', '-')
+    uid = account_details.get('uid', '-')
+    alias = account_details.get('alias', '-')
     label_parts = []
-    if username != "-":
-        label_parts.append(username)
-    if uid != "-":
-        label_parts.append(f"UID {uid}")
-    if alias != "-":
-        label_parts.append(alias)
+    if username != '-': label_parts.append(username)
+    if uid != '-': label_parts.append(f"UID {uid}")
+    if alias != '-': label_parts.append(alias)
+    account_label = " | ".join(label_parts) if label_parts else "Private account terverifikasi"
 
-    account_label = (
-        " | ".join(label_parts)
-        if label_parts
-        else "Private account terverifikasi"
-    )
-
+    # Store only the validated credentials and non-secret account metadata.
+    # The credentials remain in the DB because the trading engine needs them.
     stored_info = {
-        "Exchange": account_details.get("exchange", "-"),
-        "Account Type": account_details.get("account_type", "-"),
-        "Market": account_details.get("market_type", "-"),
-        "Private API": account_details.get("private_api", "-"),
-        "USDT Total": account_details.get("total_usdt"),
-        "USDT Free": account_details.get("free_usdt"),
-        "USDT Used": account_details.get("used_usdt"),
-        "Open Positions": account_details.get("open_positions", "N/A"),
-        "Open Orders": account_details.get("open_orders", "N/A"),
-        "Trade Permission": account_details.get("trade_permission", "-"),
-        "Read Only": account_details.get("read_only", "-")
+        'Exchange': account_details.get('exchange', '-'),
+        'Account Type': account_details.get('account_type', '-'),
+        'Market': account_details.get('market_type', '-'),
+        'Private API': account_details.get('private_api', '-'),
+        'USDT Total': account_details.get('total_usdt'),
+        'USDT Free': account_details.get('free_usdt'),
+        'USDT Used': account_details.get('used_usdt'),
+        'Open Positions': account_details.get('open_positions', 'N/A'),
+        'Open Orders': account_details.get('open_orders', 'N/A'),
+        'Trade Permission': account_details.get('trade_permission', '-'),
+        'Read Only': account_details.get('read_only', '-')
     }
-    stored_info = {
-        k: v for k, v in stored_info.items()
-        if v not in (None, "", "-")
-    }
-
-    saved_api, saved_secret, saved_password = credentials
+    stored_info = {k: v for k, v in stored_info.items() if v not in (None, '', '-')}
 
     conn = sqlite3.connect(DB_FILE, timeout=5)
     conn.cursor().execute(
-        "UPDATE cex_settings "
-        "SET api_key=?, secret=?, password=?, account_label=?, account_info=? "
-        "WHERE ex_id=?",
-        (
-            saved_api,
-            saved_secret,
-            saved_password if ex_id == "bitget" else "",
-            account_label,
-            json.dumps(stored_info, ensure_ascii=False),
-            ex_id
-        )
+        "UPDATE cex_settings SET api_key=?, secret=?, password=?, account_label=?, account_info=? WHERE ex_id=?",
+        (original_api, original_secret, original_password if ex_id == 'bitget' else '', account_label, json.dumps(stored_info, ensure_ascii=False), ex_id)
     )
-    conn.commit()
-    conn.close()
-
-    # Clear all credential references immediately after persistence.
-    saved_api = saved_secret = saved_password = ""
-    credentials = ("", "", "")
-
+    conn.commit(); conn.close()
     reload_exchanges()
+
+    # Clear local credential references after persistence.
+    original_api, original_secret, original_password = '', '', ''
 
     await status_msg.edit_text(
         f"✅ <b>API {ex_id.upper()} VALID</b>\n\n"
         "Private endpoint berhasil diakses.\n\n"
         f"{format_account_details(account_details)}\n\n"
-        "🗑️ Pesan credential setup sudah dibersihkan.\n"
-        "🔗 API sudah disimpan. CEX masih <b>OFF</b> "
-        "sampai kamu menekan tombol ON.",
+        "🔗 API sudah disimpan. CEX masih <b>OFF</b> sampai kamu menekan tombol ON.",
         reply_markup=cex_control_keyboard()
     )
 
@@ -1583,21 +1530,6 @@ async def cb_dryrun_toggle(callback: CallbackQuery):
         reply_markup=bot_control_keyboard()
     )
     send_telegram("🧪 <b>MODE BERUBAH</b> — " + ("DRY RUN aktif. Tidak ada order real." if value else "⚠️ REAL MONEY aktif. Order real diizinkan."))
-
-
-@dp.callback_query(F.data == "daily_loss_toggle")
-async def cb_daily_loss_toggle(callback: CallbackQuery):
-    global DAILY_LOSS_ENABLED
-    if not is_allowed_chat(callback):
-        return
-    DAILY_LOSS_ENABLED = not DAILY_LOSS_ENABLED
-    update_db_setting('daily_loss_enabled', 1.0 if DAILY_LOSS_ENABLED else 0.0)
-    await safe_answer(callback, "DAILY LOSS ON" if DAILY_LOSS_ENABLED else "DAILY LOSS OFF")
-    await callback.message.edit_text(
-        f"🛑 <b>DAILY LOSS LIMIT {'AKTIF' if DAILY_LOSS_ENABLED else 'NONAKTIF'}</b>\n\n"
-        + (f"Batas: {MAX_DAILY_SL}x SL per hari.\nJika tercapai, pembukaan trade baru dipause." if DAILY_LOSS_ENABLED else "Proteksi daily loss dimatikan. Bot tidak akan auto-pause setelah batas SL harian tercapai."),
-        reply_markup=bot_control_keyboard()
-    )
 
 
 @dp.callback_query(F.data == "cancelall")
@@ -1800,8 +1732,7 @@ def notify_runtime_status(new_status, text):
 
 
 def main_loop():
-    global daily_sl_count, IS_BOT_PAUSED, DAILY_LOSS_ENABLED
-    DAILY_LOSS_ENABLED = bool(get_db_setting('daily_loss_enabled', 1.0))
+    global daily_sl_count, IS_BOT_PAUSED
 
     last_hb = time.time()
     send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>\n🟢 Trading engine siap. Menunggu kondisi scan.")
@@ -1857,6 +1788,19 @@ def main_loop():
         time.sleep(15)
 
 
+def acquire_single_instance_lock():
+    """Prevent two Alchemist instances from running at the same time."""
+    lock_handle = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("[FATAL] Another Alchemist instance is already running.", flush=True)
+        raise SystemExit(1)
+    lock_handle.write(str(os.getpid()))
+    lock_handle.flush()
+    return lock_handle
+
+
 async def app_main():
     # Initialize shared state before any worker starts.
     init_db()
@@ -1891,6 +1835,7 @@ async def app_main():
 
 if __name__ == '__main__':
     try:
+        _instance_lock = acquire_single_instance_lock()
         asyncio.run(app_main())
     except (KeyboardInterrupt, SystemExit):
         print('ALCHEMIST stopped.', flush=True)
