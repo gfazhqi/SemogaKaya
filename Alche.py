@@ -41,6 +41,10 @@ DEFAULT_CEX = {
 
 exchanges = {}
 
+# Serialize trade-state DB operations so Telegram cleanup cannot race with
+# the background position updater and resurrect a cancelled queue item.
+DB_LOCK = threading.RLock()
+
 # Scanner runtime state.
 # M15 strategy is evaluated on closed candles; there is no reason to hammer
 # the exchange every 15 seconds with hundreds of OHLCV requests.
@@ -260,31 +264,178 @@ def get_free_usdt_balance(ex_instance):
         return 0.0
 
 
-def cancel_all_pending_orders_on_pause():
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        c = conn.cursor()
-        rows = c.execute(
-            "SELECT id, exchange_id, symbol, order_id "
-            "FROM trades WHERE status='PENDING'"
-        ).fetchall()
+def get_open_position_contracts(ex, symbol):
+    """Return the currently open contract amount for one symbol.
 
-        for t_id, ex_id, sym, ord_id in rows:
-            if ex_id in exchanges and not str(ord_id).startswith('sim_'):
-                try:
-                    exchanges[ex_id].cancel_order(ord_id, sym)
-                except Exception:
-                    pass
-            c.execute(
-                "UPDATE trades SET status='CANCELLED (Auto/Manual)' WHERE id=?",
-                (t_id,)
+    Uses CCXT unified positions first. This is only used for a manual emergency
+    close, so we prefer an exact live position size over the locally calculated
+    entry quantity.
+    """
+    positions = ex.fetch_positions([symbol])
+    if not positions:
+        return 0.0, None
+
+    best = None
+    for pos in positions:
+        if pos.get('symbol') != symbol:
+            continue
+        contracts = pos.get('contracts')
+        if contracts is None:
+            contracts = pos.get('amount')
+        try:
+            contracts = abs(float(contracts or 0.0))
+        except (TypeError, ValueError):
+            contracts = 0.0
+        if contracts <= 0:
+            continue
+        best = (contracts, pos.get('side'))
+        break
+
+    return best if best else (0.0, None)
+
+
+def close_open_trade(trade_id):
+    """Manually close one OPEN trade, intended for emergency/news exits.
+
+    DRY RUN only changes the local simulation state. REAL mode sends a market
+    order in the opposite direction with reduceOnly=True, using the live
+    position size returned by the exchange.
+    """
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            row = conn.execute(
+                "SELECT exchange_id, symbol, side, order_id, status "
+                "FROM trades WHERE id=?",
+                (trade_id,)
+            ).fetchone()
+            if not row:
+                return False, "Trade tidak ditemukan."
+
+            ex_id, symbol, side, order_id, status = row
+            if status != 'OPEN':
+                return False, f"Trade bukan OPEN (status: {status})."
+
+            is_sim = str(order_id).startswith('sim_')
+            ex = exchanges.get(ex_id)
+
+            if CONFIG.get('DRY_RUN', True) or is_sim:
+                cur = conn.execute(
+                    "UPDATE trades SET status='CLOSED (MANUAL)' "
+                    "WHERE id=? AND status='OPEN'",
+                    (trade_id,)
+                )
+                conn.commit()
+                if cur.rowcount:
+                    return True, f"{symbol} ditutup manual (DRY RUN)."
+                return False, "Trade sudah berubah status."
+
+            if ex is None:
+                return False, f"CEX {ex_id.upper()} tidak aktif."
+
+            contracts, live_side = get_open_position_contracts(ex, symbol)
+            if contracts <= 0:
+                return False, (
+                    f"Posisi live {symbol} tidak ditemukan di {ex_id.upper()}. "
+                    "Trade lokal tidak diubah."
+                )
+
+            close_side = 'sell' if side == 'BUY' else 'buy'
+            params = {'reduceOnly': True}
+
+            # Some exchanges need positionSide in hedge mode. If CCXT exposes
+            # it, pass it through; otherwise reduceOnly is sufficient for
+            # one-way mode and the exchange can reject safely.
+            if live_side in ('long', 'short'):
+                params['positionSide'] = live_side
+
+            result = ex.create_order(
+                symbol,
+                'market',
+                close_side,
+                contracts,
+                None,
+                params
             )
 
-        conn.commit()
-        conn.close()
-        send_telegram("🧹 <b>CLEANUP</b> Semua pending order dibatalkan!")
-    except Exception:
-        pass
+            cur = conn.execute(
+                "UPDATE trades SET status='CLOSED (MANUAL)' "
+                "WHERE id=? AND status='OPEN'",
+                (trade_id,)
+            )
+            conn.commit()
+            if not cur.rowcount:
+                return False, "Order close terkirim, tetapi status lokal sudah berubah."
+
+            return True, (
+                f"{symbol} ditutup manual di {ex_id.upper()} "
+                f"({contracts:g} kontrak)."
+            )
+        except Exception as e:
+            conn.rollback()
+            return False, str(e)[:900]
+        finally:
+            conn.close()
+
+
+def close_all_open_trades():
+    """Emergency-close every currently OPEN trade, one by one."""
+    rows = db_read(
+        "SELECT id FROM trades WHERE status='OPEN' ORDER BY id ASC"
+    )
+    results = []
+    for (trade_id,) in rows:
+        ok, detail = close_open_trade(trade_id)
+        results.append((ok, detail))
+    return results
+
+
+def cancel_all_pending_orders_on_pause():
+    """Cancel only active PENDING orders and make the DB state authoritative.
+
+    The previous version could race with update_orders_and_positions(): the
+    updater could read a PENDING row, cleanup could mark it cancelled, and the
+    updater could then write the old state back. Conditional UPDATEs plus a
+    process-local DB lock prevent that resurrection.
+    """
+    changed = 0
+    try:
+        with DB_LOCK:
+            conn = sqlite3.connect(DB_FILE, timeout=10)
+            try:
+                c = conn.cursor()
+                rows = c.execute(
+                    "SELECT id, exchange_id, symbol, order_id "
+                    "FROM trades WHERE status='PENDING'"
+                ).fetchall()
+
+                for t_id, ex_id, sym, ord_id in rows:
+                    if ex_id in exchanges and not str(ord_id).startswith('sim_'):
+                        try:
+                            exchanges[ex_id].cancel_order(ord_id, sym)
+                        except Exception:
+                            # The exchange order may already be gone; the local
+                            # queue must still stop treating it as PENDING.
+                            pass
+
+                    cur = c.execute(
+                        "UPDATE trades SET status='CANCELLED (Auto/Manual)' "
+                        "WHERE id=? AND status='PENDING'",
+                        (t_id,)
+                    )
+                    changed += cur.rowcount
+
+                conn.commit()
+            finally:
+                conn.close()
+
+        send_telegram(
+            f"🧹 <b>CLEANUP</b> {changed} pending order dibatalkan!"
+            if changed else
+            "🧹 <b>CLEANUP</b> Tidak ada pending order aktif."
+        )
+    except Exception as e:
+        send_error_alert(f"Cleanup pending orders: {e}")
 
 
 def check_and_update_daily_sl():
@@ -406,88 +557,102 @@ def _pending_price_state(ex_instance, symbol, side, entry, sl, tp):
 
 
 def update_orders_and_positions():
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    c = conn.cursor()
+    """Advance active trades without allowing stale rows to resurrect.
 
-    rows = c.execute(
-        "SELECT id, exchange_id, symbol, side, entry_price, sl_price, "
-        "tp_price, order_id, bars_count, status "
-        "FROM trades WHERE status IN ('PENDING', 'OPEN')"
-    ).fetchall()
-
-    for t_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status in rows:
-        if ex_id not in exchanges:
-            continue
-
+    Every state transition is conditional on the row still having the state
+    that was read. This is important when /cancelall or the daily-loss cleanup
+    runs at the same time as the background monitor.
+    """
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
         try:
-            ex = exchanges[ex_id]
-            n_bars = bars + 1
-            is_sim = str(ord_id).startswith('sim_')
-            tag = " (DRY RUN)" if is_sim else ""
+            c = conn.cursor()
 
-            if status == 'PENDING':
-                n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
+            rows = c.execute(
+                "SELECT id, exchange_id, symbol, side, entry_price, sl_price, "
+                "tp_price, order_id, bars_count, status "
+                "FROM trades WHERE status IN ('PENDING', 'OPEN')"
+            ).fetchall()
 
-                if n_stat == 'OPEN':
-                    send_telegram(
-                        f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!"
-                    )
-                elif n_stat != 'PENDING':
-                    if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
-                        try:
-                            ex.cancel_order(ord_id, sym)
-                        except Exception:
-                            pass
+            for t_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status in rows:
+                if ex_id not in exchanges:
+                    continue
 
-                    send_telegram(
-                        f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\n"
-                        f"Alasan: {n_stat}"
-                    )
+                try:
+                    ex = exchanges[ex_id]
+                    n_bars = bars + 1
+                    is_sim = str(ord_id).startswith('sim_')
+                    tag = " (DRY RUN)" if is_sim else ""
 
-                if n_stat != 'PENDING':
-                    c.execute(
-                        "UPDATE trades SET status=?, bars_count=? WHERE id=?",
-                        (n_stat, n_bars, t_id)
-                    )
-                else:
-                    # Keep waiting. We deliberately do not use ticker snapshots
-                    # to decide TP-first/SL-first for pending setups.
-                    c.execute(
-                        "UPDATE trades SET bars_count=? WHERE id=?",
-                        (n_bars, t_id)
-                    )
+                    if status == 'PENDING':
+                        n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
 
-            elif status == 'OPEN':
-                # Position management remains based on the live exchange price.
-                curr_price = ex.fetch_ticker(sym)['last']
+                        if n_stat == 'OPEN':
+                            send_telegram(
+                                f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!"
+                            )
+                        elif n_stat != 'PENDING':
+                            if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
+                                try:
+                                    ex.cancel_order(ord_id, sym)
+                                except Exception:
+                                    pass
 
-                if (side == 'BUY' and curr_price >= tp) or (
-                    side == 'SELL' and curr_price <= tp
-                ):
-                    c.execute(
-                        "UPDATE trades SET status='CLOSED (TP)' WHERE id=?",
-                        (t_id,)
-                    )
-                    send_telegram(
-                        f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | +1R 🚀"
-                    )
+                            send_telegram(
+                                f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\n"
+                                f"Alasan: {n_stat}"
+                            )
 
-                elif (side == 'BUY' and curr_price <= sl) or (
-                    side == 'SELL' and curr_price >= sl
-                ):
-                    c.execute(
-                        "UPDATE trades SET status='CLOSED (SL)' WHERE id=?",
-                        (t_id,)
-                    )
-                    send_telegram(
-                        f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻"
-                    )
+                        if n_stat != 'PENDING':
+                            # Do not overwrite a concurrent CANCEL ALL.
+                            c.execute(
+                                "UPDATE trades SET status=?, bars_count=? "
+                                "WHERE id=? AND status='PENDING'",
+                                (n_stat, n_bars, t_id)
+                            )
+                        else:
+                            c.execute(
+                                "UPDATE trades SET bars_count=? "
+                                "WHERE id=? AND status='PENDING'",
+                                (n_bars, t_id)
+                            )
 
-        except Exception:
-            pass
+                    elif status == 'OPEN':
+                        curr_price = ex.fetch_ticker(sym)['last']
 
-    conn.commit()
-    conn.close()
+                        if (side == 'BUY' and curr_price >= tp) or (
+                            side == 'SELL' and curr_price <= tp
+                        ):
+                            c.execute(
+                                "UPDATE trades SET status='CLOSED (TP)' "
+                                "WHERE id=? AND status='OPEN'",
+                                (t_id,)
+                            )
+                            if c.rowcount:
+                                send_telegram(
+                                    f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | +1R 🚀"
+                                )
+
+                        elif (side == 'BUY' and curr_price <= sl) or (
+                            side == 'SELL' and curr_price >= sl
+                        ):
+                            c.execute(
+                                "UPDATE trades SET status='CLOSED (SL)' "
+                                "WHERE id=? AND status='OPEN'",
+                                (t_id,)
+                            )
+                            if c.rowcount:
+                                send_telegram(
+                                    f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻"
+                                )
+
+                except Exception as e:
+                    # Keep one bad symbol from aborting the whole monitor pass.
+                    send_error_alert(f"Position monitor [{ex_id}:{sym}]: {e}")
+
+            conn.commit()
+        finally:
+            conn.close()
 
 
 # =================================================================
@@ -894,7 +1059,7 @@ def build_settings_text():
 
 def build_positions_text():
     rows = db_read(
-        "SELECT exchange_id, symbol, side, entry_price, sl_price, tp_price, status "
+        "SELECT id, exchange_id, symbol, side, entry_price, sl_price, tp_price, status "
         "FROM trades WHERE status IN ('PENDING', 'OPEN') ORDER BY id DESC"
     )
     cex_db = db_read("SELECT ex_id, enabled FROM cex_settings")
@@ -909,7 +1074,7 @@ def build_positions_text():
     if not rows:
         text += "\n🟢 Tidak ada posisi pending/open."
     else:
-        for ex_id, sym, side, en, sl, tp, status in rows:
+        for trade_id, ex_id, sym, side, en, sl, tp, status in rows:
             text += (
                 f"\n• <b>{ex_id.upper()} | {sym}</b> | {side}\n"
                 f"  Status: {status}\n"
@@ -918,6 +1083,35 @@ def build_positions_text():
                 f"  TP: {tp:.8f}\n"
             )
     return text
+
+
+def positions_keyboard():
+    rows = db_read(
+        "SELECT id, exchange_id, symbol, status "
+        "FROM trades WHERE status IN ('PENDING', 'OPEN') ORDER BY id DESC"
+    )
+    buttons = []
+    for trade_id, ex_id, symbol, status in rows:
+        if status == 'OPEN':
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🚨 TUTUP {ex_id.upper()} | {symbol[:24]}",
+                    callback_data=f"closepos:{trade_id}"
+                )
+            ])
+    if any(status == 'OPEN' for _, _, _, status in rows):
+        buttons.append([
+            InlineKeyboardButton(
+                text="🚨 TUTUP SEMUA POSISI OPEN",
+                callback_data="closeallopen"
+            )
+        ])
+    buttons.extend([
+        [InlineKeyboardButton(text="🧹 CANCEL ALL PENDING", callback_data="cancelall")],
+        [InlineKeyboardButton(text="🔄 REFRESH", callback_data="positions")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def build_stats_text():
@@ -1233,7 +1427,7 @@ async def cmd_settings(message: Message):
 async def cmd_posisi(message: Message):
     if not is_allowed_chat(message):
         return
-    await message.answer(build_positions_text(), reply_markup=main_keyboard())
+    await message.answer(build_positions_text(), reply_markup=positions_keyboard())
 
 
 @dp.message(Command("stat"))
@@ -1273,7 +1467,7 @@ async def cmd_cancelall(message: Message):
     if not is_allowed_chat(message):
         return
     cancel_all_pending_orders_on_pause()
-    await message.answer("🧹 Semua pending order diproses untuk dibatalkan.", reply_markup=main_keyboard())
+    await message.answer(build_positions_text(), reply_markup=main_keyboard())
 
 
 @dp.message(Command("dryrun"))
@@ -1656,7 +1850,7 @@ async def cb_positions(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
     try:
-        await callback.message.edit_text(build_positions_text(), reply_markup=main_keyboard())
+        await callback.message.edit_text(build_positions_text(), reply_markup=positions_keyboard())
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e).lower():
             raise
@@ -1787,9 +1981,67 @@ async def cb_cancelall(callback: CallbackQuery):
     cancel_all_pending_orders_on_pause()
     await safe_answer(callback, "Pending order diproses")
     await callback.message.edit_text(
-        "🧹 <b>CANCEL ALL</b>\n\nSemua pending order yang terdaftar diproses untuk dibatalkan.",
-        reply_markup=bot_control_keyboard()
+        build_positions_text(),
+        reply_markup=positions_keyboard()
     )
+
+
+@dp.callback_query(F.data.startswith("closepos:"))
+async def cb_close_position(callback: CallbackQuery):
+    if not is_allowed_chat(callback):
+        return
+
+    try:
+        trade_id = int(callback.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await safe_answer(callback, "ID posisi tidak valid.", show_alert=True)
+        return
+
+    ok, detail = await asyncio.to_thread(close_open_trade, trade_id)
+    if ok:
+        await safe_answer(callback, "Posisi ditutup.")
+        send_telegram(f"🚨 <b>MANUAL CLOSE</b>\n{html.escape(detail)}")
+    else:
+        await safe_answer(callback, detail[:180], show_alert=True)
+
+    try:
+        await callback.message.edit_text(
+            build_positions_text(),
+            reply_markup=positions_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
+
+
+@dp.callback_query(F.data == "closeallopen")
+async def cb_close_all_open(callback: CallbackQuery):
+    if not is_allowed_chat(callback):
+        return
+
+    results = await asyncio.to_thread(close_all_open_trades)
+    success = sum(1 for ok, _ in results if ok)
+    failed = [detail for ok, detail in results if not ok]
+
+    if not results:
+        await safe_answer(callback, "Tidak ada posisi OPEN.", show_alert=True)
+    elif failed:
+        await safe_answer(callback, f"Berhasil {success}, gagal {len(failed)}.", show_alert=True)
+    else:
+        await safe_answer(callback, f"{success} posisi ditutup.")
+
+    if results:
+        lines = [f"• {detail}" for _, detail in results]
+        send_telegram("🚨 <b>EMERGENCY CLOSE ALL OPEN</b>\n" + "\n".join(lines))
+
+    try:
+        await callback.message.edit_text(
+            build_positions_text(),
+            reply_markup=positions_keyboard()
+        )
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e).lower():
+            raise
 
 
 @dp.callback_query(F.data == "set_margin_menu")
