@@ -203,342 +203,6 @@ def update_db_setting(key, value):
 # HELPERS
 # =================================================================
 def send_telegram(message):
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }
-        r = requests.post(url, json=payload, timeout=5)
-        if r.status_code != 200:
-            payload.pop("parse_mode", None)
-            requests.post(url, json=payload, timeout=5)
-    except Exception:
-        pass
-
-
-def send_error_alert(err_msg):
-    global last_error_time
-    if time.time() - last_error_time > ERROR_COOLDOWN:
-        send_telegram(f"⚠️ <b>ERROR ALERT</b>\n\n<code>{str(err_msg)[:3500]}</code>")
-        last_error_time = time.time()
-
-
-def is_kill_zone():
-    h = datetime.now(WIB).hour
-    return (14 <= h < 17) or (19 <= h < 22)
-
-
-def is_manual_alert_symbol(symbol):
-    return any(p in symbol.split(':')[0].upper() for p in MANUAL_ALERT_PAIRS)
-
-
-def get_free_usdt_balance(ex_instance):
-    try:
-        bal = ex_instance.fetch_balance()
-        usdt = bal.get('USDT', {})
-        if isinstance(usdt, dict):
-            return float(usdt.get('free', 0.0))
-        return 0.0
-    except Exception:
-        return 0.0
-
-
-def cancel_all_pending_orders_on_pause():
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        c = conn.cursor()
-        rows = c.execute(
-            "SELECT id, exchange_id, symbol, order_id "
-            "FROM trades WHERE status='PENDING'"
-        ).fetchall()
-
-        for t_id, ex_id, sym, ord_id in rows:
-            if ex_id in exchanges and not str(ord_id).startswith('sim_'):
-                try:
-                    exchanges[ex_id].cancel_order(ord_id, sym)
-                except Exception:
-                    pass
-            c.execute(
-                "UPDATE trades SET status='CANCELLED (Auto/Manual)' WHERE id=?",
-                (t_id,)
-            )
-
-        conn.commit()
-        conn.close()
-        send_telegram("🧹 <b>CLEANUP</b> Semua pending order dibatalkan!")
-    except Exception:
-        pass
-
-
-def check_and_update_daily_sl():
-    global daily_sl_count, IS_BOT_PAUSED
-    try:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        daily_sl_count = conn.cursor().execute(
-            "SELECT COUNT(*) FROM trades "
-            "WHERE created_at >= date('now', 'start of day') "
-            "AND status LIKE '%SL%'"
-        ).fetchone()[0]
-        conn.close()
-
-        if daily_sl_count >= MAX_DAILY_SL and not IS_BOT_PAUSED:
-            IS_BOT_PAUSED = True
-            cancel_all_pending_orders_on_pause()
-            send_telegram(
-                f"🛑 <b>DAILY LOSS LIMIT</b>\n"
-                f"Kena {daily_sl_count}x SL. Bot PAUSE!"
-            )
-    except Exception:
-        pass
-
-
-# =================================================================
-# SMC STRATEGY & LIFECYCLE
-# =================================================================
-# LOGIC TRADE TIDAK DIUBAH
-def analyze_smc_retrace(df_m15, df_h1, daily_open):
-    ema50 = df_h1['close'].ewm(span=50, adjust=False).mean().iloc[-2]
-    h1_c, c_prev = df_h1['close'].iloc[-2], df_m15.iloc[-2]
-    sig, en, sl, tp = None, 0.0, 0.0, 0.0
-
-    if h1_c > ema50 and c_prev['close'] > daily_open:
-        if c_prev['low'] < df_m15['low'].iloc[-7:-2].min() and c_prev['close'] > c_prev['open']:
-            en = c_prev['high'] - (0.5 * (c_prev['high'] - c_prev['low']))
-            sl = c_prev['low'] * (1.0 - SL_BUFFER_PERCENT)
-            tp = en + (en - sl)
-            sig = 'BUY'
-
-    elif h1_c < ema50 and c_prev['close'] < daily_open:
-        if c_prev['high'] > df_m15['high'].iloc[-7:-2].max() and c_prev['close'] < c_prev['open']:
-            en = c_prev['low'] + (0.5 * (c_prev['high'] - c_prev['low']))
-            sl = c_prev['high'] * (1.0 + SL_BUFFER_PERCENT)
-            tp = en - (sl - en)
-            sig = 'SELL'
-
-    return sig, en, sl, tp
-
-
-def update_orders_and_positions():
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    c = conn.cursor()
-
-    rows = c.execute(
-        "SELECT id, exchange_id, symbol, side, entry_price, sl_price, "
-        "tp_price, order_id, bars_count, status "
-        "FROM trades WHERE status IN ('PENDING', 'OPEN')"
-    ).fetchall()
-
-    for t_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status in rows:
-        if ex_id not in exchanges:
-            continue
-
-        try:
-            curr_price = exchanges[ex_id].fetch_ticker(sym)['last']
-            n_bars, is_sim = bars + 1, str(ord_id).startswith('sim_')
-            tag = " (DRY RUN)" if is_sim else ""
-
-            if status == 'PENDING':
-                n_stat = 'PENDING'
-
-                if (side == 'BUY' and curr_price <= en) or (side == 'SELL' and curr_price >= en):
-                    n_stat = 'OPEN'
-                    send_telegram(f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!")
-
-                elif side == 'BUY':
-                    if curr_price >= tp:
-                        n_stat = 'MISSED (TP First)'
-                    elif curr_price <= sl:
-                        n_stat = 'CANCELLED (SL First)'
-                    elif n_bars > 30:
-                        n_stat = 'INVALID (>30 Bars)'
-
-                elif side == 'SELL':
-                    if curr_price <= tp:
-                        n_stat = 'MISSED (TP First)'
-                    elif curr_price >= sl:
-                        n_stat = 'CANCELLED (SL First)'
-                    elif n_bars > 30:
-                        n_stat = 'INVALID (>30 Bars)'
-
-                if n_stat != 'PENDING':
-                    if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
-                        try:
-                            exchanges[ex_id].cancel_order(ord_id, sym)
-                        except Exception:
-                            pass
-
-                    send_telegram(f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\nAlasan: {n_stat}")
-                    c.execute(
-                        "UPDATE trades SET status=?, bars_count=? WHERE id=?",
-                        (n_stat, n_bars, t_id)
-                    )
-                else:
-                    c.execute(
-                        "UPDATE trades SET bars_count=? WHERE id=?",
-                        (n_bars, t_id)
-                    )
-
-            elif status == 'OPEN':
-                if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
-                    c.execute(
-                        "UPDATE trades SET status='CLOSED (TP)' WHERE id=?",
-                        (t_id,)
-                    )
-                    send_telegram(f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | +1R 🚀")
-
-                elif (side == 'BUY' and curr_price <= sl) or (side == 'SELL' and curr_price >= sl):
-                    c.execute(
-                        "UPDATE trades SET status='CLOSED (SL)' WHERE id=?",
-                        (t_id,)
-                    )
-                    send_telegram(f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻")
-
-        except Exception:
-            pass
-
-    conn.commit()
-    conn.close()
-
-
-# =================================================================
-# MARKET SCANNER
-# =================================================================
-# LOGIC TRADE TIDAK DIUBAH
-def scan_markets():
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    c = conn.cursor()
-
-    act_count = c.execute(
-        "SELECT COUNT(*) FROM trades WHERE status IN ('PENDING', 'OPEN')"
-    ).fetchone()[0]
-
-    pair_perf = {}
-    for sym, stat in c.execute(
-        "SELECT symbol, status FROM trades "
-        "WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)')"
-    ).fetchall():
-        if sym not in pair_perf:
-            pair_perf[sym] = {'w': 0, 'l': 0}
-        if 'TP' in stat:
-            pair_perf[sym]['w'] += 1
-        else:
-            pair_perf[sym]['l'] += 1
-
-    conn.close()
-
-    for ex_id, ex in exchanges.items():
-        try:
-            for sym in [s for s in ex.fetch_tickers().keys()
-                        if s.endswith('/USDT:USDT') or s.endswith('/USDT')][:60]:
-
-                if is_manual_alert_symbol(sym):
-                    m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
-                    h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
-                    d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
-
-                    if m15 and h1 and d1:
-                        sig, en, sl, tp = analyze_smc_retrace(
-                            pd.DataFrame(m15, columns=['time','open','high','low','close','vol']),
-                            pd.DataFrame(h1, columns=['time','open','high','low','close','vol']),
-                            d1[-1][1]
-                        )
-                        if sig:
-                            send_telegram(f"📢 <b>FX ALERT</b> {sym} | {sig}")
-                    continue
-
-                if act_count >= CONFIG['MAX_CONCURRENT_POSITIONS']:
-                    continue
-
-                if sym in pair_perf and sym not in CORE_PAIRS:
-                    tot_trades = pair_perf[sym]['w'] + pair_perf[sym]['l']
-                    if tot_trades >= CONFIG['MIN_TRADES']:
-                        wr = (pair_perf[sym]['w'] / tot_trades) * 100
-                        if wr < CONFIG['MIN_WR']:
-                            continue
-
-                m15 = ex.fetch_ohlcv(sym, '15m', limit=50)
-                h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
-                d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
-
-                if not m15 or not h1 or not d1:
-                    continue
-
-                sig, en, sl, tp = analyze_smc_retrace(
-                    pd.DataFrame(m15, columns=['time','open','high','low','close','vol']),
-                    pd.DataFrame(h1, columns=['time','open','high','low','close','vol']),
-                    d1[-1][1]
-                )
-
-                if sig:
-                    lev = CONFIG['LEVERAGE'].get(ex_id, 50)
-                    qty = (CONFIG['MARGIN_PER_TRADE'] * lev) / en
-                    mode = "[DRY RUN]" if CONFIG['DRY_RUN'] else "[REAL TRADE]"
-                    ord_id = f"sim_{int(time.time()*1000)}"
-
-                    if not CONFIG['DRY_RUN']:
-                        try:
-                            ex.set_leverage(lev, sym)
-                        except Exception:
-                            pass
-
-                        try:
-                            ord_id = str(ex.create_order(
-                                sym,
-                                'limit',
-                                'buy' if sig == 'BUY' else 'sell',
-                                qty,
-                                en,
-                                params={
-                                    'stopLoss': {'price': sl},
-                                    'takeProfit': {'price': tp}
-                                }
-                            )['id'])
-                        except Exception as e:
-                            send_error_alert(f"Order Fails {sym}: {e}")
-                            continue
-
-                    conn = sqlite3.connect(DB_FILE, timeout=10)
-                    conn.cursor().execute(
-                        "INSERT INTO trades "
-                        "(exchange_id, symbol, order_type, side, entry_price, "
-                        "sl_price, tp_price, order_id, status) "
-                        "VALUES (?, ?, 'LIMIT', ?, ?, ?, ?, ?, 'PENDING')",
-                        (ex_id, sym, sig, en, sl, tp, ord_id)
-                    )
-                    conn.commit()
-                    conn.close()
-
-                    send_telegram(
-                        f"🎯 <b>{mode}</b>\n"
-                        f"CEX: {ex_id.upper()} | {sym} | {sig}\n"
-                        f"Entry: {en:.5f}"
-                    )
-                    act_count += 1
-
-        except Exception as e:
-            send_error_alert(f"Scan Ex [{ex_id}]: {e}")
-
-
-# =================================================================
-# TELEGRAM POLLING
-# =================================================================
-def telegram_api(method, payload=None, timeout=10):
-    """Call Telegram API and return decoded response; never silently fail."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
-    try:
-        r = requests.post(url, json=payload or {}, timeout=timeout)
-        data = r.json()
-        if not data.get('ok'):
-            print(f"[TELEGRAM API ERROR] {method}: {data}", flush=True)
-        return data
-    except Exception as e:
-        print(f"[TELEGRAM REQUEST ERROR] {method}: {e}", flush=True)
-        return {'ok': False, 'description': str(e)}
-
-
-def send_telegram(message):
     """Send Telegram message. If HTML fails, retry as plain text."""
     payload = {
         'chat_id': TELEGRAM_CHAT_ID,
@@ -595,324 +259,428 @@ def validate_exchange_credentials(ex_id):
 
 
 def telegram_polling():
-    """Single, explicit Telegram long-polling loop.
-
-    Trading/scanner logic is not changed here. This loop only receives
-    commands and reports errors instead of silently swallowing them.
-    """
+    """Reliable Telegram long-polling command processor."""
     global IS_BOT_PAUSED
-    last_id = 0
 
-    # Long polling and webhook mode cannot be used together.
+    offset_file = "telegram_offset.txt"
+    try:
+        last_id = int(open(offset_file).read().strip())
+    except Exception:
+        last_id = 0
+
     telegram_api('deleteWebhook', {'drop_pending_updates': False}, timeout=10)
 
     me = telegram_api('getMe', {}, timeout=10)
     if not me.get('ok'):
-        print('[FATAL] Telegram token invalid or Telegram unreachable.', flush=True)
+        print("[FATAL] Bot token invalid/unreachable.", flush=True)
         return
 
     bot_name = me.get('result', {}).get('username', 'unknown')
-    print(f'[TELEGRAM] ONLINE @{bot_name} | CHAT_ID={TELEGRAM_CHAT_ID}', flush=True)
-    send_telegram('🟢 <b>TELEGRAM POLLING ONLINE</b>')
+    print(f"[TELEGRAM] ONLINE @{bot_name} | CHAT_ID={TELEGRAM_CHAT_ID}", flush=True)
+    send_telegram("🟢 <b>TELEGRAM ONLINE</b>\nKirim /settings untuk test.")
 
     while True:
         try:
-            data = telegram_api('getUpdates', {
-                'offset': last_id + 1,
-                'timeout': 25,
-                'allowed_updates': ['message']
-            }, timeout=35)
+            data = telegram_api(
+                'getUpdates',
+                {
+                    'offset': last_id + 1,
+                    'timeout': 20,
+                    'allowed_updates': ['message']
+                },
+                timeout=30
+            )
 
             if not data.get('ok'):
+                desc = data.get('description', 'unknown error')
+                print(f"[POLLING] getUpdates error: {desc}", flush=True)
                 time.sleep(3)
                 continue
 
             for update in data.get('result', []):
-                last_id = update.get('update_id', last_id)
+                update_id = int(update.get('update_id', 0))
+                if update_id > last_id:
+                    last_id = update_id
+                    try:
+                        with open(offset_file, "w") as f:
+                            f.write(str(last_id))
+                    except Exception:
+                        pass
+
                 msg = update.get('message') or {}
                 chat_id = str(msg.get('chat', {}).get('id', ''))
-
                 if chat_id != str(TELEGRAM_CHAT_ID):
-                    print(f'[TELEGRAM] Ignored chat_id={chat_id}', flush=True)
+                    print(f"[TELEGRAM] ignored chat_id={chat_id}", flush=True)
                     continue
 
-                raw_text = str(msg.get('text') or '').strip()
-                if not raw_text:
+                raw = str(msg.get('text') or '').strip()
+                if not raw:
                     continue
 
-                parts = raw_text.split()
+                parts = raw.split()
                 command = parts[0].split('@', 1)[0].lower()
                 args = parts[1:]
-                print(f'[TELEGRAM] COMMAND={command} ARGS={args}', flush=True)
+                print(f"[COMMAND] {command} {args}", flush=True)
 
-                try:
-                    # -------------------------------------------------
-                    # SETTINGS
-                    # -------------------------------------------------
-                    if command in ('/setting', '/settings'):
-                        rows = db_read_settings = None
-                        conn = sqlite3.connect(DB_FILE, timeout=5)
-                        rows = conn.cursor().execute(
-                            'SELECT ex_id, api_key, enabled FROM cex_settings'
-                        ).fetchall()
-                        conn.close()
-
-                        lines = []
-                        for ex_id, api, enabled in rows:
-                            lines.append(
-                                f"• {ex_id.upper()}: "
-                                f"{'🟢 ON' if enabled else '🔴 OFF'} | "
-                                f"Lev: {CONFIG['LEVERAGE'].get(ex_id, 50)}x | "
-                                f"API: {'✅' if api else '❌'}"
-                            )
-
-                        mode = '🟢 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'
+                # ---------------------------------------------------------
+                # /settings and /setting: NO CEX CALL, NO NETWORK CALL.
+                # This must always respond immediately.
+                # ---------------------------------------------------------
+                if command in ("/settings", "/setting"):
+                    try:
+                        mode = "🟢 DRY RUN" if CONFIG["DRY_RUN"] else "⚠️ REAL MONEY"
                         send_telegram(
-                            '⚙️ <b>SETTING BOT</b>\n\n'
-                            f'Mode: {mode}\n'
-                            f'Margin: ${CONFIG["MARGIN_PER_TRADE"]}\n'
-                            f'Max Pos: {CONFIG["MAX_CONCURRENT_POSITIONS"]}\n'
-                            f'Min Trade: {CONFIG["MIN_TRADES"]}\n'
-                            f'Min WR: {CONFIG["MIN_WR"]}%\n\n'
-                            '<b>BURSA:</b>\n' + ('\n'.join(lines) if lines else 'Belum ada')
+                            "⚙️ <b>SETTING BOT</b>\n\n"
+                            f"Mode: {mode}\n"
+                            f"Margin: ${CONFIG['MARGIN_PER_TRADE']}\n"
+                            f"Max Pos: {CONFIG['MAX_CONCURRENT_POSITIONS']}\n"
+                            f"Min Trade: {CONFIG['MIN_TRADES']}\n"
+                            f"Min WR: {CONFIG['MIN_WR']}%"
                         )
 
-                    # -------------------------------------------------
-                    # POSITIONS
-                    # -------------------------------------------------
-                    elif command == '/posisi':
-                        conn = sqlite3.connect(DB_FILE, timeout=5)
-                        trades = conn.cursor().execute(
-                            "SELECT exchange_id, symbol, side, status FROM trades "
-                            "WHERE status IN ('PENDING','OPEN')"
-                        ).fetchall()
-                        cex_rows = conn.cursor().execute(
-                            'SELECT ex_id, enabled FROM cex_settings'
-                        ).fetchall()
-                        conn.close()
+                        def settings_worker():
+                            try:
+                                conn = sqlite3.connect(DB_FILE, timeout=3)
+                                rows = conn.execute(
+                                    "SELECT ex_id, api_key, enabled FROM cex_settings"
+                                ).fetchall()
+                                conn.close()
 
-                        cex_lines = [
-                            f"• {ex.upper()} {'🟢 ON' if en else '🔴 OFF'}"
-                            for ex, en in cex_rows
-                        ]
-                        mode = '🟢 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL'
-                        msg_text = (
-                            '📊 <b>STATUS & POSISI</b>\n'
-                            f'Bot: {"PAUSED" if IS_BOT_PAUSED else "RUNNING"} | Mode: {mode}\n\n'
-                            '🔌 <b>CEX:</b>\n' +
-                            ('\n'.join(cex_lines) if cex_lines else '• Tidak ada CEX aktif') +
-                            f'\n\n📋 <b>ANTREAN:</b> {len(trades)}\n'
+                                lines = []
+                                for ex_id, api, enabled in rows:
+                                    lines.append(
+                                        f"• {ex_id.upper()}: "
+                                        f"{'🟢 ON' if enabled else '🔴 OFF'} | "
+                                        f"Lev: {CONFIG['LEVERAGE'].get(ex_id, 50)}x | "
+                                        f"API: {'✅' if api else '❌'}"
+                                    )
+
+                                send_telegram(
+                                    "🔌 <b>BURSA</b>\n" +
+                                    ("\n".join(lines) if lines else "Belum ada CEX")
+                                )
+                            except Exception as e:
+                                send_telegram(
+                                    f"⚠️ <b>SETTINGS DB ERROR</b>\n<code>{str(e)[:2000]}</code>"
+                                )
+
+                        threading.Thread(target=settings_worker, daemon=True).start()
+                    except Exception as e:
+                        send_telegram(
+                            f"⚠️ <b>SETTINGS ERROR</b>\n<code>{str(e)[:2000]}</code>"
                         )
-                        for ex, sym, side, status in trades:
-                            msg_text += f'• {ex.upper()} | {sym} | {side} | {status}\n'
+                    continue
 
-                        # Send position data BEFORE balance/network checks.
-                        send_telegram(msg_text)
+                # ---------------------------------------------------------
+                # /posisi: immediate response, then DB/balance separately.
+                # ---------------------------------------------------------
+                if command == "/posisi":
+                    try:
+                        send_telegram("📊 <b>STATUS & POSISI</b>\n⏳ Mengambil data...")
 
-                        def balance_worker():
-                            lines = []
-                            for ex_id, ex in list(exchanges.items()):
-                                try:
-                                    bal = get_free_usdt_balance(ex)
-                                    lines.append(f'• {ex_id.upper()} Free: ${bal:.2f}')
-                                except Exception as e:
-                                    lines.append(f'• {ex_id.upper()} Error: {str(e)[:120]}')
-                            send_telegram(
-                                '💰 <b>SALDO CEX</b>\n' +
-                                ('\n'.join(lines) if lines else '• Tidak ada CEX aktif')
-                            )
+                        def posisi_worker():
+                            try:
+                                conn = sqlite3.connect(DB_FILE, timeout=3)
+                                trades = conn.execute(
+                                    "SELECT exchange_id, symbol, side, status "
+                                    "FROM trades WHERE status IN ('PENDING','OPEN')"
+                                ).fetchall()
+                                cex_rows = conn.execute(
+                                    "SELECT ex_id, enabled FROM cex_settings"
+                                ).fetchall()
+                                conn.close()
 
-                        threading.Thread(target=balance_worker, daemon=True).start()
+                                mode = "🟢 DRY RUN" if CONFIG["DRY_RUN"] else "⚠️ REAL"
+                                text = (
+                                    "📊 <b>STATUS & POSISI</b>\n"
+                                    f"Bot: {'PAUSED' if IS_BOT_PAUSED else 'RUNNING'} | Mode: {mode}\n\n"
+                                    "🔌 <b>CEX:</b>\n"
+                                )
 
-                    # -------------------------------------------------
-                    # SET API + VALIDATE IMMEDIATELY
-                    # -------------------------------------------------
-                    elif command == '/setapi' and len(args) == 3:
-                        ex_id, api, sec = args[0].lower(), args[1], args[2]
-                        if ex_id not in DEFAULT_CEX:
-                            send_telegram('⚠️ CEX tidak dikenal.')
-                            continue
+                                text += "\n".join(
+                                    f"• {ex.upper()} {'🟢 ON' if en else '🔴 OFF'}"
+                                    for ex, en in cex_rows
+                                ) or "• Tidak ada CEX"
 
-                        conn = sqlite3.connect(DB_FILE, timeout=5)
-                        conn.cursor().execute(
-                            'UPDATE cex_settings SET api_key=?, secret=? WHERE ex_id=?',
+                                text += f"\n\n📋 <b>ANTREAN:</b> {len(trades)}\n"
+                                for ex, sym, side, status in trades:
+                                    text += f"• {ex.upper()} | {sym} | {side} | {status}\n"
+
+                                send_telegram(text)
+
+                                def balance_worker():
+                                    lines = []
+                                    for ex_id, ex in list(exchanges.items()):
+                                        try:
+                                            bal = get_free_usdt_balance(ex)
+                                            lines.append(f"• {ex_id.upper()} Free: ${bal:.2f}")
+                                        except Exception as e:
+                                            lines.append(
+                                                f"• {ex_id.upper()} Error: {str(e)[:120]}"
+                                            )
+                                    send_telegram(
+                                        "💰 <b>SALDO CEX</b>\n" +
+                                        ("\n".join(lines) if lines else "• Tidak ada CEX aktif")
+                                    )
+
+                                threading.Thread(target=balance_worker, daemon=True).start()
+
+                            except Exception as e:
+                                send_telegram(
+                                    f"⚠️ <b>POSISI ERROR</b>\n<code>{str(e)[:2000]}</code>"
+                                )
+
+                        threading.Thread(target=posisi_worker, daemon=True).start()
+                    except Exception as e:
+                        send_telegram(
+                            f"⚠️ <b>POSISI ERROR</b>\n<code>{str(e)[:2000]}</code>"
+                        )
+                    continue
+
+                # ---------------------------------------------------------
+                # /setapi: save, validate asynchronously, disable on failure.
+                # ---------------------------------------------------------
+                if command == "/setapi":
+                    if len(args) != 3:
+                        send_telegram("⚠️ Format:\n<code>/setapi &lt;cex&gt; &lt;api_key&gt; &lt;secret&gt;</code>")
+                        continue
+
+                    ex_id, api, sec = args[0].lower(), args[1], args[2]
+                    if ex_id not in DEFAULT_CEX:
+                        send_telegram("❌ CEX tidak dikenal.")
+                        continue
+
+                    try:
+                        conn = sqlite3.connect(DB_FILE, timeout=3)
+                        conn.execute(
+                            "UPDATE cex_settings SET api_key=?, secret=?, enabled=0 WHERE ex_id=?",
                             (api, sec, ex_id)
                         )
                         conn.commit()
                         conn.close()
+                    except Exception as e:
+                        send_telegram(
+                            f"❌ <b>GAGAL SIMPAN API {ex_id.upper()}</b>\n"
+                            f"<code>{str(e)[:2000]}</code>"
+                        )
+                        continue
 
-                        ok, detail = validate_exchange_credentials(ex_id)
+                    send_telegram(
+                        f"🔎 <b>VALIDASI {ex_id.upper()}</b>\n"
+                        "API disimpan sementara dan sedang dicek..."
+                    )
+
+                    def validate_worker(exchange_id):
+                        ok, detail = validate_exchange_credentials(exchange_id)
                         if ok:
-                            send_telegram(f'✅ <b>{ex_id.upper()} API VALID</b>\n{detail}')
-                        else:
+                            reload_exchanges()
                             send_telegram(
-                                f'❌ <b>{ex_id.upper()} API ERROR</b>\n'
-                                f'{detail}\n\n'
-                                'API disimpan, tetapi CEX belum diaktifkan.'
+                                f"✅ <b>{exchange_id.upper()} API VALID</b>\n{detail}\n"
+                                "CEX masih OFF. Gunakan /cex on setelah yakin."
+                            )
+                        else:
+                            try:
+                                conn = sqlite3.connect(DB_FILE, timeout=3)
+                                conn.execute(
+                                    "UPDATE cex_settings SET enabled=0 WHERE ex_id=?",
+                                    (exchange_id,)
+                                )
+                                conn.commit()
+                                conn.close()
+                            except Exception:
+                                pass
+
+                            reload_exchanges()
+                            send_telegram(
+                                f"❌ <b>{exchange_id.upper()} API TIDAK VALID</b>\n"
+                                f"{detail}\n\n"
+                                "🔴 CEX otomatis tetap OFF."
+                            )
+
+                    threading.Thread(
+                        target=validate_worker,
+                        args=(ex_id,),
+                        daemon=True
+                    ).start()
+                    continue
+
+                # ---------------------------------------------------------
+                # /cex on/off: never allow ON without successful validation.
+                # ---------------------------------------------------------
+                if command == "/cex":
+                    if len(args) != 2:
+                        send_telegram("⚠️ Format: <code>/cex on/off &lt;cex&gt;</code>")
+                        continue
+
+                    action, ex_id = args[0].lower(), args[1].lower()
+                    if ex_id not in DEFAULT_CEX or action not in ("on", "off"):
+                        send_telegram("⚠️ CEX/action tidak valid.")
+                        continue
+
+                    if action == "on":
+                        send_telegram(f"🔎 Validasi {ex_id.upper()} sebelum ON...")
+                        ok, detail = validate_exchange_credentials(ex_id)
+                        if not ok:
+                            send_telegram(
+                                f"❌ <b>{ex_id.upper()} TIDAK BISA ON</b>\n{detail}\n"
+                                "🔴 CEX tetap OFF."
                             )
                             continue
 
-                        reload_exchanges()
-
-                    # -------------------------------------------------
-                    # CEX ON/OFF + VALIDATE BEFORE ON
-                    # -------------------------------------------------
-                    elif command == '/cex' and len(args) == 2:
-                        action, ex_id = args[0].lower(), args[1].lower()
-                        if ex_id not in DEFAULT_CEX or action not in ('on', 'off'):
-                            send_telegram('⚠️ Format: /cex on/off <cex>')
-                            continue
-
-                        if action == 'on':
-                            ok, detail = validate_exchange_credentials(ex_id)
-                            if not ok:
-                                send_telegram(
-                                    f'❌ <b>{ex_id.upper()} TIDAK BISA ON</b>\n{detail}'
-                                )
-                                continue
-
-                        conn = sqlite3.connect(DB_FILE, timeout=5)
-                        conn.cursor().execute(
-                            'UPDATE cex_settings SET enabled=? WHERE ex_id=?',
-                            (1 if action == 'on' else 0, ex_id)
+                    try:
+                        conn = sqlite3.connect(DB_FILE, timeout=3)
+                        conn.execute(
+                            "UPDATE cex_settings SET enabled=? WHERE ex_id=?",
+                            (1 if action == "on" else 0, ex_id)
                         )
                         conn.commit()
                         conn.close()
                         reload_exchanges()
+
                         send_telegram(
-                            f'✅ CEX {ex_id.upper()} di-{action.upper()}!'
-                            + (f'\n{detail}' if action == 'on' else '')
+                            f"✅ CEX {ex_id.upper()} di-{action.upper()}!"
+                            + (f"\n{detail}" if action == "on" else "")
                         )
+                    except Exception as e:
+                        send_telegram(
+                            f"❌ Gagal ubah status CEX:\n<code>{str(e)[:2000]}</code>"
+                        )
+                    continue
 
-                    # -------------------------------------------------
-                    # BASIC SETTINGS
-                    # -------------------------------------------------
-                    elif command == '/dryrun' and len(args) == 1:
-                        if args[0].lower() == 'on':
-                            CONFIG['DRY_RUN'] = True
-                            update_db_setting('dry_run', 1.0)
-                            send_telegram('✅ <b>DRY RUN AKTIF</b>')
-                        elif args[0].lower() == 'off':
-                            CONFIG['DRY_RUN'] = False
-                            update_db_setting('dry_run', 0.0)
-                            send_telegram('⚠️ <b>REAL MONEY AKTIF</b>')
+                # ---------------------------------------------------------
+                # Existing commands
+                # ---------------------------------------------------------
+                try:
+                    if command == "/dryrun" and len(args) == 1:
+                        if args[0].lower() == "on":
+                            CONFIG["DRY_RUN"] = True
+                            update_db_setting("dry_run", 1.0)
+                            send_telegram("✅ <b>DRY RUN AKTIF</b>")
+                        elif args[0].lower() == "off":
+                            CONFIG["DRY_RUN"] = False
+                            update_db_setting("dry_run", 0.0)
+                            send_telegram("⚠️ <b>REAL MONEY AKTIF</b>")
                         else:
-                            send_telegram('⚠️ Format: /dryrun on atau /dryrun off')
+                            send_telegram("⚠️ Format: /dryrun on atau /dryrun off")
 
-                    elif command == '/setmargin' and len(args) == 1:
+                    elif command == "/setmargin" and len(args) == 1:
                         value = float(args[0])
-                        CONFIG['MARGIN_PER_TRADE'] = value
-                        update_db_setting('margin', value)
-                        send_telegram(f'✅ Margin: ${value}')
+                        CONFIG["MARGIN_PER_TRADE"] = value
+                        update_db_setting("margin", value)
+                        send_telegram(f"✅ Margin: ${value}")
 
-                    elif command == '/setmaxpos' and len(args) == 1:
+                    elif command == "/setmaxpos" and len(args) == 1:
                         value = int(args[0])
-                        CONFIG['MAX_CONCURRENT_POSITIONS'] = value
-                        update_db_setting('max_pos', value)
-                        send_telegram(f'✅ Max Posisi: {value}')
+                        CONFIG["MAX_CONCURRENT_POSITIONS"] = value
+                        update_db_setting("max_pos", value)
+                        send_telegram(f"✅ Max Posisi: {value}")
 
-                    elif command == '/setminwr' and len(args) == 1:
+                    elif command == "/setminwr" and len(args) == 1:
                         value = float(args[0])
-                        CONFIG['MIN_WR'] = value
-                        update_db_setting('min_wr', value)
-                        send_telegram(f'✅ Min WinRate: {value}%')
+                        CONFIG["MIN_WR"] = value
+                        update_db_setting("min_wr", value)
+                        send_telegram(f"✅ Min WinRate: {value}%")
 
-                    elif command == '/setmintrades' and len(args) == 1:
+                    elif command == "/setmintrades" and len(args) == 1:
                         value = int(args[0])
-                        CONFIG['MIN_TRADES'] = value
-                        update_db_setting('min_trades', value)
-                        send_telegram(f'✅ Min Trade: {value}x')
+                        CONFIG["MIN_TRADES"] = value
+                        update_db_setting("min_trades", value)
+                        send_telegram(f"✅ Min Trade: {value}x")
 
-                    elif command == '/setlev' and len(args) in (1, 2):
+                    elif command == "/setlev" and len(args) in (1, 2):
                         if len(args) == 1:
                             value = int(args[0])
                             for ex in DEFAULT_CEX:
-                                CONFIG['LEVERAGE'][ex] = value
-                                update_db_setting(f'lev_{ex}', value)
-                            send_telegram(f'✅ Semua leverage: {value}x')
+                                CONFIG["LEVERAGE"][ex] = value
+                                update_db_setting(f"lev_{ex}", value)
+                            send_telegram(f"✅ Semua leverage: {value}x")
                         else:
                             ex_id, value = args[0].lower(), int(args[1])
                             if ex_id not in DEFAULT_CEX:
-                                send_telegram('⚠️ CEX tidak dikenal.')
+                                send_telegram("⚠️ CEX tidak dikenal.")
                             else:
-                                CONFIG['LEVERAGE'][ex_id] = value
-                                update_db_setting(f'lev_{ex_id}', value)
-                                send_telegram(f'✅ Lev {ex_id.upper()}: {value}x')
+                                CONFIG["LEVERAGE"][ex_id] = value
+                                update_db_setting(f"lev_{ex_id}", value)
+                                send_telegram(f"✅ Lev {ex_id.upper()}: {value}x")
 
-                    # -------------------------------------------------
-                    # PAIR PERFORMANCE
-                    # -------------------------------------------------
-                    elif command == '/pairperf':
-                        conn = sqlite3.connect(DB_FILE, timeout=5)
-                        rows = conn.cursor().execute(
-                            "SELECT symbol, status FROM trades WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)')"
-                        ).fetchall()
-                        conn.close()
-                        pair_perf = {}
-                        for sym, stat in rows:
-                            pair_perf.setdefault(sym, {'w': 0, 'l': 0})
-                            pair_perf[sym]['w' if 'TP' in stat else 'l'] += 1
-                        lines = []
-                        for sym, d in pair_perf.items():
-                            total = d['w'] + d['l']
-                            wr = (d['w'] / total * 100) if total else 0
-                            lines.append(f'• {sym}: {d["w"]}W/{d["l"]}L (WR: {wr:.1f}%)')
+                    elif command in ("/start", "/help"):
                         send_telegram(
-                            '🏆 <b>PERFORMA KOIN</b>\n' +
-                            ('\n'.join(lines) if lines else 'Belum ada')
+                            "🤖 <b>COMMANDS</b>\n"
+                            "• /cex on/off &lt;cex&gt; | /setapi &lt;cex&gt; &lt;api&gt; &lt;secret&gt;\n"
+                            "• /dryrun on/off\n"
+                            "• /posisi | /stat | /pairperf\n"
+                            "• /setting | /settings\n"
+                            "• /setmargin | /setlev | /setmaxpos\n"
+                            "• /setminwr | /setmintrades\n"
+                            "• /cancelall | /pause | /resume"
                         )
 
-                    # -------------------------------------------------
-                    # HELP / STAT / CONTROL
-                    # -------------------------------------------------
-                    elif command in ('/start', '/help'):
-                        send_telegram(
-                            '🤖 <b>COMMANDS</b>\n'
-                            '• /cex on/off <cex> | /setapi <cex> <api> <secret>\n'
-                            '• /dryrun on/off\n'
-                            '• /posisi | /stat | /pairperf\n'
-                            '• /setting | /settings\n'
-                            '• /setmargin | /setlev | /setmaxpos\n'
-                            '• /setminwr | /setmintrades\n'
-                            '• /cancelall | /pause | /resume'
-                        )
-
-                    elif command == '/pause':
+                    elif command == "/pause":
                         IS_BOT_PAUSED = True
-                        send_telegram('⏸️ Bot PAUSED')
+                        send_telegram("⏸️ Bot PAUSED")
 
-                    elif command == '/resume':
+                    elif command == "/resume":
                         IS_BOT_PAUSED = False
-                        send_telegram('▶️ Bot RESUMED')
+                        send_telegram("▶️ Bot RESUMED")
 
-                    elif command == '/cancelall':
+                    elif command == "/cancelall":
                         cancel_all_pending_orders_on_pause()
 
-                    elif command == '/stat':
-                        conn = sqlite3.connect(DB_FILE, timeout=5)
-                        rows = conn.cursor().execute(
-                            'SELECT status, COUNT(*) FROM trades GROUP BY status'
+                    elif command == "/stat":
+                        conn = sqlite3.connect(DB_FILE, timeout=3)
+                        rows = conn.execute(
+                            "SELECT status, COUNT(*) FROM trades GROUP BY status"
                         ).fetchall()
                         conn.close()
-                        stats = '\n'.join(f'• {s}: {n}' for s, n in rows)
-                        send_telegram(f'📈 <b>STATISTIK</b>\n\n{stats or "Belum ada data"}')
+                        stats = "\n".join(f"• {s}: {n}" for s, n in rows)
+                        send_telegram(
+                            f"📈 <b>STATISTIK</b>\n\n{stats or 'Belum ada data'}"
+                        )
+
+                    elif command == "/pairperf":
+                        conn = sqlite3.connect(DB_FILE, timeout=3)
+                        rows = conn.execute(
+                            "SELECT symbol, status FROM trades "
+                            "WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)')"
+                        ).fetchall()
+                        conn.close()
+
+                        perf = {}
+                        for sym, stat in rows:
+                            perf.setdefault(sym, {"w": 0, "l": 0})
+                            perf[sym]["w" if "TP" in stat else "l"] += 1
+
+                        lines = []
+                        for sym, d in perf.items():
+                            total = d["w"] + d["l"]
+                            wr = d["w"] / total * 100 if total else 0
+                            lines.append(
+                                f"• {sym}: {d['w']}W/{d['l']}L (WR: {wr:.1f}%)"
+                            )
+
+                        send_telegram(
+                            "🏆 <b>PERFORMA KOIN</b>\n" +
+                            ("\n".join(lines) if lines else "Belum ada")
+                        )
 
                     else:
-                        send_telegram(f'⚠️ Command tidak dikenal: <code>{raw_text[:100]}</code>')
+                        send_telegram(
+                            f"⚠️ Command tidak dikenal:\n<code>{raw[:200]}</code>"
+                        )
 
                 except Exception as cmd_error:
-                    print(f'[COMMAND ERROR] {raw_text}: {cmd_error}', flush=True)
+                    print(f"[COMMAND ERROR] {raw}: {cmd_error}", flush=True)
                     send_telegram(
-                        '⚠️ <b>COMMAND ERROR</b>\n'
-                        f'Command: <code>{raw_text[:200]}</code>\n'
-                        f'<code>{str(cmd_error)[:2500]}</code>'
+                        "⚠️ <b>COMMAND ERROR</b>\n"
+                        f"Command: <code>{raw[:200]}</code>\n"
+                        f"<code>{str(cmd_error)[:2500]}</code>"
                     )
 
         except Exception as poll_error:
-            print(f'[POLLING ERROR] {poll_error}', flush=True)
+            print(f"[POLLING ERROR] {poll_error}", flush=True)
             time.sleep(3)
 
-        time.sleep(0.5)
+        time.sleep(0.3)
 
 
 # =================================================================
@@ -980,7 +748,7 @@ def main_loop():
     global daily_sl_count, IS_BOT_PAUSED
 
     last_hb = time.time()
-    send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>")
+    send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>\n🔧 Telegram Command Engine: FINAL")
 
     while True:
         try:
