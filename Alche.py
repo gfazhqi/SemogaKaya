@@ -520,39 +520,41 @@ def is_allowed_chat(message_or_callback):
 
 
 def main_keyboard():
-    # Semua fitur yang memang sudah ada di script dipusatkan di inline keyboard.
+    # Tombol dibuat 1 baris penuh agar lebih besar dan mudah disentuh di HP.
+    # Telegram tidak menyediakan API untuk mengubah warna background inline button,
+    # jadi status/warna divisualisasikan dengan emoji.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"),
-         InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
-        [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings"),
-         InlineKeyboardButton(text="🏆 PAIR PERF", callback_data="pairperf")],
-        [InlineKeyboardButton(text="🏦 CEX", callback_data="cex_status"),
-         InlineKeyboardButton(text="🔐 API", callback_data="api_menu")],
-        [InlineKeyboardButton(text="⏯ BOT CONTROL", callback_data="bot_control")],
+        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions")],
+        [InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
+        [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings")],
+        [InlineKeyboardButton(text="🏆 PAIR PERFORMANCE", callback_data="pairperf")],
+        [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status")],
+        [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
+        [InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
     ])
 
 
 def bot_control_keyboard():
-    dry = "🧪 DRY RUN 🟢" if CONFIG['DRY_RUN'] else "🧪 DRY RUN 🔴"
-    pause = "▶️ RESUME" if IS_BOT_PAUSED else "⏸ PAUSE"
+    dry = "🟢 DRY RUN: ON" if CONFIG['DRY_RUN'] else "🔴 DRY RUN: OFF / REAL"
+    pause = "▶️ RESUME TRADING" if IS_BOT_PAUSED else "⏸️ PAUSE TRADING"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=dry, callback_data="dryrun_toggle")],
         [InlineKeyboardButton(text=pause, callback_data="resume" if IS_BOT_PAUSED else "pause")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
-        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
 
 
 def settings_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 MARGIN", callback_data="set_margin_menu"),
-         InlineKeyboardButton(text="📊 MAX POS", callback_data="set_maxpos_menu")],
-        [InlineKeyboardButton(text="🎯 MIN WR", callback_data="set_minwr_menu"),
-         InlineKeyboardButton(text="📈 MIN TRADES", callback_data="set_mintrades_menu")],
+        [InlineKeyboardButton(text="💵 MARGIN / TRADE", callback_data="set_margin_menu")],
+        [InlineKeyboardButton(text="📊 MAX POSISI", callback_data="set_maxpos_menu")],
+        [InlineKeyboardButton(text="🎯 MINIMUM WIN RATE", callback_data="set_minwr_menu")],
+        [InlineKeyboardButton(text="📈 MINIMUM TRADES", callback_data="set_mintrades_menu")],
         [InlineKeyboardButton(text="⚡ LEVERAGE", callback_data="set_lev_menu")],
-        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
 
 
@@ -566,15 +568,15 @@ def preset_keyboard(title, values, prefix, back="settings"):
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data=back)])
+    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data=back)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cex_api_keyboard():
     rows = []
     for ex_id in DEFAULT_CEX:
-        rows.append([InlineKeyboardButton(text=f"🔑 {ex_id.upper()}", callback_data=f"api_setup:{ex_id}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="api_menu")])
+        rows.append([InlineKeyboardButton(text=f"🔑 SET / GANTI {ex_id.upper()}", callback_data=f"api_setup:{ex_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="api_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -584,20 +586,19 @@ def cex_control_keyboard():
     for ex_id, enabled, api_key, account_label in db_rows:
         state = "🟢 ON" if enabled else "🔴 OFF"
         toggle_action = "off" if enabled else "on"
-        rows.append([
-            InlineKeyboardButton(text=f"{ex_id.upper()} {state}", callback_data=f"cex_toggle:{ex_id}:{toggle_action}"),
-            InlineKeyboardButton(text="🔑 API", callback_data=f"api_setup:{ex_id}")
-        ])
-    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="api_menu")])
+        label = account_label or "Akun belum terdeteksi"
+        rows.append([InlineKeyboardButton(text=f"{ex_id.upper()} — {state} | {label}", callback_data=f"cex_toggle:{ex_id}:{toggle_action}")])
+        rows.append([InlineKeyboardButton(text=f"🔑 API {ex_id.upper()}", callback_data=f"api_setup:{ex_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="api_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def api_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔑 Set / Ganti API", callback_data="api_setup_menu")],
+        [InlineKeyboardButton(text="🔑 SET / GANTI API", callback_data="api_setup_menu")],
         [InlineKeyboardButton(text="🏦 ON / OFF CEX", callback_data="cex_control")],
-        [InlineKeyboardButton(text="📋 Lihat API & Akun", callback_data="api_status")],
-        [InlineKeyboardButton(text="⬅️ Kembali", callback_data="menu")]
+        [InlineKeyboardButton(text="📋 LIHAT API & INFO AKUN", callback_data="api_status")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
 
 
@@ -605,11 +606,11 @@ def leverage_keyboard():
     rows = []
     for ex_id in DEFAULT_CEX:
         rows.append([InlineKeyboardButton(
-            text=f"⚡ {ex_id.upper()} ({CONFIG['LEVERAGE'].get(ex_id, 50)}x)",
+            text=f"⚡ {ex_id.upper()} — {CONFIG['LEVERAGE'].get(ex_id, 50)}x",
             callback_data=f"lev_ex:{ex_id}"
         )])
     rows.append([InlineKeyboardButton(text="⚡ SEMUA CEX", callback_data="lev_all")])
-    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="settings")])
+    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -622,7 +623,7 @@ def leverage_value_keyboard(target):
         if len(row) == 3:
             rows.append(row); row=[]
     if row: rows.append(row)
-    rows.append([InlineKeyboardButton(text="⬅️ Kembali", callback_data="set_lev_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="set_lev_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1662,7 +1663,9 @@ def api_stats():
             'wins': 0,
             'losses': 0,
             'net_pnl': 0,
-            'recent': []
+            'recent': [],
+            'daily_pnl': {},
+            'daily_trades': {}
         })
 
     margin = CONFIG.get('MARGIN_PER_TRADE', 2.0)
@@ -1670,9 +1673,27 @@ def api_stats():
         lambda x: margin if 'TP' in x else -margin
     )
     df['cum_pnl'] = df['pnl_value'].cumsum()
-    df['date_only'] = pd.to_datetime(
-        df['created_at']
-    ).dt.strftime('%d %b %H:%M')
+    dt = pd.to_datetime(df['created_at'], errors='coerce')
+    df['date_only'] = dt.dt.strftime('%d %b %H:%M')
+    df['day_key'] = dt.dt.strftime('%Y-%m-%d')
+
+    # Daily PnL for the calendar heatmap.
+    daily = (
+        df.dropna(subset=['day_key'])
+          .groupby('day_key', as_index=False)['pnl_value']
+          .sum()
+    )
+    daily_pnl = {
+        str(row['day_key']): round(float(row['pnl_value']), 2)
+        for _, row in daily.iterrows()
+    }
+    daily_trades = (
+        df.dropna(subset=['day_key'])
+          .groupby('day_key')
+          .size()
+          .to_dict()
+    )
+    daily_trades = {str(k): int(v) for k, v in daily_trades.items()}
 
     wins = len(df[df['status'] == 'CLOSED (TP)'])
     losses = len(df[df['status'] == 'CLOSED (SL)'])
@@ -1689,7 +1710,9 @@ def api_stats():
         'wins': wins,
         'losses': losses,
         'net_pnl': net_pnl,
-        'recent': recent
+        'recent': recent,
+        'daily_pnl': daily_pnl,
+        'daily_trades': daily_trades
     })
 
 
