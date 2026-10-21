@@ -71,6 +71,10 @@ ERROR_COOLDOWN = 300
 last_runtime_status = None
 ERROR_HISTORY = []
 ERROR_HISTORY_MAX = 50
+BOT_STARTED_AT = time.time()
+EXCHANGE_RUNTIME = {}
+LAST_EVENT_TEXT = 'Bot initialized'
+LAST_EVENT_TIME = time.time()
 
 # =================================================================
 # DATABASE & SETTINGS
@@ -656,6 +660,80 @@ def update_orders_and_positions():
 
 
 # =================================================================
+# RUNTIME MONITORING
+# =================================================================
+def set_runtime_event(text):
+    global LAST_EVENT_TEXT, LAST_EVENT_TIME
+    LAST_EVENT_TEXT = str(text)[:500]
+    LAST_EVENT_TIME = time.time()
+
+
+def _fmt_uptime(seconds):
+    seconds = max(0, int(seconds))
+    d, seconds = divmod(seconds, 86400)
+    h, seconds = divmod(seconds, 3600)
+    m, _ = divmod(seconds, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    return f"{h:02d}h {m:02d}m"
+
+
+def build_runtime_status_text():
+    mode = '🧪 DRY RUN' if CONFIG.get('DRY_RUN', True) else '⚠️ REAL'
+    engine = '⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'
+    kill = '🟢 ACTIVE' if is_kill_zone() else '🔴 INACTIVE'
+    pending = db_read("SELECT COUNT(*) FROM trades WHERE status='PENDING'")[0][0]
+    opened = db_read("SELECT COUNT(*) FROM trades WHERE status='OPEN'")[0][0]
+    total_today = db_read(
+        "SELECT COUNT(*) FROM trades WHERE created_at >= date('now','start of day')"
+    )[0][0]
+    lines = [
+        "🤖 <b>ALCHEMIST — RUNTIME STATUS</b>",
+        "",
+        f"{engine} | {mode}",
+        f"⏱ Uptime: {_fmt_uptime(time.time() - BOT_STARTED_AT)}",
+        f"🧠 Strategy: SMC M15 / H1 / D1",
+        f"🕐 Kill Zone: {kill}",
+        "",
+        "🔎 <b>SCANNER PER CEX</b>",
+    ]
+    if EXCHANGE_RUNTIME:
+        for ex_id in sorted(EXCHANGE_RUNTIME):
+            st = EXCHANGE_RUNTIME[ex_id]
+            state = st.get('state', 'IDLE')
+            icon = '🟢' if state == 'SCANNING' else ('⚠️' if state == 'ERROR' else '⏸')
+            last = st.get('last_scan', '-')
+            reason = st.get('last_reason', '')
+            line = f"• {ex_id.upper()}: {icon} {state} | Last: {last}"
+            if reason:
+                line += f"\n  ↳ {html.escape(reason[:140])}"
+            lines.append(line)
+    else:
+        lines.append('• Belum ada CEX aktif.')
+
+    lines += [
+        "",
+        "📊 <b>TRADE</b>",
+        f"• OPEN: {opened} | PENDING: {pending}",
+        f"• Today created: {total_today}",
+        f"• Daily SL: {daily_sl_count}/{MAX_DAILY_SL} "
+        f"({'🟢 ON' if CONFIG.get('DAILY_LOSS_LIMIT', True) else '🔴 OFF'})",
+        "",
+        f"⚠️ Last event: {html.escape(LAST_EVENT_TEXT[:220])}",
+        f"🕒 {datetime.fromtimestamp(LAST_EVENT_TIME, WIB).strftime('%d/%m/%Y %H:%M:%S')}",
+    ]
+    return "\n".join(lines)
+
+
+def runtime_status_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 REFRESH", callback_data="runtime_status")],
+        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions")],
+        [InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
+    ])
+
+# =================================================================
 # MARKET SCANNER
 # =================================================================
 # LOGIC TRADE TIDAK DIUBAH
@@ -708,11 +786,15 @@ def _valid_usdt_swap_symbols(ex_id, ex):
 
 def _scan_one_exchange(ex_id, ex, pair_perf):
     now = time.time()
+    runtime = EXCHANGE_RUNTIME.setdefault(ex_id, {'state': 'IDLE', 'last_scan': '-', 'last_reason': '', 'signals': 0, 'created': 0})
+    runtime['state'] = 'SCANNING'
     if now < EXCHANGE_SCAN_NEXT.get(ex_id, 0):
         return 0
 
     try:
         symbols = _valid_usdt_swap_symbols(ex_id, ex)
+        runtime['last_scan'] = datetime.now(WIB).strftime('%H:%M:%S')
+        runtime['last_reason'] = f'{len(symbols)} valid USDT perpetual markets'
         if not symbols:
             EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
             return 0
@@ -727,6 +809,7 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
 
         closed_candle_ts = probe_bars[-2][0]
         if EXCHANGE_LAST_CANDLE.get(ex_id) == closed_candle_ts:
+            runtime['last_reason'] = 'Menunggu candle M15 baru'
             EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
             return 0
 
@@ -743,6 +826,7 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
         slots = max(0, CONFIG['MAX_CONCURRENT_POSITIONS'] - active_count)
 
         if slots <= 0:
+            runtime['last_reason'] = 'Max posisi CEX tercapai'
             EXCHANGE_SCAN_NEXT[ex_id] = now + SCANNER_MIN_INTERVAL
             return 0
 
@@ -796,6 +880,7 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
             )
 
             if not sig or en <= 0:
+                runtime['last_reason'] = f'{sym}: no setup / filter'
                 continue
 
             # Avoid duplicate setup on the same exchange/pair/side.
@@ -806,6 +891,7 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                 (ex_id, sym, sig)
             )
             if exists:
+                runtime['last_reason'] = f'{sym}: duplicate setup'
                 continue
 
             lev = CONFIG['LEVERAGE'].get(ex_id, 50)
@@ -854,18 +940,29 @@ def _scan_one_exchange(ex_id, ex, pair_perf):
                 f"Entry: {en:.5f}"
             )
             created += 1
+            runtime['signals'] = runtime.get('signals', 0) + 1
+            runtime['created'] = runtime.get('created', 0) + 1
+            runtime['last_reason'] = f'{sym}: {sig} setup created'
+            set_runtime_event(f'{ex_id.upper()} {sym} {sig} setup created')
 
+        runtime['state'] = 'SCANNING'
         EXCHANGE_SCAN_NEXT[ex_id] = time.time() + SCANNER_MIN_INTERVAL
         return created
 
     except Exception as e:
         if _is_retryable_market_error(ex_id, e):
+            runtime['state'] = 'ERROR'
+            runtime['last_reason'] = f'Cooldown/rate limit: {str(e)[:120]}'
+            set_runtime_event(f'{ex_id.upper()} cooldown/rate-limit')
             EXCHANGE_SCAN_NEXT[ex_id] = time.time() + BINGX_BACKOFF_SECONDS
             send_error_alert(
                 f"Scan Ex [{ex_id}]: market data cooldown {BINGX_BACKOFF_SECONDS}s "
                 f"({str(e)[:500]})"
             )
         else:
+            runtime['state'] = 'ERROR'
+            runtime['last_reason'] = str(e)[:160]
+            set_runtime_event(f'{ex_id.upper()} scanner error')
             EXCHANGE_SCAN_NEXT[ex_id] = time.time() + SCANNER_MIN_INTERVAL
             send_error_alert(f"Scan Ex [{ex_id}]: {e}")
         return 0
@@ -924,6 +1021,7 @@ def main_keyboard():
         [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings")],
         [InlineKeyboardButton(text="🏆 PAIR PERFORMANCE", callback_data="pairperf")],
         [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status")],
+        [InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
         [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
         [InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
@@ -939,7 +1037,9 @@ def bot_control_keyboard():
         [InlineKeyboardButton(text=dry, callback_data="dryrun_toggle")],
         [InlineKeyboardButton(text=loss, callback_data="daily_loss_toggle")],
         [InlineKeyboardButton(text=pause, callback_data="resume" if IS_BOT_PAUSED else "pause")],
-        [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
+        [InlineKeyboardButton(text="🧹 CANCEL ALL PENDING", callback_data="cancelall")],
+        [InlineKeyboardButton(text="🚨 CLOSE ALL OPEN", callback_data="closeallopen")],
+        [InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
         [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
 
@@ -1911,6 +2011,14 @@ async def cb_resume(callback: CallbackQuery):
     await callback.message.edit_text("▶️ <b>Bot RESUMED</b>\nBot kembali aktif.", reply_markup=main_keyboard())
 
 
+@dp.callback_query(F.data == "runtime_status")
+async def cb_runtime_status(callback: CallbackQuery):
+    if not is_allowed_chat(callback):
+        return
+    await safe_answer(callback)
+    await callback.message.edit_text(build_runtime_status_text(), reply_markup=runtime_status_keyboard())
+
+
 @dp.callback_query(F.data == "bot_control")
 async def cb_bot_control(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
@@ -2379,6 +2487,11 @@ def api_engine_status():
             'active_cex': len(exchanges),
             'daily_sl': int(daily_sl_count),
             'max_daily_sl': int(MAX_DAILY_SL),
+            'open_positions': db_read("SELECT COUNT(*) FROM trades WHERE status='OPEN'")[0][0],
+            'pending_orders': db_read("SELECT COUNT(*) FROM trades WHERE status='PENDING'")[0][0],
+            'uptime_seconds': int(time.time() - BOT_STARTED_AT),
+            'last_event': LAST_EVENT_TEXT,
+            'exchange_runtime': EXCHANGE_RUNTIME,
             'updated': datetime.now(WIB).strftime('%d/%m/%Y %H:%M:%S')
         })
     except Exception as e:
@@ -2392,6 +2505,7 @@ def api_errors():
 
 def notify_runtime_status(new_status, text):
     global last_runtime_status
+    set_runtime_event(new_status)
     if last_runtime_status != new_status:
         last_runtime_status = new_status
         send_telegram(text)
@@ -2442,6 +2556,7 @@ def main_loop():
                         "🔎 <b>SCANNING MARKET</b>\nBot sedang mencari setup sesuai logic SMC yang ada."
                     )
                     scan_markets()
+                    set_runtime_event('Scanning selesai / menunggu candle berikutnya')
             else:
                 notify_runtime_status(
                     'WAITING',
