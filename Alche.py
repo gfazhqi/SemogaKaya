@@ -76,6 +76,17 @@ def init_db():
         status TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )''')
+    # Lifecycle tracking fields. These do NOT change the strategy/entry logic.
+    for col, definition in (
+        ('last_price', 'REAL'),
+        ('last_bar_ts', 'INTEGER DEFAULT 0'),
+        ('filled_at', 'TIMESTAMP'),
+        ('entry_bar_ts', 'INTEGER DEFAULT 0'),
+    ):
+        try:
+            c.execute(f"ALTER TABLE trades ADD COLUMN {col} {definition}")
+        except sqlite3.OperationalError:
+            pass
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value REAL
@@ -298,83 +309,244 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
     return sig, en, sl, tp
 
 
+def _safe_fetch_1m_candle(ex, symbol):
+    """Return the latest 1m OHLC candle when the exchange supports it."""
+    try:
+        rows = ex.fetch_ohlcv(symbol, '1m', limit=2)
+        if rows:
+            return rows[-1]
+    except Exception:
+        pass
+    return None
+
+
+def _latest_closed_15m_ts(ex, symbol):
+    """Return the timestamp of the latest closed 15m candle for bar aging."""
+    try:
+        rows = ex.fetch_ohlcv(symbol, '15m', limit=3)
+        if len(rows) >= 2:
+            # The last row is normally the currently forming candle.
+            return int(rows[-2][0])
+    except Exception:
+        pass
+    return None
+
+
+def _mark_trade_status(c, t_id, status, bars, filled_at=None, last_price=None, last_bar_ts=None, entry_bar_ts=None):
+    c.execute(
+        "UPDATE trades SET status=?, bars_count=?, filled_at=COALESCE(?, filled_at), "
+        "last_price=COALESCE(?, last_price), last_bar_ts=COALESCE(?, last_bar_ts), "
+        "entry_bar_ts=COALESCE(?, entry_bar_ts) WHERE id=?",
+        (status, bars, filled_at, last_price, last_bar_ts, entry_bar_ts, t_id)
+    )
+
+
 def update_orders_and_positions():
+    """Manage pending/open trades without changing the existing SMC entry logic.
+
+    Important fixes:
+    - DRY RUN uses 1m high/low instead of only one ticker snapshot.
+    - Entry is checked before TP/SL when a candle touches the entry area.
+      This prevents false 'MISSED (TP First)' when entry and TP occur in the
+      same polling interval.
+    - bars_count now represents actual 15m candles, not 15-second loops.
+    - Duplicate/ambiguous transitions are avoided by persisting lifecycle state.
+    """
     conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
 
     rows = c.execute(
         "SELECT id, exchange_id, symbol, side, entry_price, sl_price, "
-        "tp_price, order_id, bars_count, status "
+        "tp_price, order_id, bars_count, status, last_price, last_bar_ts, filled_at, entry_bar_ts "
         "FROM trades WHERE status IN ('PENDING', 'OPEN')"
     ).fetchall()
 
-    for t_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status in rows:
+    for t_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, last_price, last_bar_ts, filled_at, entry_bar_ts in rows:
         if ex_id not in exchanges:
             continue
 
         try:
-            curr_price = exchanges[ex_id].fetch_ticker(sym)['last']
-            n_bars, is_sim = bars + 1, str(ord_id).startswith('sim_')
+            ex = exchanges[ex_id]
+            ticker = ex.fetch_ticker(sym)
+            curr_price = ticker.get('last')
+            if curr_price is None:
+                continue
+            curr_price = float(curr_price)
+
+            is_sim = str(ord_id).startswith('sim_')
             tag = " (DRY RUN)" if is_sim else ""
 
+            # Use 1m OHLC for DRY RUN lifecycle decisions. If unavailable,
+            # safely fall back to the ticker price.
+            candle = _safe_fetch_1m_candle(ex, sym) if is_sim else None
+            if candle:
+                candle_ts, candle_open, candle_high, candle_low, candle_close = map(float, candle[:5])
+                candle_ts = int(candle_ts)
+            else:
+                candle_ts = None
+                candle_open = candle_high = candle_low = candle_close = curr_price
+
+            closed_15m_ts = _latest_closed_15m_ts(ex, sym)
+            n_bars = bars
+            if closed_15m_ts is not None and int(closed_15m_ts) != int(last_bar_ts or 0):
+                # Only count a new closed 15m candle once.
+                n_bars = bars + 1
+                c.execute(
+                    "UPDATE trades SET bars_count=?, last_bar_ts=? WHERE id=?",
+                    (n_bars, int(closed_15m_ts), t_id)
+                )
+
             if status == 'PENDING':
-                n_stat = 'PENDING'
+                entry_touched = False
+                tp_touched = False
+                sl_touched = False
 
-                if (side == 'BUY' and curr_price <= en) or (side == 'SELL' and curr_price >= en):
-                    n_stat = 'OPEN'
-                    send_telegram(f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!")
+                if is_sim and candle:
+                    entry_touched = candle_low <= en <= candle_high
+                    if side == 'BUY':
+                        tp_touched = candle_high >= tp
+                        sl_touched = candle_low <= sl
+                    else:
+                        tp_touched = candle_low <= tp
+                        sl_touched = candle_high >= sl
+                else:
+                    # Real order: prefer the exchange's actual order state.
+                    try:
+                        order = ex.fetch_order(ord_id, sym)
+                        order_status = str(order.get('status', '')).lower()
+                        filled_amount = float(order.get('filled') or 0)
+                        if order_status in ('closed',) or filled_amount > 0:
+                            entry_touched = True
+                        elif order_status in ('canceled', 'cancelled', 'expired', 'rejected'):
+                            n_stat = f'CANCELLED ({order_status.upper()})'
+                            _mark_trade_status(
+                                c, t_id, n_stat, n_bars,
+                                last_price=curr_price,
+                                last_bar_ts=closed_15m_ts
+                            )
+                            send_telegram(
+                                f"⚪ <b>ORDER CANCELED</b> {sym} di {ex_id.upper()}\n"
+                                f"Status exchange: {order_status.upper()}"
+                            )
+                            continue
+                    except Exception:
+                        # Fallback only if the exchange does not expose fetch_order.
+                        entry_touched = (
+                            (side == 'BUY' and curr_price <= en) or
+                            (side == 'SELL' and curr_price >= en)
+                        )
 
-                elif side == 'BUY':
-                    if curr_price >= tp:
-                        n_stat = 'MISSED (TP First)'
-                    elif curr_price <= sl:
-                        n_stat = 'CANCELLED (SL First)'
-                    elif n_bars > 30:
-                        n_stat = 'INVALID (>30 Bars)'
+                    if side == 'BUY':
+                        tp_touched = curr_price >= tp
+                        sl_touched = curr_price <= sl
+                    else:
+                        tp_touched = curr_price <= tp
+                        sl_touched = curr_price >= sl
 
-                elif side == 'SELL':
-                    if curr_price <= tp:
-                        n_stat = 'MISSED (TP First)'
-                    elif curr_price >= sl:
-                        n_stat = 'CANCELLED (SL First)'
-                    elif n_bars > 30:
-                        n_stat = 'INVALID (>30 Bars)'
-
-                if n_stat != 'PENDING':
-                    if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
-                        try:
-                            exchanges[ex_id].cancel_order(ord_id, sym)
-                        except Exception:
-                            pass
-
-                    send_telegram(f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\nAlasan: {n_stat}")
-                    c.execute(
-                        "UPDATE trades SET status=?, bars_count=? WHERE id=?",
-                        (n_stat, n_bars, t_id)
+                # IMPORTANT: entry wins over TP/SL when the same 1m candle
+                # contains the entry. We cannot know the exact intrabar path,
+                # so treating the setup as filled is safer than falsely calling
+                # it MISSED before an entry was ever recorded.
+                if entry_touched:
+                    now_stamp = datetime.now(WIB).strftime('%Y-%m-%d %H:%M:%S')
+                    _mark_trade_status(
+                        c, t_id, 'OPEN', n_bars,
+                        filled_at=now_stamp,
+                        last_price=curr_price,
+                        last_bar_ts=closed_15m_ts,
+                        entry_bar_ts=candle_ts
                     )
+                    send_telegram(
+                        f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!\n"
+                        f"Entry: {en:.8f}"
+                    )
+                    continue
+
+                # Only classify as missed when price actually crossed TP
+                # without ever touching the entry area.
+                if tp_touched:
+                    n_stat = 'MISSED (TP First)'
+                elif sl_touched:
+                    n_stat = 'CANCELLED (SL First)'
+                elif n_bars > 30:
+                    n_stat = 'INVALID (>30 Bars)'
                 else:
                     c.execute(
-                        "UPDATE trades SET bars_count=? WHERE id=?",
-                        (n_bars, t_id)
+                        "UPDATE trades SET last_price=?, bars_count=?, last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
+                        (curr_price, n_bars, closed_15m_ts, t_id)
                     )
+                    continue
+
+                if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
+                    try:
+                        ex.cancel_order(ord_id, sym)
+                    except Exception:
+                        pass
+
+                _mark_trade_status(
+                    c, t_id, n_stat, n_bars,
+                    last_price=curr_price,
+                    last_bar_ts=closed_15m_ts
+                )
+                send_telegram(
+                    f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\n"
+                    f"Alasan: {n_stat}"
+                )
 
             elif status == 'OPEN':
-                if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
+                # Never evaluate the full 1m candle that triggered a simulated
+                # entry again. Its high/low may have occurred before the entry.
+                if is_sim and candle_ts is not None and entry_bar_ts and int(candle_ts) == int(entry_bar_ts):
                     c.execute(
-                        "UPDATE trades SET status='CLOSED (TP)' WHERE id=?",
-                        (t_id,)
+                        "UPDATE trades SET last_price=?, bars_count=?, last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
+                        (curr_price, n_bars, closed_15m_ts, t_id)
+                    )
+                    continue
+
+                # For DRY RUN, use candle extremes so a 15-second polling gap
+                # cannot hide a genuine SL/TP touch.
+                if is_sim and candle:
+                    hit_tp = (candle_high >= tp) if side == 'BUY' else (candle_low <= tp)
+                    hit_sl = (candle_low <= sl) if side == 'BUY' else (candle_high >= sl)
+                else:
+                    hit_tp = (curr_price >= tp) if side == 'BUY' else (curr_price <= tp)
+                    hit_sl = (curr_price <= sl) if side == 'BUY' else (curr_price >= sl)
+
+                # If both TP and SL are inside the same 1m candle, OHLC alone
+                # cannot reveal the exact sequence. Use the candle direction
+                # as a deterministic tie-breaker instead of always awarding TP.
+                if hit_tp and hit_sl and is_sim and candle:
+                    if side == 'BUY':
+                        hit_tp = candle_close >= candle_open
+                        hit_sl = not hit_tp
+                    else:
+                        hit_tp = candle_close <= candle_open
+                        hit_sl = not hit_tp
+
+                if hit_tp:
+                    _mark_trade_status(
+                        c, t_id, 'CLOSED (TP)', n_bars,
+                        last_price=curr_price,
+                        last_bar_ts=closed_15m_ts
                     )
                     send_telegram(f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | +1R 🚀")
 
-                elif (side == 'BUY' and curr_price <= sl) or (side == 'SELL' and curr_price >= sl):
-                    c.execute(
-                        "UPDATE trades SET status='CLOSED (SL)' WHERE id=?",
-                        (t_id,)
+                elif hit_sl:
+                    _mark_trade_status(
+                        c, t_id, 'CLOSED (SL)', n_bars,
+                        last_price=curr_price,
+                        last_bar_ts=closed_15m_ts
                     )
                     send_telegram(f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻")
+                else:
+                    c.execute(
+                        "UPDATE trades SET last_price=?, bars_count=?, last_bar_ts=COALESCE(?, last_bar_ts) WHERE id=?",
+                        (curr_price, n_bars, closed_15m_ts, t_id)
+                    )
 
-        except Exception:
-            pass
+        except Exception as e:
+            # Do not kill the whole lifecycle loop because one symbol/CEX failed.
+            send_error_alert(f"Lifecycle [{ex_id} {sym}]: {e}")
 
     conn.commit()
     conn.close()
@@ -450,6 +622,20 @@ def scan_markets():
                 )
 
                 if sig:
+                    # Do not create duplicate orders for the same pair while an
+                    # existing setup is still pending/open. This does not alter
+                    # the SMC signal itself; it only prevents duplicate lifecycle
+                    # records during the 15-second scan loop.
+                    existing = sqlite3.connect(DB_FILE, timeout=10)
+                    already_active = existing.cursor().execute(
+                        "SELECT 1 FROM trades WHERE exchange_id=? AND symbol=? "
+                        "AND status IN ('PENDING', 'OPEN') LIMIT 1",
+                        (ex_id, sym)
+                    ).fetchone()
+                    existing.close()
+                    if already_active:
+                        continue
+
                     lev = CONFIG['LEVERAGE'].get(ex_id, 50)
                     qty = (CONFIG['MARGIN_PER_TRADE'] * lev) / en
                     mode = "[DRY RUN]" if CONFIG['DRY_RUN'] else "[REAL TRADE]"
