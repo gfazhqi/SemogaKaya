@@ -955,17 +955,13 @@ async def cb_resume(callback: CallbackQuery):
 
 
 async def aiogram_polling():
+    # IMPORTANT: Aiogram polling runs in the MAIN THREAD.
+    # Python signal handlers cannot be installed from a worker thread.
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
-
-def telegram_polling():
-    """Run Aiogram polling in its own thread. Trading logic remains separate."""
-    try:
-        asyncio.run(aiogram_polling())
-    except Exception as e:
-        print(f"[AIOGRAM ERROR] {e}", flush=True)
-        send_error_alert(f"Aiogram polling: {e}")
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types()
+    )
 
 
 # =================================================================
@@ -1061,22 +1057,46 @@ def main_loop():
         time.sleep(15)
 
 
-if __name__ == '__main__':
+async def app_main():
+    # Initialize shared state before any worker starts.
     init_db()
     load_settings()
     reload_exchanges()
 
+    # Trading engine runs in a worker thread.
     threading.Thread(
-        target=telegram_polling,
+        target=main_loop,
+        name='trading-engine',
         daemon=True
     ).start()
 
+    # Flask runs in a worker thread. use_reloader=False prevents Flask
+    # from spawning a second process/thread and interfering with the bot.
     threading.Thread(
         target=lambda: app.run(
             host='0.0.0.0',
-            port=5000
+            port=5000,
+            use_reloader=False
         ),
+        name='flask-dashboard',
         daemon=True
     ).start()
 
-    main_loop()
+    # Aiogram MUST stay in the main thread.
+    try:
+        await aiogram_polling()
+    finally:
+        await bot.session.close()
+
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(app_main())
+    except (KeyboardInterrupt, SystemExit):
+        print('ALCHEMIST stopped.', flush=True)
+    except Exception as e:
+        print(f'[FATAL] {e}', flush=True)
+        try:
+            send_error_alert(f'FATAL: {e}')
+        except Exception:
+            pass
