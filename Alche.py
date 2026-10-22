@@ -69,7 +69,7 @@ DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
 # ===== FIX CONSTANTS =====
-MAX_PENDING_BARS = 20
+MAX_PENDING_BARS = 4            # FIX: 4 bar M15 = 1 Jam (sebelumnya 20 bar / 5 jam)
 POSITION_MODE_CACHE = {}
 POSITION_MODE_CACHE_TTL = 3600
 ORDER_UNKNOWN_COUNT = {}
@@ -514,22 +514,26 @@ def cancel_all_pending_orders_on_pause(user_id='OWNER'):
                         except ccxt.OrderNotFound:
                             pass # Order sudah tidak ada, cancel sukses
                         except Exception as e:
-                            try:
-                                ord_state = exchanges[ex_key].fetch_order(str(ord_id), sym)
-                                st = str(ord_state.get('status') or '').lower()
-                                if st in ('closed', 'filled'):
+                            err_str = str(e).lower()
+                            if "110001" in err_str or "not exists" in err_str or "not found" in err_str or "does not exist" in err_str:
+                                pass # Treated as success
+                            else:
+                                try:
+                                    ord_state = exchanges[ex_key].fetch_order(str(ord_id), sym)
+                                    st = str(ord_state.get('status') or '').lower()
+                                    if st in ('closed', 'filled'):
+                                        real_cancel_ok = False
+                                        failed_cancels.append(f"{sym} ({ex_id}): order sudah FILLED — tidak bisa cancel")
+                                    elif st in ('canceled', 'cancelled', 'expired', 'rejected'):
+                                        pass
+                                    else:
+                                        real_cancel_ok = False
+                                        failed_cancels.append(f"{sym} ({ex_id}): cancel gagal ({e})")
+                                except ccxt.OrderNotFound:
+                                    pass # Order sudah tidak ada
+                                except Exception:
                                     real_cancel_ok = False
-                                    failed_cancels.append(f"{sym} ({ex_id}): order sudah FILLED — tidak bisa cancel")
-                                elif st in ('canceled', 'cancelled', 'expired', 'rejected'):
-                                    pass
-                                else:
-                                    real_cancel_ok = False
-                                    failed_cancels.append(f"{sym} ({ex_id}): cancel gagal ({e})")
-                            except ccxt.OrderNotFound:
-                                pass # Order sudah tidak ada
-                            except Exception:
-                                real_cancel_ok = False
-                                failed_cancels.append(f"{sym} ({ex_id}): cancel gagal & verifikasi gagal ({e})")
+                                    failed_cancels.append(f"{sym} ({ex_id}): cancel gagal & verifikasi gagal ({e})")
                     if real_cancel_ok:
                         cur = c.execute("UPDATE trades SET status='CANCELLED (Auto/Manual)' WHERE id=? AND status='PENDING'", (t_id,))
                         changed += cur.rowcount
@@ -721,7 +725,13 @@ def _real_exchange_order_state(ex_instance, symbol, order_id):
         return "UNKNOWN"
     except ccxt.OrderNotFound:
         ORDER_UNKNOWN_COUNT.pop(str(order_id), None); return "FILLED_OR_CANCELLED"
-    except Exception:
+    except Exception as e:
+        # FIX: Deteksi teks error Bybit manual jika CCXT tidak melempar OrderNotFound
+        err_str = str(e).lower()
+        if "110001" in err_str or "not exists" in err_str or "not found" in err_str or "does not exist" in err_str:
+            ORDER_UNKNOWN_COUNT.pop(str(order_id), None)
+            return "FILLED_OR_CANCELLED"
+
         cnt = ORDER_UNKNOWN_COUNT.get(str(order_id), 0) + 1
         ORDER_UNKNOWN_COUNT[str(order_id)] = cnt
         if cnt == 5:
@@ -763,8 +773,12 @@ def update_orders_and_positions():
                                 try: ex.cancel_order(str(ord_id), sym)
                                 except ccxt.OrderNotFound: pass
                                 except Exception as e:
-                                    cancel_ok = False
-                                    send_error_alert(f"Timeout cancel {ex_id}/{sym} order={ord_id}: {e}")
+                                    err_str = str(e).lower()
+                                    if "110001" in err_str or "not exists" in err_str or "not found" in err_str or "does not exist" in err_str:
+                                        pass
+                                    else:
+                                        cancel_ok = False
+                                        send_error_alert(f"Timeout cancel {ex_id}/{sym} order={ord_id}: {e}")
                             if cancel_ok:
                                 c.execute("UPDATE trades SET status='CANCELLED (Timeout)', bars_count=? WHERE id=? AND status='PENDING'", (n_bars, t_id))
                                 if c.rowcount:
