@@ -56,9 +56,10 @@ EXCHANGE_SCAN_CURSOR = {}
 EXCHANGE_LAST_CANDLE = {}
 EXCHANGE_MARKETS = {}
 EXCHANGE_REQUEST_NEXT = {}
+SYMBOL_COOLDOWN = {}             # FIX: Cooldown per pair (30 menit) agar tidak spam order
 IS_BOT_PAUSED = False
 daily_sl_count = 0
-SCANNER_MIN_INTERVAL = 5         # FIX: Scanner lebih cepat (5 detik)
+SCANNER_MIN_INTERVAL = 5         # Scan berjalan tiap 5 detik
 BINGX_REQUEST_SPACING = 0.35
 MAX_DAILY_SL = 3
 SL_BUFFER_PERCENT = 0.001
@@ -619,7 +620,6 @@ def check_and_update_daily_sl():
 # SMC STRATEGY
 # =================================================================
 def analyze_smc_retrace(df_m15, df_h1, daily_open):
-    # GUARD: Pastikan data cukup (minimal 7 baris untuk M15, 2 baris untuk H1)
     if len(df_m15) < 7 or len(df_h1) < 2:
         return None, 0.0, 0.0, 0.0
 
@@ -1345,13 +1345,13 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         runtime['last_reason'] = f'{len(symbols)} valid USDT perpetual markets'
         if not symbols:
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
-        if ex_id == 'bingx':
-            batch_size = 15 # FIX: Batch size lebih besar
-            cursor = EXCHANGE_SCAN_CURSOR.get(exchange_key, 0) % len(symbols)
-            scan_symbols = [symbols[(cursor + i) % len(symbols)] for i in range(min(batch_size, len(symbols)))]
-            EXCHANGE_SCAN_CURSOR[exchange_key] = (cursor + len(scan_symbols)) % len(symbols)
-        else:
-            scan_symbols = symbols
+        
+        # ROTATING SCAN: Scan 40 koin per cycle agar cepat & tidak kena limit
+        batch_size = 40
+        cursor = EXCHANGE_SCAN_CURSOR.get(exchange_key, 0) % len(symbols)
+        scan_symbols = [symbols[(cursor + i) % len(symbols)] for i in range(min(batch_size, len(symbols)))]
+        EXCHANGE_SCAN_CURSOR[exchange_key] = (cursor + len(scan_symbols)) % len(symbols)
+
         user_is_owner = (str(user_id) == 'OWNER')
         if not user_is_owner and get_vip_member(user_id) is None:
             runtime['last_reason'] = 'VIP tidak aktif / expired'
@@ -1365,7 +1365,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             runtime['last_reason'] = 'VIP Auto Trade OFF'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
         
-        # ===== CEK MAX POSISI UNTUK REAL MONEY SAJA =====
+        # CEK MAX POSISI UNTUK REAL MONEY SAJA
         dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
         
         active_count = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')", (user_id, ex_id))[0][0]
@@ -1409,6 +1409,10 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         for sym in scan_symbols:
             if is_manual_alert_symbol(sym): continue
             if sym in cycle_created_symbols: continue 
+            
+            # CEK COOLDOWN: Jika koin ini baru entry, jangan di-scan dulu (30 menit)
+            cooldown_until = SYMBOL_COOLDOWN.get(sym, 0)
+            if now < cooldown_until: continue
             
             try:
                 if ex_id == 'bingx':
@@ -1476,6 +1480,9 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 if user_is_owner:
                     _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
             except Exception: pass
+
+            # SET COOLDOWN 30 MENIT (1800 detik)
+            SYMBOL_COOLDOWN[sym] = time.time() + 1800
 
             if not can_open_trade:
                 runtime['last_reason'] = f'{sym}: {sig} signal generated (No Open)'
@@ -2005,7 +2012,6 @@ def build_stats_text(user_id='OWNER'):
     )
 
 def build_pairperf_text():
-    # FIX: Wrap dengan try-except agar jika ada data aneh bot tidak crash
     try:
         rows = db_read("SELECT symbol, status FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')")
         pair_perf = {}
