@@ -77,6 +77,7 @@ MARGIN_MODE_SET = set()
 PUBLIC_SIGNAL_MAX_AGE = 7 * 86400
 LEVERAGE_TIERS_CACHE = {}       # {ex_id::symbol: (max_lev, timestamp)}
 LEVERAGE_TIERS_CACHE_TTL = 3600  # 1 jam
+NEWS_CACHE = {'last_fetch': 0, 'events': []}
 
 def _table_columns(conn, table):
     return {row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()}
@@ -355,6 +356,40 @@ def update_db_setting(key, value):
     conn.close()
 
 # =================================================================
+# NEWS FILTER (FOREXFACTORY)
+# =================================================================
+def _fetch_news_calendar():
+    now = time.time()
+    if now - NEWS_CACHE['last_fetch'] < 3600 and NEWS_CACHE['events']: return
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            events = []
+            for item in data:
+                if item.get('impact') == 'High' and item.get('country') == 'USD':
+                    dt_str = item.get('date')
+                    if dt_str:
+                        dt_str = dt_str.replace('Z', '+00:00')
+                        try:
+                            dt = datetime.fromisoformat(dt_str)
+                            events.append(dt)
+                        except: pass
+            NEWS_CACHE['events'] = events
+            NEWS_CACHE['last_fetch'] = now
+    except Exception: pass
+
+def is_news_time():
+    _fetch_news_calendar()
+    now = datetime.now(timezone.utc)
+    for event_dt in NEWS_CACHE['events']:
+        diff = abs((now - event_dt).total_seconds())
+        if diff <= 1800: # 30 minutes before/after
+            return True, event_dt.astimezone(WIB).strftime('%H:%M')
+    return False, None
+
+# =================================================================
 # BACKUP / TEMP
 # =================================================================
 BACKUP_MESSAGE_TTL_SECONDS = 300
@@ -526,11 +561,11 @@ def cancel_all_pending_orders_on_pause(user_id='OWNER'):
                         try:
                             exchanges[ex_key].cancel_order(ord_id, sym)
                         except ccxt.OrderNotFound:
-                            pass # Order sudah tidak ada, cancel sukses
+                            pass
                         except Exception as e:
                             err_str = str(e).lower()
                             if "110001" in err_str or "not exists" in err_str or "not found" in err_str or "does not exist" in err_str:
-                                pass # Treated as success
+                                pass
                             else:
                                 try:
                                     ord_state = exchanges[ex_key].fetch_order(str(ord_id), sym)
@@ -544,7 +579,7 @@ def cancel_all_pending_orders_on_pause(user_id='OWNER'):
                                         real_cancel_ok = False
                                         failed_cancels.append(f"{sym} ({ex_id}): cancel gagal ({e})")
                                 except ccxt.OrderNotFound:
-                                    pass # Order sudah tidak ada
+                                    pass
                                 except Exception:
                                     real_cancel_ok = False
                                     failed_cancels.append(f"{sym} ({ex_id}): cancel gagal & verifikasi gagal ({e})")
@@ -764,6 +799,8 @@ def update_orders_and_positions():
             ).fetchall()
 
             live_positions_by_ex = {}
+            tickers_by_ex = {}
+            
             for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, elapsed_sec in rows:
                 ex_key = _exchange_key(user_id, ex_id)
                 if status == 'OPEN' and not str(ord_id).startswith('sim_') and ex_key not in live_positions_by_ex:
@@ -771,6 +808,11 @@ def update_orders_and_positions():
                     if ex:
                         try: live_positions_by_ex[ex_key] = ex.fetch_positions()
                         except Exception: live_positions_by_ex[ex_key] = None
+                if status == 'OPEN' and ex_key not in tickers_by_ex:
+                    ex = exchanges.get(ex_key)
+                    if ex:
+                        try: tickers_by_ex[ex_key] = ex.fetch_tickers()
+                        except Exception: tickers_by_ex[ex_key] = {}
 
             for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, elapsed_sec in rows:
                 ex_key = _exchange_key(user_id, ex_id)
@@ -839,8 +881,8 @@ def update_orders_and_positions():
                                 for p in live
                             )
                             if not still_open:
-                                try: curr_price = float(ex.fetch_ticker(sym)['last'])
-                                except Exception: curr_price = None
+                                ticker = tickers_by_ex.get(ex_key, {}).get(sym)
+                                curr_price = float(ticker['last']) if ticker and ticker.get('last') else None
                                 if curr_price is not None:
                                     if side == 'BUY':
                                         new_status = ('CLOSED (TP)' if curr_price >= tp else 'CLOSED (SL)' if curr_price <= sl else 'CLOSED (UNKNOWN)')
@@ -852,7 +894,8 @@ def update_orders_and_positions():
                                     emoji = '🎉' if 'TP' in new_status else ('❌' if 'SL' in new_status else '❔')
                                     send_user_telegram(user_id, f"{emoji} <b>{new_status}</b> {sym} ({ex_id.upper()}) terdeteksi dari posisi exchange.")
                         else:
-                            curr_price = ex.fetch_ticker(sym)['last']
+                            ticker = tickers_by_ex.get(ex_key, {}).get(sym)
+                            curr_price = float(ticker['last']) if ticker and ticker.get('last') else ex.fetch_ticker(sym)['last']
                             if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
                                 c.execute("UPDATE trades SET status='CLOSED (TP)' WHERE id=? AND status='OPEN'", (t_id,))
                                 if c.rowcount:
@@ -1307,7 +1350,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             runtime['last_reason'] = 'VIP Auto Trade OFF'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
         
-        # ===== CEK MAX POSISI GLOBAL DAN PER-CEX =====
+        # CEK MAX POSISI GLOBAL DAN PER-CEX
         active_count = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')", (user_id, ex_id))[0][0]
         global_active = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND status IN ('PENDING','OPEN')", (user_id,))[0][0]
         user_max_pos = int(risk_cfg['max_pos'])
@@ -1331,9 +1374,22 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         elif today_losses >= int(risk_cfg['max_loss']):
             can_open_trade = False
             reason_cant_trade = f"Max loss ({today_losses}/{risk_cfg['max_loss']})"
-            
+        
+        # NEWS FILTER CHECK
+        news_paused, news_time = is_news_time()
+        if news_paused:
+            can_open_trade = False
+            reason_cant_trade = f"News Pause (High Impact USD @ {news_time} WIB)"
+
         if not can_open_trade:
             runtime['last_reason'] = f'Scan Only. {reason_cant_trade}'
+
+        # OPTIMASI: BATCH FETCH TICKERS
+        all_tickers = {}
+        try:
+            all_tickers = ex.fetch_tickers()
+        except Exception:
+            pass
 
         created = 0
         rate_limited = 0
@@ -1388,8 +1444,11 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 sl = float(ex.price_to_precision(sym, sl))
                 tp = float(ex.price_to_precision(sym, tp))
             except Exception: pass
-            try: live_price = float(ex.fetch_ticker(sym).get('last') or en)
+            try: 
+                ticker = all_tickers.get(sym)
+                live_price = float(ticker['last']) if ticker and ticker.get('last') else float(en)
             except Exception: live_price = float(en)
+            
             if live_price <= 0 or en <= 0:
                 continue
             if sig == 'BUY' and float(en) >= live_price:
@@ -1631,6 +1690,7 @@ def owner_keyboard():
         [InlineKeyboardButton(text="⚙️ CUSTOM TRADING PER CEX", callback_data="risk_settings")],
         [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
         [InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")],
+        [InlineKeyboardButton(text="⚡ FORCE SCAN", callback_data="force_scan")],
         [InlineKeyboardButton(text="🧹 CANCEL ALL", callback_data="cancelall")],
         [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
     ])
@@ -3034,6 +3094,15 @@ async def cb_resume(callback: CallbackQuery):
     notify_runtime_status("RESUMED", "▶️ <b>TRADING RESUMED</b>\nBot kembali boleh mencari setup baru.")
     await safe_answer(callback, "Bot dilanjutkan")
     await callback.message.edit_text("▶️ <b>Bot RESUMED</b>\nBot kembali aktif.", reply_markup=role_keyboard(callback))
+
+@dp.callback_query(F.data == "force_scan")
+async def cb_force_scan(callback: CallbackQuery):
+    if not require_owner(callback): await safe_answer(callback, "Akses Owner saja.", True); return
+    await safe_answer(callback, "Memulai Force Scan...")
+    for k in list(EXCHANGE_SCAN_NEXT.keys()):
+        EXCHANGE_SCAN_NEXT[k] = 0
+    threading.Thread(target=scan_markets, daemon=True).start()
+    await callback.message.answer("⚡ <b>FORCE SCAN TRIGGERED</b>\nBot sedang memindai semua CEX sekarang.")
 
 @dp.callback_query(F.data == "runtime_status")
 async def cb_runtime_status(callback: CallbackQuery):
