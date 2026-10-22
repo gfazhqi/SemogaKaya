@@ -69,7 +69,9 @@ DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
 # ===== FIX CONSTANTS =====
-MAX_PENDING_BARS = 4            # 4 bar M15 = 1 Jam
+MAX_PENDING_BARS = 4            # 4 bar M15 = 1 jam
+PENDING_TIMEOUT_SECONDS = MAX_PENDING_BARS * 15 * 60  # 60 menit nyata
+SCANNER_LOOP_INTERVAL = 10
 POSITION_MODE_CACHE = {}
 POSITION_MODE_CACHE_TTL = 3600
 ORDER_UNKNOWN_COUNT = {}
@@ -759,11 +761,11 @@ def update_orders_and_positions():
             c = conn.cursor()
             rows = c.execute(
                 "SELECT id, user_id, exchange_id, symbol, side, entry_price, sl_price, "
-                "tp_price, order_id, bars_count, status FROM trades WHERE status IN ('PENDING', 'OPEN')"
+                "tp_price, order_id, bars_count, status, created_at FROM trades WHERE status IN ('PENDING', 'OPEN')"
             ).fetchall()
 
             live_positions_by_ex = {}
-            for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status in rows:
+            for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, created_at in rows:
                 ex_key = _exchange_key(user_id, ex_id)
                 if status == 'OPEN' and not str(ord_id).startswith('sim_') and ex_key not in live_positions_by_ex:
                     ex = exchanges.get(ex_key)
@@ -771,17 +773,24 @@ def update_orders_and_positions():
                         try: live_positions_by_ex[ex_key] = ex.fetch_positions()
                         except Exception: live_positions_by_ex[ex_key] = None
 
-            for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status in rows:
+            for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, created_at in rows:
                 ex_key = _exchange_key(user_id, ex_id)
                 if ex_key not in exchanges: continue
                 try:
                     ex = exchanges[ex_key]
-                    n_bars = bars + 1
+                    # Timeout dihitung dari umur order sebenarnya, bukan jumlah loop monitor.
+                    now_ts = time.time()
+                    try:
+                        created_ts = datetime.fromisoformat(str(created_at).replace('Z', '+00:00')).timestamp() if created_at else now_ts
+                    except Exception:
+                        created_ts = now_ts
+                    elapsed = max(0.0, now_ts - created_ts)
+                    n_bars = int(elapsed // (15 * 60))
                     is_sim = str(ord_id).startswith('sim_')
                     tag = " (DRY RUN)" if is_sim else ""
 
                     if status == 'PENDING':
-                        if n_bars >= MAX_PENDING_BARS:
+                        if elapsed >= PENDING_TIMEOUT_SECONDS:
                             cancel_ok = True
                             if not is_sim:
                                 try: ex.cancel_order(str(ord_id), sym)
@@ -1329,20 +1338,20 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             runtime['last_reason'] = f"Max loss tercapai ({today_losses}/{risk_cfg['max_loss']})"
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
         
-        if final_slots <= 0:
+        can_create = final_slots > 0
+        if not can_create:
             if slots <= 0 and global_slots <= 0:
-                runtime['last_reason'] = f'Max Posisi Global ({global_active}/{global_max}) & CEX tercapai'
+                runtime['last_reason'] = f'SCAN ONLY — Max Posisi Global ({global_active}/{global_max}) & CEX tercapai'
             elif global_slots <= 0:
-                runtime['last_reason'] = f'Max Posisi Global tercapai ({global_active}/{global_max})'
+                runtime['last_reason'] = f'SCAN ONLY — Max Posisi Global tercapai ({global_active}/{global_max})'
             else:
-                runtime['last_reason'] = f'Max Posisi CEX tercapai ({active_count}/{user_max_pos})'
-            EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
+                runtime['last_reason'] = f'SCAN ONLY — Max Posisi CEX tercapai ({active_count}/{user_max_pos})'
 
         created = 0
         rate_limited = 0
         cycle_created_symbols = set() # ANTI-DUPLIKAT DI SATU SIKLUS
         for sym in scan_symbols:
-            if created >= final_slots: break # Batasi sesuai slot yang tersedia
+            if can_create and created >= final_slots: break # Batasi pembuatan trade; scanner tetap berjalan
             if is_manual_alert_symbol(sym): continue
             if sym in cycle_created_symbols: continue 
             
@@ -1386,6 +1395,10 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             )
             if exists:
                 runtime['last_reason'] = f'{sym}: already has active trade (BUY/SELL)'
+                continue
+
+            if not can_create:
+                runtime['last_reason'] = f'{sym}: setup ditemukan, tapi slot penuh — scan saja'
                 continue
 
             lev = int(risk_cfg['leverage'])
@@ -3400,7 +3413,7 @@ def main_loop():
                 notify_runtime_status('WAITING', "⏹️ <b>STOP TRADE / WAITING</b>\nDi luar kill zone. Bot tidak membuka trade baru dan menunggu sesi berikutnya.")
         except Exception as e:
             send_error_alert(str(e))
-        time.sleep(10)
+        time.sleep(SCANNER_LOOP_INTERVAL)
 
 async def app_main():
     global MAIN_ASYNC_LOOP
