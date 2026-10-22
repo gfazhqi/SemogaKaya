@@ -11,7 +11,6 @@ import html
 import json
 import zipfile
 import shutil
-import os
 import re
 import tempfile
 from pathlib import Path
@@ -51,8 +50,6 @@ ERROR_HISTORY_MAX = 50
 LAST_MENU_MESSAGE = {}
 PENDING_API_SETUP = {}
 EXCHANGE_RUNTIME = {}
-# Per-account/per-CEX CCXT instances. Key format: USER_ID::CEX.
-# This must exist before init_db/load_settings/reload_exchanges can run.
 exchanges = {}
 EXCHANGE_SCAN_NEXT = {}
 EXCHANGE_SCAN_CURSOR = {}
@@ -70,6 +67,14 @@ MANUAL_ALERT_PAIRS = set()
 CORE_PAIRS = ('BTC/USDT', 'ETH/USDT')
 DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
+
+# ===== NEW FIX CONSTANTS =====
+MAX_PENDING_BARS = 20           # 20 × M15 = 5 jam timeout untuk PENDING order
+POSITION_MODE_CACHE = {}         # {ex_key: timestamp} — cache one-way mode check
+POSITION_MODE_CACHE_TTL = 3600   # 1 jam
+ORDER_UNKNOWN_COUNT = {}         # {order_id: int} — track UNKNOWN status
+MARGIN_MODE_SET = set()          # {ex_key::symbol} — track isolated set
+PUBLIC_SIGNAL_MAX_AGE = 7 * 86400  # 7 hari timeout public signal
 
 def _table_columns(conn, table):
     return {row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()}
@@ -120,9 +125,8 @@ def _save_owner_pair_filter(enabled,pairs):
         finally: conn.close()
 
 # =================================================================
-# VIP USER SETTINGS — SIMPLE MODE
+# VIP USER SETTINGS
 # =================================================================
-# These defaults are for VIP users only. Owner/Dry-Run logic is unchanged.
 VIP_RECOMMENDED_MARGIN_USD = 2.0
 VIP_RECOMMENDED_LEVERAGE = 20
 VIP_RECOMMENDED_MAX_OPEN_POSITIONS = 3
@@ -131,7 +135,7 @@ VIP_RECOMMENDED_MAX_TRADES_PER_DAY = 10
 def vip_recommended_settings_text(user_id=None):
     uid = str(user_id or '')
     cfg = get_user_settings(uid) if uid and uid != 'OWNER' else {
-        'margin': 2.0, 'max_pos': 2, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1
+        'margin': 2.0, 'max_pos': 3, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1
     }
     return (
         "💎 <b>VIP SETTINGS</b>\n\n"
@@ -144,7 +148,6 @@ def vip_recommended_settings_text(user_id=None):
         + VIP_WARNING_TEXT
     )
 
-
 def ensure_user_settings(user_id):
     uid = str(user_id)
     conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -152,13 +155,12 @@ def ensure_user_settings(user_id):
         conn.execute(
             "INSERT OR IGNORE INTO user_settings "
             "(user_id, margin, max_pos, max_trades_day, leverage, auto_trade) "
-            "VALUES (?, 2.0, 2, 10, 20, 1)",
+            "VALUES (?, 2.0, 3, 10, 20, 1)",
             (uid,)
         )
         conn.commit()
     finally:
         conn.close()
-
 
 def get_user_settings(user_id):
     uid = str(user_id)
@@ -169,7 +171,7 @@ def get_user_settings(user_id):
         (uid,)
     )
     if not rows:
-        return {'margin': 2.0, 'max_pos': 2, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1}
+        return {'margin': 2.0, 'max_pos': 3, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1}
     r = rows[0]
     return {
         'margin': float(r[0]),
@@ -179,7 +181,7 @@ def get_user_settings(user_id):
         'auto_trade': int(r[4]),
     }
 
-
+# ===== FIX #3: VIP settings now propagate ke cex_risk_settings =====
 def set_user_setting(user_id, field, value):
     allowed = {'margin', 'max_pos', 'max_trades_day', 'leverage', 'auto_trade'}
     if field not in allowed:
@@ -188,11 +190,18 @@ def set_user_setting(user_id, field, value):
     conn = sqlite3.connect(DB_FILE, timeout=10)
     try:
         conn.execute(f"UPDATE user_settings SET {field}=? WHERE user_id=?", (value, str(user_id)))
+        # Propagate ke per-CEX risk settings agar scanner benar-benar memakai nilai ini
+        if field in ('margin', 'leverage', 'max_pos', 'max_trades_day'):
+            for ex_id in DEFAULT_CEX:
+                conn.execute(
+                    f"INSERT INTO cex_risk_settings (user_id, ex_id, {field}) VALUES (?, ?, ?) "
+                    f"ON CONFLICT(user_id, ex_id) DO UPDATE SET {field}=excluded.{field}, "
+                    f"updated_at=datetime('now')",
+                    (str(user_id), ex_id, value)
+                )
         conn.commit()
     finally:
         conn.close()
-
-
 
 DEFAULT_CEX_RISK = {'margin': 2.0, 'leverage': 20, 'max_pos': 2, 'max_trades_day': 10, 'max_loss': 5}
 CUSTOMIZE_WARNING_TEXT = (
@@ -269,13 +278,13 @@ def load_settings():
         elif row[0] == 'max_pos':
             CONFIG['MAX_CONCURRENT_POSITIONS'] = int(row[1])
         elif row[0] == 'dry_run':
-            CONFIG['DRY_RUN'] = bool(row[1])
+            CONFIG['DRY_RUN'] = bool(float(row[1]))
         elif row[0] == 'min_trades':
             CONFIG['MIN_TRADES'] = int(row[1])
         elif row[0] == 'min_wr':
             CONFIG['MIN_WR'] = float(row[1])
         elif row[0] == 'daily_loss_limit':
-            CONFIG['DAILY_LOSS_LIMIT'] = bool(row[1])
+            CONFIG['DAILY_LOSS_LIMIT'] = bool(float(row[1]))
         elif row[0].startswith('lev_'):
             CONFIG['LEVERAGE'][row[0].split('_', 1)[1]] = int(row[1])
         elif row[0].startswith('dry_run_'):
@@ -283,13 +292,13 @@ def load_settings():
 
     conn.close()
 
-
 def _exchange_key(user_id, ex_id):
     return f"{str(user_id)}::{ex_id}"
 
 def _split_exchange_key(key):
     return str(key).split("::", 1)
 
+# ===== FIX #13: VIP dengan auto_trade=0 tidak di-load =====
 def reload_exchanges():
     global exchanges, EXCHANGE_MARKETS, EXCHANGE_SCAN_NEXT, EXCHANGE_LAST_CANDLE, EXCHANGE_SCAN_CURSOR, EXCHANGE_REQUEST_NEXT
 
@@ -307,6 +316,16 @@ def reload_exchanges():
     for user_id, ex_id, api, sec, en, password in rows:
         if ex_id not in DEFAULT_CEX or en != 1:
             continue
+        # VIP: skip jika auto_trade OFF atau VIP expired
+        if str(user_id) != 'OWNER':
+            if get_vip_member(user_id) is None:
+                continue
+            try:
+                ucfg = get_user_settings(user_id)
+                if not ucfg['auto_trade']:
+                    continue
+            except Exception:
+                continue
         try:
             params = {
                 'apiKey': api or '',
@@ -327,32 +346,29 @@ def reload_exchanges():
         except Exception as e:
             send_error_alert(f"Load Ex [{ex_id}] user={user_id}: {e}")
 
-
+    for stale in [k for k in list(EXCHANGE_RUNTIME) if k not in exchanges]:
+        EXCHANGE_RUNTIME.pop(stale, None)
 
 def update_db_setting(key, value):
     conn = sqlite3.connect(DB_FILE, timeout=10)
     conn.cursor().execute(
-        "UPDATE settings SET value=? WHERE key=?",
-        (value, key)
+        "INSERT INTO settings(key,value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value))
     )
     conn.commit()
     conn.close()
 
-
-
 # =================================================================
 # TEMPORARY TELEGRAM BACKUP
-# Backup files are created only in the system temp directory.
-# They are deleted automatically after the Telegram message is
-# removed (default: 5 minutes). No permanent backup is kept on VPS.
 # =================================================================
 BACKUP_MESSAGE_TTL_SECONDS = 300
 
 async def create_temp_db_backup():
-    """Create a consistent SQLite backup in the OS temp directory."""
     import sqlite3
     fd, temp_path = tempfile.mkstemp(prefix="alche_backup_", suffix=".db")
     os.close(fd)
+    src_conn = None
     try:
         src_conn = sqlite3.connect(DB_FILE, timeout=15)
         dst_conn = sqlite3.connect(temp_path, timeout=15)
@@ -363,7 +379,8 @@ async def create_temp_db_backup():
         return temp_path
     except Exception:
         try:
-            src_conn.close()
+            if src_conn is not None:
+                src_conn.close()
         except Exception:
             pass
         try:
@@ -373,11 +390,9 @@ async def create_temp_db_backup():
         raise
 
 async def send_temporary_backup(chat_id):
-    """Send DB backup to Telegram and delete both message/file after 5 min."""
     temp_path = await create_temp_db_backup()
     backup_message = None
     try:
-        from aiogram.types import FSInputFile
         backup_message = await bot.send_document(
             chat_id=chat_id,
             document=FSInputFile(temp_path),
@@ -400,7 +415,6 @@ async def send_temporary_backup(chat_id):
         except Exception:
             pass
 
-
 # =================================================================
 # HELPERS
 # =================================================================
@@ -419,7 +433,6 @@ def send_telegram(message):
     except Exception:
         pass
 
-
 def send_user_telegram(user_id, message):
     target = TELEGRAM_CHAT_ID if str(user_id) == 'OWNER' else str(user_id)
     try:
@@ -431,7 +444,6 @@ def send_user_telegram(user_id, message):
             requests.post(url, json=payload, timeout=5)
     except Exception:
         pass
-
 
 def send_error_alert(err_msg):
     global last_error_time, ERROR_HISTORY
@@ -446,15 +458,12 @@ def send_error_alert(err_msg):
         send_telegram(f"⚠️ <b>ERROR ALERT</b>\n\n<code>{safe_err}</code>")
         last_error_time = time.time()
 
-
 def is_kill_zone():
     h = datetime.now(WIB).hour
     return (14 <= h < 17) or (19 <= h < 22)
 
-
 def is_manual_alert_symbol(symbol):
     return any(p in symbol.split(':')[0].upper() for p in MANUAL_ALERT_PAIRS)
-
 
 def get_free_usdt_balance(ex_instance):
     try:
@@ -466,14 +475,7 @@ def get_free_usdt_balance(ex_instance):
     except Exception:
         return 0.0
 
-
 def get_open_position_contracts(ex, symbol):
-    """Return the currently open contract amount for one symbol.
-
-    Uses CCXT unified positions first. This is only used for a manual emergency
-    close, so we prefer an exact live position size over the locally calculated
-    entry quantity.
-    """
     positions = ex.fetch_positions([symbol])
     if not positions:
         return 0.0, None
@@ -496,14 +498,8 @@ def get_open_position_contracts(ex, symbol):
 
     return best if best else (0.0, None)
 
-
+# ===== FIX #6: tidak kirim positionSide di one-way mode =====
 def close_open_trade(trade_id):
-    """Manually close one OPEN trade, intended for emergency/news exits.
-
-    DRY RUN only changes the local simulation state. REAL mode sends a market
-    order in the opposite direction with reduceOnly=True, using the live
-    position size returned by the exchange.
-    """
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         try:
@@ -544,13 +540,8 @@ def close_open_trade(trade_id):
                 )
 
             close_side = 'sell' if side == 'BUY' else 'buy'
+            # FIX: reduceOnly cukup untuk one-way. positionSide hanya untuk hedge.
             params = {'reduceOnly': True}
-
-            # Some exchanges need positionSide in hedge mode. If CCXT exposes
-            # it, pass it through; otherwise reduceOnly is sufficient for
-            # one-way mode and the exchange can reject safely.
-            if live_side in ('long', 'short'):
-                params['positionSide'] = live_side
 
             result = ex.create_order(
                 symbol,
@@ -580,9 +571,7 @@ def close_open_trade(trade_id):
         finally:
             conn.close()
 
-
 def close_all_open_trades(user_id='OWNER'):
-    """Emergency-close every currently OPEN trade, one by one."""
     if str(user_id) == 'OWNER':
         rows = db_read("SELECT id FROM trades WHERE status='OPEN' ORDER BY id ASC")
     else:
@@ -596,16 +585,10 @@ def close_all_open_trades(user_id='OWNER'):
         results.append((ok, detail))
     return results
 
-
+# ===== FIX #4: cancel order gagal → alert + verifikasi =====
 def cancel_all_pending_orders_on_pause(user_id='OWNER'):
-    """Cancel only active PENDING orders and make the DB state authoritative.
-
-    The previous version could race with update_orders_and_positions(): the
-    updater could read a PENDING row, cleanup could mark it cancelled, and the
-    updater could then write the old state back. Conditional UPDATEs plus a
-    process-local DB lock prevent that resurrection.
-    """
     changed = 0
+    failed_cancels = []
     try:
         with DB_LOCK:
             conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -624,24 +607,59 @@ def cancel_all_pending_orders_on_pause(user_id='OWNER'):
                     ).fetchall()
 
                 for t_id, row_user_id, ex_id, sym, ord_id in rows:
-                    if ex_id in exchanges and not str(ord_id).startswith('sim_'):
+                    ex_key = _exchange_key(row_user_id, ex_id)
+                    real_cancel_ok = True
+                    if ex_key in exchanges and not str(ord_id).startswith('sim_'):
                         try:
-                            exchanges[_exchange_key(row_user_id, ex_id)].cancel_order(ord_id, sym)
-                        except Exception:
-                            # The exchange order may already be gone; the local
-                            # queue must still stop treating it as PENDING.
-                            pass
+                            exchanges[ex_key].cancel_order(ord_id, sym)
+                        except Exception as e:
+                            # Coba verifikasi apakah sebenarnya sudah fill/cancel
+                            try:
+                                ord_state = exchanges[ex_key].fetch_order(str(ord_id), sym)
+                                st = str(ord_state.get('status') or '').lower()
+                                if st in ('closed', 'filled'):
+                                    real_cancel_ok = False
+                                    failed_cancels.append(
+                                        f"{sym} ({ex_id}): order sudah FILLED — tidak bisa cancel"
+                                    )
+                                elif st in ('canceled', 'cancelled', 'expired', 'rejected'):
+                                    pass  # sudah cancel
+                                else:
+                                    real_cancel_ok = False
+                                    failed_cancels.append(
+                                        f"{sym} ({ex_id}): cancel gagal ({e})"
+                                    )
+                            except Exception:
+                                real_cancel_ok = False
+                                failed_cancels.append(
+                                    f"{sym} ({ex_id}): cancel gagal & verifikasi gagal ({e})"
+                                )
 
-                    cur = c.execute(
-                        "UPDATE trades SET status='CANCELLED (Auto/Manual)' "
-                        "WHERE id=? AND status='PENDING'",
-                        (t_id,)
-                    )
-                    changed += cur.rowcount
+                    if real_cancel_ok:
+                        cur = c.execute(
+                            "UPDATE trades SET status='CANCELLED (Auto/Manual)' "
+                            "WHERE id=? AND status='PENDING'",
+                            (t_id,)
+                        )
+                        changed += cur.rowcount
+                    # Jika order sebenarnya FILLED, ubah status PENDING → OPEN
+                    elif any('sudah FILLED' in x for x in failed_cancels if sym in x):
+                        c.execute(
+                            "UPDATE trades SET status='OPEN' WHERE id=? AND status='PENDING'",
+                            (t_id,)
+                        )
 
                 conn.commit()
             finally:
                 conn.close()
+
+        if failed_cancels:
+            send_user_telegram(
+                user_id,
+                "⚠️ <b>CANCEL GAGAL — CEK MANUAL</b>\n\n"
+                + "\n".join(f"• {html.escape(x)}" for x in failed_cancels[:10])
+            )
+            send_error_alert(f"Cancel failures ({len(failed_cancels)}): {failed_cancels[:5]}")
 
         send_user_telegram(
             user_id,
@@ -652,14 +670,14 @@ def cancel_all_pending_orders_on_pause(user_id='OWNER'):
     except Exception as e:
         send_error_alert(f"Cleanup pending orders: {e}")
 
-
+# ===== FIX #10: WIB timezone consistency =====
 def check_and_update_daily_sl():
     global daily_sl_count, IS_BOT_PAUSED
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         daily_sl_count = conn.cursor().execute(
             "SELECT COUNT(*) FROM trades "
-            "WHERE created_at >= date('now', 'start of day') "
+            "WHERE user_id='OWNER' AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours') "
             "AND status LIKE '%SL%'"
         ).fetchone()[0]
         conn.close()
@@ -674,11 +692,9 @@ def check_and_update_daily_sl():
     except Exception:
         pass
 
-
 # =================================================================
-# SMC STRATEGY & LIFECYCLE
+# SMC STRATEGY
 # =================================================================
-# LOGIC TRADE TIDAK DIUBAH
 def analyze_smc_retrace(df_m15, df_h1, daily_open):
     ema50 = df_h1['close'].ewm(span=50, adjust=False).mean().iloc[-2]
     h1_c, c_prev = df_h1['close'].iloc[-2], df_m15.iloc[-2]
@@ -700,65 +716,69 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
 
     return sig, en, sl, tp
 
-
+# ===== FIX #8: cache + deteksi hedge mode BingX =====
 def ensure_one_way_mode(ex, ex_id, symbol):
-    """Ensure the derivatives account uses one-way mode before live orders.
-    Returns (ok, message). Never silently switches to hedge mode.
-    """
+    cache_key = f"{ex_id}::{id(ex)}"
+    now = time.time()
+    if cache_key in POSITION_MODE_CACHE and now - POSITION_MODE_CACHE[cache_key] < POSITION_MODE_CACHE_TTL:
+        return True, 'cached'
+
     try:
         if not getattr(ex, 'has', {}).get('setPositionMode', False):
-            return True, 'setPositionMode unsupported; using exchange default'
+            # FIX: BingX kadang tidak expose setPositionMode. Cek posisi live.
+            try:
+                positions = ex.fetch_positions()
+                if positions and any(
+                    str(p.get('positionSide', '')).upper() in ('LONG', 'SHORT')
+                    and str(p.get('side', '')).lower() in ('long', 'short')
+                    for p in positions
+                ):
+                    # Ada 2 sisi terpisah → hedge mode aktif
+                    return False, (
+                        'Hedge mode terdeteksi di akun ini, tetapi bot memerlukan '
+                        'one-way mode. Ubah ke One-Way di pengaturan exchange.'
+                    )
+            except Exception:
+                pass
+            POSITION_MODE_CACHE[cache_key] = now
+            return True, 'setPositionMode unsupported; assumed one-way'
+
         params = {}
         if ex_id == 'bitget':
             params['productType'] = 'USDT-FUTURES'
         ex.set_position_mode(False, symbol, params)
+        POSITION_MODE_CACHE[cache_key] = now
         return True, 'one-way mode confirmed/set'
     except Exception as e:
         msg = str(e)
-        # Exchanges commonly return a harmless "already in this mode" error.
         low = msg.lower()
         harmless = (
             'no need to change' in low or
-            'already' in low and ('one-way' in low or 'one_way' in low or 'oneway' in low) or
+            ('already' in low and ('one-way' in low or 'one_way' in low or 'oneway' in low)) or
             'same position mode' in low or
-            '40774' not in low and 'position mode' in low and 'unchanged' in low
+            ('position mode' in low and 'unchanged' in low)
         )
         if harmless:
+            POSITION_MODE_CACHE[cache_key] = now
             return True, 'one-way mode already active'
         return False, msg[:500]
 
-
 def _fetch_last_closed_m15(ex_instance, symbol):
-    """Return the latest CLOSED M15 candle."""
     try:
         bars = ex_instance.fetch_ohlcv(symbol, '15m', limit=3)
         if not bars or len(bars) < 2:
             return None
-        # Last candle may still be forming; use the previous one.
         return bars[-2]
     except Exception:
         return None
 
-
 def _pending_price_state(ex_instance, symbol, side, entry, sl, tp):
-    """
-    Validate a PENDING setup using M15 OHLC, not a low-TF ticker.
-    This keeps the strategy timeframe at M15 and avoids 1m noise.
-
-    Important:
-    - If Entry is touched by the M15 candle, it becomes FILLED.
-    - If Entry is NOT touched but TP is already beyond the candle range,
-      it remains PENDING; we only call TP-first when the candle proves that
-      TP was crossed without reaching Entry.
-    - If the same candle contains both Entry and TP/SL, Entry wins because
-      the pending order must be considered filled before position management.
-    """
     try:
         bars = ex_instance.fetch_ohlcv(symbol, '15m', limit=3)
         if not bars or len(bars) < 2:
             return 'PENDING'
 
-        candle = bars[-2]  # latest closed M15
+        candle = bars[-2]
         high = float(candle[2])
         low = float(candle[3])
         entry = float(entry)
@@ -769,23 +789,16 @@ def _pending_price_state(ex_instance, symbol, side, entry, sl, tp):
             entry_hit = low <= entry
             tp_crossed = high >= tp
             sl_crossed = low <= sl
-
-            # Entry has priority on a candle that contains entry.
             if entry_hit:
                 return 'OPEN'
-
-            # No entry touch: only mark TP/SL first when the closed candle
-            # proves price moved beyond that level.
             if tp_crossed:
                 return 'MISSED (TP First)'
             if sl_crossed:
                 return 'CANCELLED (SL First)'
-
-        else:  # SELL
+        else:
             entry_hit = high >= entry
             tp_crossed = low <= tp
             sl_crossed = high >= sl
-
             if entry_hit:
                 return 'OPEN'
             if tp_crossed:
@@ -797,24 +810,55 @@ def _pending_price_state(ex_instance, symbol, side, entry, sl, tp):
     except Exception:
         return 'PENDING'
 
+# ===== FIX #18: track UNKNOWN count + alert =====
+def _real_exchange_order_state(ex_instance, symbol, order_id):
+    try:
+        if not order_id or str(order_id).startswith("sim_"):
+            return "UNKNOWN"
+        result = ex_instance.fetch_order(str(order_id), symbol)
+        status = str(result.get("status") or "").lower()
+        if status in ("closed", "filled"):
+            ORDER_UNKNOWN_COUNT.pop(str(order_id), None)
+            return "FILLED"
+        if status in ("open", "new", "partially_filled", "partially-filled", "pending"):
+            ORDER_UNKNOWN_COUNT.pop(str(order_id), None)
+            return "PENDING"
+        if status in ("canceled", "cancelled", "expired", "rejected"):
+            ORDER_UNKNOWN_COUNT.pop(str(order_id), None)
+            return "CANCELLED"
+        return "UNKNOWN"
+    except Exception:
+        cnt = ORDER_UNKNOWN_COUNT.get(str(order_id), 0) + 1
+        ORDER_UNKNOWN_COUNT[str(order_id)] = cnt
+        if cnt == 5:
+            send_error_alert(
+                f"Order {order_id} ({symbol}) UNKNOWN 5x — cek manual di exchange!"
+            )
+        return "UNKNOWN"
 
+# ===== FIX #5 + #14: verifikasi posisi via fetch_positions sebelum mark CLOSED =====
 def update_orders_and_positions():
-    """Advance active trades without allowing stale rows to resurrect.
-
-    Every state transition is conditional on the row still having the state
-    that was read. This is important when /cancelall or the daily-loss cleanup
-    runs at the same time as the background monitor.
-    """
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         try:
             c = conn.cursor()
-
             rows = c.execute(
                 "SELECT id, user_id, exchange_id, symbol, side, entry_price, sl_price, "
                 "tp_price, order_id, bars_count, status "
                 "FROM trades WHERE status IN ('PENDING', 'OPEN')"
             ).fetchall()
+
+            # Pre-fetch posisi live per exchange (batch) untuk verifikasi
+            live_positions_by_ex = {}
+            for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status in rows:
+                ex_key = _exchange_key(user_id, ex_id)
+                if status == 'OPEN' and not str(ord_id).startswith('sim_') and ex_key not in live_positions_by_ex:
+                    ex = exchanges.get(ex_key)
+                    if ex:
+                        try:
+                            live_positions_by_ex[ex_key] = ex.fetch_positions()
+                        except Exception:
+                            live_positions_by_ex[ex_key] = None
 
             for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status in rows:
                 ex_key = _exchange_key(user_id, ex_id)
@@ -828,26 +872,61 @@ def update_orders_and_positions():
                     tag = " (DRY RUN)" if is_sim else ""
 
                     if status == 'PENDING':
-                        n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
-
-                        if n_stat == 'OPEN':
-                            send_user_telegram(user_id, 
-                                f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!"
-                            )
-                        elif n_stat != 'PENDING':
-                            if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
+                        # FIX #14: timeout pending order
+                        if n_bars >= MAX_PENDING_BARS:
+                            cancel_ok = True
+                            if not is_sim:
                                 try:
-                                    ex.cancel_order(ord_id, sym)
-                                except Exception:
-                                    pass
+                                    ex.cancel_order(str(ord_id), sym)
+                                except Exception as e:
+                                    cancel_ok = False
+                                    send_error_alert(
+                                        f"Timeout cancel {ex_id}/{sym} order={ord_id}: {e}"
+                                    )
+                            if cancel_ok:
+                                c.execute(
+                                    "UPDATE trades SET status='CANCELLED (Timeout)', "
+                                    "bars_count=? WHERE id=? AND status='PENDING'",
+                                    (n_bars, t_id)
+                                )
+                                if c.rowcount:
+                                    send_user_telegram(
+                                        user_id,
+                                        f"⏱️ <b>PENDING TIMEOUT</b> {sym} ({ex_id.upper()})\n"
+                                        f"Tidak fill dalam {MAX_PENDING_BARS} bar M15 — dibatalkan."
+                                    )
+                            continue
 
-                            send_user_telegram(user_id, 
-                                f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\n"
-                                f"Alasan: {n_stat}"
-                            )
+                        if not is_sim:
+                            real_state = _real_exchange_order_state(ex, sym, ord_id)
+                            if real_state == 'FILLED':
+                                n_stat = 'OPEN'
+                                send_user_telegram(
+                                    user_id,
+                                    f"🔔 <b>ORDER FILLED — CONFIRMED{tag}</b> {sym} di {ex_id.upper()}!"
+                                )
+                            elif real_state == 'CANCELLED':
+                                n_stat = 'CANCELLED'
+                                send_user_telegram(
+                                    user_id,
+                                    f"⚪ <b>ORDER CANCELLED</b> {sym} di {ex_id.upper()}"
+                                )
+                            else:
+                                n_stat = 'PENDING'
+                        else:
+                            n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
+                            if n_stat == 'OPEN':
+                                send_user_telegram(
+                                    user_id,
+                                    f"🔔 <b>ORDER FILLED (DRY RUN)</b> {sym} di {ex_id.upper()}!"
+                                )
+                            elif n_stat != 'PENDING':
+                                send_user_telegram(
+                                    user_id,
+                                    f"⚪ <b>AUTO-CANCEL (DRY RUN)</b> {sym}\nAlasan: {n_stat}"
+                                )
 
                         if n_stat != 'PENDING':
-                            # Do not overwrite a concurrent CANCEL ALL.
                             c.execute(
                                 "UPDATE trades SET status=?, bars_count=? "
                                 "WHERE id=? AND status='PENDING'",
@@ -861,42 +940,73 @@ def update_orders_and_positions():
                             )
 
                     elif status == 'OPEN':
-                        curr_price = ex.fetch_ticker(sym)['last']
-
-                        if (side == 'BUY' and curr_price >= tp) or (
-                            side == 'SELL' and curr_price <= tp
-                        ):
-                            c.execute(
-                                "UPDATE trades SET status='CLOSED (TP)' "
-                                "WHERE id=? AND status='OPEN'",
-                                (t_id,)
+                        if not is_sim:
+                            # REAL: verifikasi posisi masih ada di exchange
+                            live = live_positions_by_ex.get(ex_key)
+                            if live is None:
+                                # fetch gagal total → lewati cycle ini
+                                continue
+                            still_open = any(
+                                p.get('symbol') == sym
+                                and abs(float(p.get('contracts') or p.get('amount') or 0)) > 0
+                                for p in live
                             )
-                            if c.rowcount:
-                                send_user_telegram(user_id, 
-                                    f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | +1R 🚀"
+                            if not still_open:
+                                # Posisi sudah ditutup oleh exchange (SL/TP/manual)
+                                try:
+                                    curr_price = float(ex.fetch_ticker(sym)['last'])
+                                except Exception:
+                                    curr_price = None
+                                if curr_price is not None:
+                                    if side == 'BUY':
+                                        new_status = (
+                                            'CLOSED (TP)' if curr_price >= tp
+                                            else 'CLOSED (SL)' if curr_price <= sl
+                                            else 'CLOSED (UNKNOWN)'
+                                        )
+                                    else:
+                                        new_status = (
+                                            'CLOSED (TP)' if curr_price <= tp
+                                            else 'CLOSED (SL)' if curr_price >= sl
+                                            else 'CLOSED (UNKNOWN)'
+                                        )
+                                else:
+                                    new_status = 'CLOSED (UNKNOWN)'
+                                c.execute(
+                                    "UPDATE trades SET status=? WHERE id=? AND status='OPEN'",
+                                    (new_status, t_id)
                                 )
-
-                        elif (side == 'BUY' and curr_price <= sl) or (
-                            side == 'SELL' and curr_price >= sl
-                        ):
-                            c.execute(
-                                "UPDATE trades SET status='CLOSED (SL)' "
-                                "WHERE id=? AND status='OPEN'",
-                                (t_id,)
-                            )
-                            if c.rowcount:
-                                send_user_telegram(user_id, 
-                                    f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻"
+                                if c.rowcount:
+                                    emoji = '🎉' if 'TP' in new_status else ('❌' if 'SL' in new_status else '❔')
+                                    send_user_telegram(
+                                        user_id,
+                                        f"{emoji} <b>{new_status}</b> {sym} ({ex_id.upper()}) "
+                                        f"terdeteksi dari posisi exchange."
+                                    )
+                        else:
+                            # DRY RUN: pakai ticker
+                            curr_price = ex.fetch_ticker(sym)['last']
+                            if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
+                                c.execute(
+                                    "UPDATE trades SET status='CLOSED (TP)' WHERE id=? AND status='OPEN'",
+                                    (t_id,)
                                 )
+                                if c.rowcount:
+                                    send_user_telegram(user_id, f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | +1R 🚀")
+                            elif (side == 'BUY' and curr_price <= sl) or (side == 'SELL' and curr_price >= sl):
+                                c.execute(
+                                    "UPDATE trades SET status='CLOSED (SL)' WHERE id=? AND status='OPEN'",
+                                    (t_id,)
+                                )
+                                if c.rowcount:
+                                    send_user_telegram(user_id, f"❌ <b>STOP LOSS{tag}</b> {sym} | -1R 🔻")
 
                 except Exception as e:
-                    # Keep one bad symbol from aborting the whole monitor pass.
                     send_error_alert(f"Position monitor [{ex_id}:{sym}]: {e}")
 
             conn.commit()
         finally:
             conn.close()
-
 
 # =================================================================
 # RUNTIME MONITORING
@@ -905,7 +1015,6 @@ def set_runtime_event(text):
     global LAST_EVENT_TEXT, LAST_EVENT_TIME
     LAST_EVENT_TEXT = str(text)[:500]
     LAST_EVENT_TIME = time.time()
-
 
 def _fmt_uptime(seconds):
     seconds = max(0, int(seconds))
@@ -916,7 +1025,6 @@ def _fmt_uptime(seconds):
         return f"{d}d {h}h {m}m"
     return f"{h:02d}h {m:02d}m"
 
-
 def build_runtime_status_text(user_id='OWNER'):
     user_id = _account_user_id(user_id)
     mode = ' | '.join(f"{x.upper()}: {'DRY' if get_owner_dry_run(x) else 'REAL'}" for x in DEFAULT_CEX) if str(user_id)=='OWNER' else ''
@@ -926,13 +1034,13 @@ def build_runtime_status_text(user_id='OWNER'):
         pending = db_read("SELECT COUNT(*) FROM trades WHERE user_id='OWNER' AND status='PENDING'")[0][0]
         opened = db_read("SELECT COUNT(*) FROM trades WHERE user_id='OWNER' AND status='OPEN'")[0][0]
         total_today = db_read(
-            "SELECT COUNT(*) FROM trades WHERE user_id='OWNER' AND created_at >= date('now','start of day')"
+            "SELECT COUNT(*) FROM trades WHERE user_id='OWNER' AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')"
         )[0][0]
     else:
         pending = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND status='PENDING'", (str(user_id),))[0][0]
         opened = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND status='OPEN'", (str(user_id),))[0][0]
         total_today = db_read(
-            "SELECT COUNT(*) FROM trades WHERE user_id=? AND created_at >= date('now','start of day')",
+            "SELECT COUNT(*) FROM trades WHERE user_id=? AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
             (str(user_id),)
         )[0][0]
     lines = [
@@ -945,9 +1053,11 @@ def build_runtime_status_text(user_id='OWNER'):
         "",
         "🔎 <b>SCANNER PER CEX</b>",
     ]
-    if EXCHANGE_RUNTIME:
-        for ex_id in sorted(EXCHANGE_RUNTIME):
-            st = EXCHANGE_RUNTIME[ex_id]
+    own_keys = sorted(k for k in EXCHANGE_RUNTIME if str(k).split('::', 1)[0] == str(user_id))
+    if own_keys:
+        for rt_key in own_keys:
+            ex_id = str(rt_key).split('::', 1)[-1]
+            st = EXCHANGE_RUNTIME[rt_key]
             state = st.get('state', 'IDLE')
             icon = '🟢' if state == 'SCANNING' else ('⚠️' if state == 'ERROR' else '⏸')
             last = st.get('last_scan', '-')
@@ -972,7 +1082,6 @@ def build_runtime_status_text(user_id='OWNER'):
     ]
     return "\n".join(lines)
 
-
 def runtime_status_keyboard(obj=None):
     rows=[[InlineKeyboardButton(text="🔄 REFRESH", callback_data="runtime_status")],[InlineKeyboardButton(text="📊 POSISI", callback_data="positions")]]
     if obj is None or is_owner(obj):
@@ -980,9 +1089,8 @@ def runtime_status_keyboard(obj=None):
     rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 # =================================================================
-# PUBLIC CHANNEL — CRYPTO SCALP SIGNALS
+# PUBLIC CHANNEL
 # =================================================================
 PUBLIC_DAILY_MIN = 3
 PUBLIC_DAILY_MAX = 6
@@ -1031,7 +1139,10 @@ def _public_reset_if_new_day():
 def _public_save_history():
     path = Path("public_signal_history.json")
     try:
-        path.write_text(json.dumps(PUBLIC_STATE['signals'], ensure_ascii=False, indent=2), encoding='utf-8')
+        existing = _public_load_history()
+        today = PUBLIC_STATE.get('date')
+        merged = [x for x in existing if x.get('date') != today] + list(PUBLIC_STATE['signals'])
+        path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding='utf-8')
     except Exception:
         pass
 
@@ -1055,18 +1166,16 @@ def _public_crypto_symbol(sym):
     blocked = ('XAU', 'XAG', 'WTI', 'USOIL', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF', 'NZD')
     if any(x in s for x in blocked):
         return False
-    # Reject leveraged-token styles such as BTCUP, BTCDOWN, 2L/2S/3L/3S.
     base = s.split('/')[0]
     if any(x in base for x in ('UP', 'DOWN', 'BULL', 'BEAR')) or re.search(r'\d+[LS]$', base):
         return False
     return True
 
-
 VIP_WARNING_TEXT = (
     "⚠️ <b>WARNING</b>\n"
     "Auto trading dan leverage memiliki risiko kerugian. "
-"20x leverage dapat memperbesar dampak pergerakan harga dan risiko likuidasi.\n\n"
-"Gunakan dana yang siap untuk kehilangan dan pastikan API tidak memiliki permission withdrawal."
+    "20x leverage dapat memperbesar dampak pergerakan harga dan risiko likuidasi.\n\n"
+    "Gunakan dana yang siap untuk kehilangan dan pastikan API tidak memiliki permission withdrawal."
 )
 
 def _public_keyboard():
@@ -1077,8 +1186,7 @@ def _public_keyboard():
 
 def _public_signal_text(n, total, sym, side, ex_id, entry, sl):
     risk = abs(float(entry) - float(sl))
-    tp1 = float(entry) + risk if side == 'BUY' else float(entry) - risk
-    tp2 = float(entry) + (2 * risk) if side == 'BUY' else float(entry) - (2 * risk)
+    tp = float(entry) + risk if side == 'BUY' else float(entry) - risk
     now = datetime.now(WIB)
     return (
         f"📣 <b>SCALP TRADE #{n}/{total}</b>\n\n"
@@ -1089,12 +1197,12 @@ def _public_signal_text(n, total, sym, side, ex_id, entry, sl):
         f"📈 <b>{side}</b>\n\n"
         f"🎯 Entry: <code>{float(entry):.8g}</code>\n"
         f"🛑 SL: <code>{float(sl):.8g}</code>\n"
-        f"💰 TP1: <code>{tp1:.8g}</code> (1R)\n"
-        f"🚀 TP2: <code>{tp2:.8g}</code> (2R)\n\n"
+        f"💰 TP: <code>{tp:.8g}</code> (1R)\n\n"
         f"⚡ <b>SCALP TRADE</b>\n"
         f"📊 Timeframe: M15"
-    ), tp1, tp2
+    ), tp
 
+# ===== FIX: tambah published_at untuk OHLCV outcome tracking =====
 async def publish_public_signal(sym, side, ex_id, entry, sl):
     if not PUBLIC_CHANNEL_ID or not _public_crypto_symbol(sym):
         return None
@@ -1105,7 +1213,7 @@ async def publish_public_signal(sym, side, ex_id, entry, sl):
         return None
 
     n = state['published'] + 1
-    text_msg, tp1, tp2 = _public_signal_text(
+    text_msg, tp = _public_signal_text(
         n, state['target'], sym, side, ex_id, entry, sl
     )
     kwargs = {'chat_id': PUBLIC_CHANNEL_ID, 'text': text_msg}
@@ -1122,10 +1230,11 @@ async def publish_public_signal(sym, side, ex_id, entry, sl):
     state['signals'].append({
         'n': n, 'symbol': sym, 'side': side, 'exchange': ex_id,
         'entry': float(entry), 'sl': float(sl),
-        'tp1': tp1, 'tp2': tp2,
+        'tp': tp,
         'status': 'UNRESOLVED', 'r': 0.0,
         'message_id': getattr(sent, 'message_id', None),
-        'date': state['date']
+        'date': state['date'],
+        'published_at': time.time(),   # FIX: untuk OHLCV outcome tracking
     })
     _public_save_history()
     return sent
@@ -1136,6 +1245,7 @@ def _public_daily_report_text():
     wins = sum(1 for x in items if x['status'] == 'WIN')
     losses = sum(1 for x in items if x['status'] == 'LOSS')
     unresolved = sum(1 for x in items if x['status'] == 'UNRESOLVED')
+    expired = sum(1 for x in items if x['status'] == 'EXPIRED')
     decided = wins + losses
     wr = wins / decided * 100 if decided else 0.0
     net_r = sum(float(x.get('r', 0.0)) for x in items)
@@ -1147,20 +1257,18 @@ def _public_daily_report_text():
         f"📢 Public Signal: {len(items)}/{state['target']}\n"
         f"✅ WIN: {wins}\n"
         f"❌ LOSS: {losses}\n"
-        f"⏳ Unresolved: {unresolved}\n\n"
+        f"⏳ Unresolved: {unresolved}\n"
+        f"⌛ Expired: {expired}\n\n"
         f"🏆 Win Rate: <b>{wr:.2f}%</b>\n"
         f"📈 Net Result: <b>{net_r:+.2f}R</b>\n\n"
-        f"🎯 TP1 (1R): {sum(1 for x in items if x['status']=='WIN' and x.get('r') == 1)}\n"
-        f"🚀 TP2 (2R): {sum(1 for x in items if x['status']=='WIN' and x.get('r') == 2)}\n"
-        f"🛑 SL: {losses}\n\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"📌 <b>STATUS: TRADE SELESAI</b>\n\n"
         f"Semua public signal hari ini telah selesai.\n"
         f"Public signal akan kembali tersedia besok."
     )
 
+# ===== FIX #12: OHLCV-based outcome (urutan SL/TP akurat) =====
 async def update_public_signal_outcomes():
-    """Evaluate unresolved public signals: 1R/2R = WIN, SL = LOSS."""
     state = _public_reset_if_new_day()
     for sig in state['signals']:
         if sig.get('status') != 'UNRESOLVED':
@@ -1173,24 +1281,35 @@ async def update_public_signal_outcomes():
         if ex is None or not sym:
             continue
         try:
-            px = float(ex.fetch_ticker(sym)['last'])
-            side = sig.get('side')
-            if side == 'BUY':
-                if px <= float(sig['sl']):
-                    _public_record_outcome(sig, 'LOSS', -1)
-                elif px >= float(sig['tp2']):
-                    _public_record_outcome(sig, 'WIN', 2)
-                elif px >= float(sig['tp1']):
-                    _public_record_outcome(sig, 'WIN', 1)
-            elif side == 'SELL':
-                if px >= float(sig['sl']):
-                    _public_record_outcome(sig, 'LOSS', -1)
-                elif px <= float(sig['tp2']):
-                    _public_record_outcome(sig, 'WIN', 2)
-                elif px <= float(sig['tp1']):
-                    _public_record_outcome(sig, 'WIN', 1)
+            published_at = float(sig.get('published_at') or 0)
+            # Timeout 7 hari → EXPIRED
+            if published_at and (time.time() - published_at) > PUBLIC_SIGNAL_MAX_AGE:
+                _public_record_outcome(sig, 'EXPIRED', 0)
+                continue
+
+            bars = await asyncio.to_thread(ex.fetch_ohlcv, sym, '5m', 1000)
+            for bar in bars:
+                ts = bar[0] / 1000.0
+                if ts < published_at:
+                    continue
+                high, low = float(bar[2]), float(bar[3])
+                if sig['side'] == 'BUY':
+                    # SL pertama dianggap LOSS (konservatif)
+                    if low <= float(sig['sl']):
+                        _public_record_outcome(sig, 'LOSS', -1); break
+                    if high >= float(sig['tp']):
+                        _public_record_outcome(sig, 'WIN', 1); break
+                else:
+                    if high >= float(sig['sl']):
+                        _public_record_outcome(sig, 'LOSS', -1); break
+                    if low <= float(sig['tp']):
+                        _public_record_outcome(sig, 'WIN', 1); break
         except Exception:
             continue
+
+async def _public_cycle():
+    await update_public_signal_outcomes()
+    await send_public_daily_report()
 
 async def send_public_daily_report(force=False):
     global PUBLIC_LAST_DAILY_REPORT_DATE
@@ -1219,8 +1338,6 @@ async def send_public_daily_report(force=False):
 
 async def _public_weekly_report():
     global PUBLIC_LAST_WEEKLY_REPORT_DATE
-    """Weekly report is sent Sunday morning from the persisted public history."""
-    # Uses only signals recorded by this public-channel layer.
     if not PUBLIC_CHANNEL_ID:
         return
     now = datetime.now(WIB)
@@ -1229,11 +1346,8 @@ async def _public_weekly_report():
     sunday_key = now.date().isoformat()
     if PUBLIC_LAST_WEEKLY_REPORT_DATE == sunday_key:
         return
-    # Weekly aggregation can be populated by the daily history hook below.
     wins = losses = unresolved = 0
     net_r = 0.0
-    # Current-day signals are included; prior days require persistence.
-    # We keep a small JSON file, not trade DB, so public stats don't alter trading.
     path = Path("public_signal_history.json")
     try:
         history = json.loads(path.read_text(encoding='utf-8')) if path.exists() else []
@@ -1279,9 +1393,7 @@ async def _public_weekly_report():
     except Exception:
         pass
 
-
 def _submit_async(coro):
-    """Submit a coroutine from the synchronous trading worker to aiogram's loop."""
     loop = MAIN_ASYNC_LOOP
     if loop is None or not loop.is_running():
         try:
@@ -1301,7 +1413,6 @@ def _submit_async(coro):
 # =================================================================
 # MARKET SCANNER
 # =================================================================
-# LOGIC TRADE TIDAK DIUBAH
 def _is_retryable_market_error(ex_id, exc):
     text = str(exc).lower()
     return (
@@ -1314,13 +1425,11 @@ def _is_retryable_market_error(ex_id, exc):
         )
     )
 
-
 NON_CRYPTO_MARKET_TYPES = {
     'stock', 'stocks', 'equity', 'equities', 'etf', 'index', 'indices',
     'forex', 'fiat', 'commodity', 'commodities', 'bond', 'bonds',
     'tokenized_stock', 'tokenized_equity', 'security', 'securities',
 }
-
 
 def _text_looks_non_crypto(value):
     text = str(value or '').strip().lower()
@@ -1331,21 +1440,10 @@ def _text_looks_non_crypto(value):
         'commodity', 'bond', 'security', 'tokenized stock', 'tokenized equity',
     ))
 
-
 def _is_crypto_usdt_perpetual_market(ex, sym, market):
-    """Strictly reject non-crypto perpetuals such as tokenized stocks.
-
-    Some CEXs list equity/tokenized-stock perpetuals using the same
-    ``contract + swap + USDT settle`` shape as crypto futures. Therefore the
-    contract/settle check alone is not enough. Prefer CCXT currency metadata,
-    then exchange market metadata, and fail closed when a market is explicitly
-    identified as non-crypto.
-    """
     base = str(market.get('base', '')).upper()
     if not base:
         return False
-
-    # CCXT currency metadata is the strongest generic discriminator.
     currencies = getattr(ex, 'currencies', None) or {}
     cur = currencies.get(base) or currencies.get(str(market.get('baseId', '')).upper())
     if isinstance(cur, dict):
@@ -1354,7 +1452,6 @@ def _is_crypto_usdt_perpetual_market(ex, sym, market):
             return False
         if ctype == 'crypto':
             return True
-        # Some exchanges expose a crypto flag instead of type.
         if cur.get('crypto') is True:
             return True
         if cur.get('crypto') is False:
@@ -1372,8 +1469,6 @@ def _is_crypto_usdt_perpetual_market(ex, sym, market):
     if any(_text_looks_non_crypto(v) for v in metadata_values):
         return False
 
-    # Explicit legacy/non-crypto symbols seen in old versions must never be
-    # reintroduced into the Owner/VIP scanner.
     legacy_non_crypto_bases = {
         'AAPL', 'AMZN', 'AMD', 'COIN', 'CMCSA', 'GOOG', 'GOOGL', 'META',
         'MSFT', 'NFLX', 'NVDA', 'ORCL', 'TSLA', 'MSTR', 'QQQ', 'SPY',
@@ -1382,22 +1477,25 @@ def _is_crypto_usdt_perpetual_market(ex, sym, market):
     if base in legacy_non_crypto_bases:
         return False
 
-    # If no metadata says the instrument is non-crypto, keep the normal crypto
-    # CEX market. This preserves legitimate crypto assets whose currency type
-    # is omitted by an exchange while still rejecting explicitly tagged stocks.
+    if currencies and cur is None:
+        return False
+
+    non_crypto_bases = {
+        'AAPL','AMZN','AMD','COIN','CMCSA','GOOG','GOOGL','META','MSFT','NFLX',
+        'NVDA','ORCL','TSLA','MSTR','QQQ','SPY','NDAQ','HOOD','PLTR','INTC',
+        'BA','DIS','PYPL','UBER','JPM','BAC','WMT','COST','PEP','KO','XOM',
+        'CVX','PFE','MRK','JNJ','V','MA','CSCO','CRM','ADBE','AVGO','QCOM',
+        'T','VZ','GE','CAT','IBM','ABT','LLY','NFLX','SHOP','SNOW',
+    }
+    if base in non_crypto_bases:
+        return False
+
     return True
 
-
+# ===== FIX #2: filter '1000' dihapus =====
 def _valid_usdt_swap_symbols(exchange_key, ex_id, ex):
-    """Return active USDT-settled *crypto* perpetual symbols only.
-
-    Tokenized-stock/equity perpetuals are deliberately excluded even when the
-    exchange exposes them as contract/swap/USDT markets. This is the final
-    scanner gate used by both Owner and VIP.
-    """
     markets = EXCHANGE_MARKETS.get(exchange_key) or getattr(ex, 'markets', {}) or {}
     symbols = []
-
     for sym, m in markets.items():
         if not isinstance(m, dict):
             continue
@@ -1411,27 +1509,30 @@ def _valid_usdt_swap_symbols(exchange_key, ex_id, ex):
             continue
         if str(m.get('settle', '')).upper() != 'USDT':
             continue
-        if any(x in sym.upper() for x in ('TEST', '1000', 'BULL', 'BEAR')):
+        base = str(m.get('base', '')).upper()
+        # Hanya tolak leveraged-token (2L/2S/3L/3S/UP/DOWN/BULL/BEAR) dan pair test
+        if 'TEST' in sym.upper():
+            continue
+        if any(x in base for x in ('BULL', 'BEAR')):
+            continue
+        if re.search(r'\d+[LS]$', base):
             continue
         if not _is_crypto_usdt_perpetual_market(ex, sym, m):
             continue
         symbols.append(sym)
 
-    core = [s for s in CORE_PAIRS if s in symbols]
+    core_set = {c.upper() for c in CORE_PAIRS}
+    core = sorted(s for s in symbols if s.split(':')[0].upper() in core_set)
     rest = sorted(s for s in symbols if s not in core)
     return core + rest
 
-
 def _bingx_ohlcv(ex, symbol, timeframe, limit):
-    """Rate-limit BingX public OHLCV calls without blocking other CEXs."""
     if getattr(ex, 'id', '') != 'bingx':
         return ex.fetch_ohlcv(symbol, timeframe, limit=limit)
-
     now = time.time()
     wait = EXCHANGE_REQUEST_NEXT.get('bingx', 0) - now
     if wait > 0:
         time.sleep(wait)
-
     try:
         data = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
         EXCHANGE_REQUEST_NEXT['bingx'] = time.time() + BINGX_REQUEST_SPACING
@@ -1440,6 +1541,38 @@ def _bingx_ohlcv(ex, symbol, timeframe, limit):
         EXCHANGE_REQUEST_NEXT['bingx'] = time.time() + BINGX_REQUEST_SPACING
         raise
 
+# ===== Helper baru: bangun params SL/TP per exchange dengan format yang benar =====
+def _build_sl_tp_params(ex_id, sl, tp):
+    """Return dict params SL/TP yang valid untuk tiap CEX."""
+    params = {
+        'stopLoss':   {'triggerPrice': float(sl)},
+        'takeProfit': {'triggerPrice': float(tp)},
+    }
+    if ex_id == 'binance':
+        params['stopLoss']['workingType'] = 'MARK_PRICE'
+        params['takeProfit']['workingType'] = 'MARK_PRICE'
+    elif ex_id == 'bybit':
+        params['stopLoss']['triggerBy'] = 'MarkPrice'
+        params['takeProfit']['triggerBy'] = 'MarkPrice'
+    elif ex_id == 'bingx':
+        params['stopLoss']['priceType'] = 'MARK_PRICE'
+        params['takeProfit']['priceType'] = 'MARK_PRICE'
+    elif ex_id == 'bitget':
+        params['oneWayMode'] = True
+        params['hedged'] = False
+    return params
+
+# ===== FIX #9: set isolated margin mode sekali per symbol =====
+def _ensure_isolated_margin(ex, ex_id, sym):
+    key = f"{ex_id}::{id(ex)}::{sym}"
+    if key in MARGIN_MODE_SET:
+        return
+    try:
+        ex.set_margin_mode('isolated', sym)
+    except Exception:
+        # Sudah isolated atau exchange tidak support — abaikan
+        pass
+    MARGIN_MODE_SET.add(key)
 
 def _scan_one_exchange(exchange_key, ex, pair_perf):
     user_id, ex_id = _split_exchange_key(exchange_key)
@@ -1463,14 +1596,9 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
             return 0
 
-        # IMPORTANT:
-        # Do not use one "probe" symbol to gate the entire exchange.
-        # BingX can return 100410 on one request while other symbols are fine.
-        # Scan a small rotating batch instead of firing hundreds of OHLCV
-        # requests at once. This keeps M15 logic unchanged while avoiding
-        # BingX's global/IP+UID rate limiter.
+        # FIX #11: BingX batch 8 (sebelumnya 4)
         if ex_id == 'bingx':
-            batch_size = 4
+            batch_size = 8
             cursor = EXCHANGE_SCAN_CURSOR.get(exchange_key, 0) % len(symbols)
             scan_symbols = [
                 symbols[(cursor + i) % len(symbols)]
@@ -1478,17 +1606,16 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             ]
             EXCHANGE_SCAN_CURSOR[exchange_key] = (cursor + len(scan_symbols)) % len(symbols)
         else:
-            # Other exchanges retain the existing broad scan behavior.
             scan_symbols = symbols
 
         user_is_owner = (str(user_id) == 'OWNER')
+        if not user_is_owner and get_vip_member(user_id) is None:
+            runtime['last_reason'] = 'VIP tidak aktif / expired'
+            EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
+            return 0
         risk_cfg = get_cex_risk_settings(user_id, ex_id)
         refresh_owner_eligible_pairs()
         if not user_is_owner and OWNER_PAIR_FILTER.get('enabled', True):
-            # VIP receives only the Owner-approved global eligible universe.
-            # Owner itself is intentionally unrestricted and may scan all valid
-            # USDT perpetual pairs to discover future eligible candidates.
-            # Turning the Owner filter OFF intentionally removes this VIP pair gate.
             scan_symbols = [sym for sym in scan_symbols if is_pair_owner_eligible(sym)]
         user_cfg = get_user_settings(user_id) if not user_is_owner else None
         if not user_is_owner and not user_cfg['auto_trade']:
@@ -1502,12 +1629,20 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         )[0][0]
         user_max_pos = int(risk_cfg['max_pos'])
         slots = max(0, user_max_pos - active_count)
-        today_trades = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",(user_id,ex_id))[0][0]
+        today_trades = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? "
+            "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
+            (user_id, ex_id)
+        )[0][0]
         if today_trades >= int(risk_cfg['max_trades_day']):
             runtime['last_reason'] = f"Max entry/trade tercapai ({today_trades}/{risk_cfg['max_trades_day']})"
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
             return 0
-        today_losses = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status='CLOSED (SL)' AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",(user_id,ex_id))[0][0]
+        today_losses = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? "
+            "AND status='CLOSED (SL)' AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
+            (user_id, ex_id)
+        )[0][0]
         if today_losses >= int(risk_cfg['max_loss']):
             runtime['last_reason'] = f"Max loss tercapai ({today_losses}/{risk_cfg['max_loss']})"
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
@@ -1523,11 +1658,8 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         for sym in scan_symbols:
             if created >= slots:
                 break
-
             if is_manual_alert_symbol(sym):
-                # Crypto-only engine: ignore legacy FX/manual-alert symbols.
                 continue
-
             try:
                 if ex_id == 'bingx':
                     m15 = _bingx_ohlcv(ex, sym, '15m', 50)
@@ -1538,9 +1670,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     h1 = ex.fetch_ohlcv(sym, '1h', limit=60)
                     d1 = ex.fetch_ohlcv(sym, '1d', limit=2)
             except Exception as e:
-                # A BingX 100410 belongs to this symbol/request only.
-                # Never abort the whole BingX scan and never put the entire
-                # CEX into a 90-second dead period.
                 if _is_retryable_market_error(ex_id, e):
                     rate_limited += 1
                     runtime['last_reason'] = f'{sym}: market cooldown, skip symbol'
@@ -1560,6 +1689,16 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 runtime['last_reason'] = f'{sym}: no setup / filter'
                 continue
 
+            # ===== FIX #12-trading: validasi TP/SL relatif ke entry =====
+            if sig == 'BUY':
+                if not (sl < en < tp):
+                    runtime['last_reason'] = f'{sym}: invalid BUY setup (sl={sl:.6g}, en={en:.6g}, tp={tp:.6g})'
+                    continue
+            else:
+                if not (tp < en < sl):
+                    runtime['last_reason'] = f'{sym}: invalid SELL setup (tp={tp:.6g}, en={en:.6g}, sl={sl:.6g})'
+                    continue
+
             exists = db_read(
                 "SELECT 1 FROM trades "
                 "WHERE user_id=? AND exchange_id=? AND symbol=? AND side=? "
@@ -1573,76 +1712,120 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             lev = int(risk_cfg['leverage'])
             margin = float(risk_cfg['margin'])
             dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
-            # Market execution uses the live price for sizing. The retracement
-            # level from analyze_smc_retrace remains the strategy reference
-            # (and is retained for SL/TP calculation/public signal context).
+
+            # FIX: precision rounding
+            try:
+                en = float(ex.price_to_precision(sym, en))
+                sl = float(ex.price_to_precision(sym, sl))
+                tp = float(ex.price_to_precision(sym, tp))
+            except Exception:
+                pass
+
             try:
                 live_price = float(ex.fetch_ticker(sym).get('last') or en)
             except Exception:
                 live_price = float(en)
-            if live_price <= 0:
-                runtime['last_reason'] = f'{sym}: invalid live price'
+            if live_price <= 0 or en <= 0:
+                runtime['last_reason'] = f'{sym}: invalid price'
                 continue
-            qty = (margin * lev) / live_price
+            if sig == 'BUY' and float(en) >= live_price:
+                runtime['last_reason'] = f'{sym}: BUY retracement already crossed; skip stale limit'
+                continue
+            if sig == 'SELL' and float(en) <= live_price:
+                runtime['last_reason'] = f'{sym}: SELL retracement already crossed; skip stale limit'
+                continue
+
+            qty = (margin * lev) / float(en)
+            try:
+                qty = float(ex.amount_to_precision(sym, qty))
+            except Exception:
+                pass
+            if qty <= 0:
+                runtime['last_reason'] = f'{sym}: qty=0 setelah precision'
+                continue
+
+            # FIX #13-trading: min notional check
+            market = EXCHANGE_MARKETS.get(exchange_key, {}).get(sym, {})
+            limits = (market.get('limits') or {}).get('cost') or {}
+            min_cost = limits.get('min') or 0
+            try:
+                min_cost = float(min_cost)
+            except Exception:
+                min_cost = 0
+            notional = qty * en
+            if min_cost and notional < min_cost:
+                runtime['last_reason'] = f'{sym}: notional ${notional:.4f} < min ${min_cost:.2f}'
+                continue
+
             mode = "[DRY RUN]" if dry_run else "[REAL TRADE]"
             ord_id = f"sim_{int(time.time()*1000)}"
 
             if not dry_run:
+                # FIX #7: set_leverage gagal → alert + skip
                 try:
                     ex.set_leverage(lev, sym)
-                except Exception:
-                    pass
+                except Exception as e:
+                    send_error_alert(f"set_leverage gagal {ex_id}/{sym} (lev={lev}x): {e}")
+                    continue
+
+                # FIX #9: isolated margin mode
+                _ensure_isolated_margin(ex, ex_id, sym)
 
                 ok_mode, mode_msg = ensure_one_way_mode(ex, ex_id, sym)
                 if not ok_mode:
                     send_error_alert(f"Order Fails {ex_id}/{sym}: One-Way Mode wajib aktif: {mode_msg}")
                     continue
 
-                order_params = {
-                    'stopLoss': {
-                        'triggerPrice': float(sl),
-                        'stopPrice': float(sl),
-                        'type': 'mark_price',
-                    },
-                    'takeProfit': {
-                        'triggerPrice': float(tp),
-                        'stopPrice': float(tp),
-                        'type': 'mark_price',
-                    },
-                }
-                # Bitget explicitly requires oneWayMode=True when the account
-                # is in one-way position mode. Do not send hedge/tradeSide.
-                if ex_id == 'bitget':
-                    order_params['oneWayMode'] = True
-                    order_params['hedged'] = False
-
-            actual_entry = float(live_price)
-            trade_status = 'OPEN'
-            order_type = 'MARKET'
+            actual_entry = float(en)
+            trade_status = 'PENDING'
+            order_type = 'LIMIT'
 
             if not dry_run:
+                # ===== FIX #1 + #19: SL/TP format + fallback =====
+                sl_tp_params = _build_sl_tp_params(ex_id, sl, tp)
+                order_params_with = dict(sl_tp_params)
                 try:
                     result = ex.create_order(
-                        sym,
-                        'market',
-                        'buy' if sig == 'BUY' else 'sell',
-                        qty,
-                        None,
-                        params=order_params
+                        sym, 'limit', 'buy' if sig == 'BUY' else 'sell',
+                        qty, float(en), params=order_params_with
                     )
                     ord_id = str(result.get('id') or '')
                     if not ord_id:
                         raise RuntimeError('Exchange tidak mengembalikan order ID.')
-                    avg = result.get('average')
-                    filled = result.get('filled')
-                    if avg not in (None, '', 0):
-                        actual_entry = float(avg)
-                    elif filled and result.get('cost'):
-                        actual_entry = float(result['cost']) / float(filled)
+                except Exception as e_first:
+                    err_text = str(e_first)
+                    # Coba fallback: entry order saja tanpa SL/TP
+                    try:
+                        result = ex.create_order(
+                            sym, 'limit', 'buy' if sig == 'BUY' else 'sell',
+                            qty, float(en), params=None
+                        )
+                        ord_id = str(result.get('id') or '')
+                        if not ord_id:
+                            raise RuntimeError('Fallback order tidak mengembalikan order ID.')
+                        send_error_alert(
+                            f"SL/TP attach gagal {ex_id}/{sym} — order entry dibuat TANPA SL/TP. "
+                            f"Alasan: {err_text[:200]}. Pasang manual atau cek log!"
+                        )
+                    except Exception as e_fallback:
+                        send_error_alert(
+                            f"Order Fails {ex_id}/{sym}: primary={err_text[:200]} | fallback={e_fallback}"
+                        )
+                        continue
+
+                avg = result.get('average')
+                filled = result.get('filled')
+                if avg not in (None, '', 0):
+                    actual_entry = float(avg)
+                elif filled and result.get('cost'):
+                    actual_entry = float(result['cost']) / float(filled)
+
+                exchange_status = str(result.get('status') or '').lower()
+                if exchange_status in ('closed', 'filled'):
                     trade_status = 'OPEN'
-                except Exception as e:
-                    send_error_alert(f"Order Fails {ex_id}/{sym}: {e}")
-                    continue
+                else:
+                    confirmed = _real_exchange_order_state(ex, sym, ord_id)
+                    trade_status = 'OPEN' if confirmed == 'FILLED' else 'PENDING'
 
             conn = sqlite3.connect(DB_FILE, timeout=10)
             try:
@@ -1657,14 +1840,17 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             finally:
                 conn.close()
 
+            status_text = 'FILLED' if trade_status == 'OPEN' else 'PENDING LIMIT'
             send_user_telegram(
                 user_id,
                 f"🎯 <b>{mode}</b>\n"
                 f"CEX: {ex_id.upper()} | {sym} | {sig}\n"
-                f"Entry: {actual_entry:.5f}"
+                f"Entry LIMIT: {float(en):.8g}\n"
+                f"SL: {float(sl):.8g} | TP: {float(tp):.8g}\n"
+                f"Qty: {qty:g} | Notional: ${notional:.4f}\n"
+                f"Status: <b>{status_text}</b>"
             )
             try:
-                # Public channel is broadcast-only; this never opens or changes a trade.
                 if user_is_owner:
                     _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
             except Exception:
@@ -1678,8 +1864,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
 
         if rate_limited:
             runtime['last_reason'] = (
-                f'{rate_limited} symbol request kena 100410, '
-                f'skip lokal; scanner tetap jalan'
+                f'{rate_limited} symbol request kena 100410, skip lokal; scanner tetap jalan'
             )
 
         runtime['state'] = 'SCANNING'
@@ -1690,19 +1875,14 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         runtime['state'] = 'ERROR'
         runtime['last_reason'] = str(e)[:160]
         set_runtime_event(f'{ex_id.upper()} scanner error')
-        # Only a genuine exchange-level failure gets a short retry delay.
         EXCHANGE_SCAN_NEXT[exchange_key] = time.time() + SCANNER_MIN_INTERVAL
         if _is_retryable_market_error(ex_id, e):
-            send_error_alert(
-                f"Scan Ex [{ex_id}]: market data cooldown "
-                f"(skip batch, scanner lanjut)"
-            )
+            send_error_alert(f"Scan Ex [{ex_id}]: market data cooldown (skip batch, scanner lanjut)")
         else:
             send_error_alert(f"Scan Ex [{ex_id}]: {e}")
         return 0
 
 def scan_markets():
-    """Scan every enabled CEX independently without changing SMC formulas."""
     try:
         pair_perf = {}
         rows = db_read(
@@ -1716,16 +1896,13 @@ def scan_markets():
             else:
                 pair_perf[sym]['l'] += 1
 
-        # Snapshot to avoid mutation while Telegram ON/OFF reloads exchanges.
         for exchange_key, ex in list(exchanges.items()):
             _scan_one_exchange(exchange_key, ex, pair_perf)
-
     except Exception as e:
         send_error_alert(f"Scanner engine: {e}")
 
-
 # =================================================================
-# TELEGRAM BOT - AIOGRAM + INLINE KEYBOARD + CALLBACK QUERY
+# TELEGRAM BOT
 # =================================================================
 bot = Bot(
     token=TELEGRAM_BOT_TOKEN,
@@ -1733,15 +1910,11 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# Conversational API setup state.
-# {chat_id: {stage, ex_id, api, secret, password, prompt_message_id, ack_message_id}}
-# Prompt/ack message IDs are tracked so the API setup conversation can be cleaned up.
 PENDING_API_SETUP = {}
 PENDING_RESTORE = set()
 PENDING_RISK_SETTING = {}
 BACKUP_DIR = Path("backups")
 BACKUP_DIR.mkdir(exist_ok=True)
-
 
 def _chat_id(obj):
     chat = obj.chat if hasattr(obj, 'chat') else obj.message.chat
@@ -1798,33 +1971,6 @@ def is_allowed_chat(message_or_callback):
 def require_owner(obj):
     return is_owner(obj)
 
-
-def get_owner_eligible_pairs():
-    return sorted(set(OWNER_PAIR_FILTER.get('eligible_pairs') or DEFAULT_OWNER_ELIGIBLE_PAIRS))
-def is_pair_owner_eligible(symbol):
-    return (not OWNER_PAIR_FILTER.get('enabled',True)) or str(symbol).upper() in {p.upper() for p in get_owner_eligible_pairs()}
-def get_owner_dry_run(ex_id):
-    return bool(CONFIG.get('DRY_RUN_CEX',{}).get(ex_id,CONFIG.get('DRY_RUN',True)))
-def set_owner_dry_run(ex_id,value):
-    CONFIG.setdefault('DRY_RUN_CEX',{})[ex_id]=bool(value); update_db_setting(f'dry_run_{ex_id}',1.0 if value else 0.0)
-
-def owner_pair_filter_text():
-    pairs = get_owner_eligible_pairs()
-    return (
-        "📊 <b>OWNER PAIR PERFORMANCE FILTER</b>\n\n"
-        f"Status: {'🟢 ON' if OWNER_PAIR_FILTER.get('enabled', True) else '🔴 OFF'}\n"
-        f"Pair eligible: <b>{len(pairs)}</b>\n\n"
-        + "\n".join(f"• {p}" for p in pairs)
-        + "\n\n⚠️ Filter ini global. Semua VIP mengikuti daftar pair Owner."
-    )
-
-def owner_pair_filter_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🟢 FILTER ON/OFF", callback_data="owner_pair_toggle")],
-        [InlineKeyboardButton(text="🔄 DEFAULT PAIRS", callback_data="owner_pair_default")],
-        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
-    ])
-
 def owner_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 PAIR PERFORMANCE", callback_data="owner_pair_filter")],
@@ -1843,7 +1989,6 @@ def owner_keyboard():
         [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
     ])
 
-
 def vip_settings_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💵 MARGIN", callback_data="vip_set_margin")],
@@ -1854,7 +1999,6 @@ def vip_settings_keyboard():
         [InlineKeyboardButton(text="♻️ KEMBALIKAN DEFAULT", callback_data="vip_reset_settings")],
         [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
-
 
 def vip_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1869,10 +2013,8 @@ def vip_keyboard():
         [InlineKeyboardButton(text="🔄 REFRESH", callback_data="menu")]
     ])
 
-
 def role_keyboard(obj):
     return owner_keyboard() if is_owner(obj) else vip_keyboard()
-
 
 def vip_management_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1890,12 +2032,6 @@ DEFAULT_OWNER_ELIGIBLE_PAIRS = list(CORE_PAIRS)
 OWNER_PAIR_FILTER = {'enabled': True, 'eligible_pairs': list(DEFAULT_OWNER_ELIGIBLE_PAIRS), 'updated_at': None}
 
 def canonical_pair(symbol):
-    """Normalize exchange symbols for Owner/VIP performance matching.
-
-    CCXT perpetual symbols are commonly returned as BTC/USDT:USDT while the
-    bot's CORE_PAIRS and historical records may use BTC/USDT.  Eligibility
-    must compare the same canonical pair, otherwise valid pairs never match.
-    """
     text = str(symbol or '').strip().upper()
     if ':' in text:
         text = text.split(':', 1)[0]
@@ -1903,8 +2039,6 @@ def canonical_pair(symbol):
 
 def _refresh_owner_pair_state_from_db():
     enabled, pairs = _load_owner_pair_filter_state()
-    # Core pair is always present; all non-core eligibility is recalculated
-    # from Owner trade history by refresh_owner_eligible_pairs().
     pairs = sorted(set(pairs) | set(CORE_PAIRS))
     OWNER_PAIR_FILTER.update(
         enabled=enabled,
@@ -1913,7 +2047,6 @@ def _refresh_owner_pair_state_from_db():
     )
 
 def _pair_performance_snapshot():
-    """Build Owner-only closed-trade performance by canonical crypto pair."""
     out = {}
     rows = db_read(
         "SELECT symbol, status FROM trades WHERE UPPER(COALESCE(user_id,'OWNER'))='OWNER'"
@@ -1935,21 +2068,27 @@ def _pair_performance_snapshot():
     return out
 
 def refresh_owner_eligible_pairs():
-    """Rebuild VIP eligibility from Owner closed performance.
-
-    BTC/USDT and ETH/USDT are permanent core pairs. Every other crypto pair
-    needs MIN_TRADES and MIN_WR. Symbols are canonicalized so BTC/USDT and
-    BTC/USDT:USDT are treated as the same pair.
-    """
     enabled = bool(OWNER_PAIR_FILTER.get('enabled', True))
     perf = _pair_performance_snapshot()
     eligible = {canonical_pair(x) for x in CORE_PAIRS}
+    non_crypto_bases = {
+        'AAPL','AMZN','AMD','COIN','CMCSA','GOOG','GOOGL','META','MSFT','NFLX',
+        'NVDA','ORCL','TSLA','MSTR','QQQ','SPY','NDAQ','HOOD','PLTR','INTC',
+        'BA','DIS','PYPL','UBER','JPM','BAC','WMT','COST','PEP','KO','XOM',
+        'CVX','PFE','MRK','JNJ','V','MA','CSCO','CRM','ADBE','AVGO','QCOM',
+        'T','VZ','GE','CAT','IBM','ABT','LLY','SHOP','SNOW',
+    }
+    def _eligible_crypto_history(pair):
+        base = canonical_pair(pair).split('/')[0].upper()
+        return base not in non_crypto_bases and canonical_pair(pair).endswith('/USDT')
     min_trades = int(CONFIG.get('MIN_TRADES', 20))
     min_wr = float(CONFIG.get('MIN_WR', 50.0))
 
     if enabled:
         for sym, data in perf.items():
             pair = canonical_pair(sym)
+            if not _eligible_crypto_history(pair):
+                continue
             if pair in eligible:
                 continue
             total = int(data.get('w', 0)) + int(data.get('l', 0))
@@ -1957,8 +2096,7 @@ def refresh_owner_eligible_pairs():
             if total >= min_trades and wr >= min_wr:
                 eligible.add(pair)
     else:
-        # Filter OFF means VIP can use all crypto pairs known from Owner history.
-        eligible.update(canonical_pair(x) for x in perf.keys())
+        eligible.update(canonical_pair(x) for x in perf.keys() if _eligible_crypto_history(x))
 
     _save_owner_pair_filter(enabled, eligible)
     OWNER_PAIR_FILTER['eligible_pairs'] = sorted(eligible)
@@ -1972,7 +2110,6 @@ def is_pair_owner_eligible(symbol):
     if not OWNER_PAIR_FILTER.get('enabled', True):
         return True
     return canonical_pair(symbol) in set(get_owner_eligible_pairs())
-
 
 def get_owner_dry_run(ex_id):
     return bool(CONFIG.get('DRY_RUN_CEX', {}).get(ex_id, CONFIG.get('DRY_RUN', True)))
@@ -2013,13 +2150,17 @@ def owner_pair_filter_keyboard():
 def main_keyboard(obj=None):
     return role_keyboard(obj) if obj is not None else owner_keyboard()
 
-
 def bot_control_keyboard():
-    pause="▶️ RESUME TRADING" if IS_BOT_PAUSED else "⏸️ PAUSE TRADING"; loss="🟢 DAILY LOSS: ON" if CONFIG.get('DAILY_LOSS_LIMIT',True) else "🔴 DAILY LOSS: OFF"
+    pause="▶️ RESUME TRADING" if IS_BOT_PAUSED else "⏸️ PAUSE TRADING"
+    loss="🟢 DAILY LOSS: ON" if CONFIG.get('DAILY_LOSS_LIMIT',True) else "🔴 DAILY LOSS: OFF"
     rows=[[InlineKeyboardButton(text=f"{x.upper()}: {'🧪 DRY RUN' if get_owner_dry_run(x) else '⚠️ REAL'}",callback_data=f"dryrun_cex:{x}")] for x in DEFAULT_CEX]
-    rows += [[InlineKeyboardButton(text=loss,callback_data="daily_loss_toggle")],[InlineKeyboardButton(text=pause,callback_data="resume" if IS_BOT_PAUSED else "pause")],[InlineKeyboardButton(text="🧹 CANCEL ALL PENDING",callback_data="cancelall")],[InlineKeyboardButton(text="🚨 CLOSE ALL OPEN",callback_data="closeallopen")],[InlineKeyboardButton(text="🛰️ RUNTIME STATUS",callback_data="runtime_status")],[InlineKeyboardButton(text="⬅️ KEMBALI",callback_data="menu")]]
+    rows += [[InlineKeyboardButton(text=loss,callback_data="daily_loss_toggle")],
+             [InlineKeyboardButton(text=pause,callback_data="resume" if IS_BOT_PAUSED else "pause")],
+             [InlineKeyboardButton(text="🧹 CANCEL ALL PENDING",callback_data="cancelall")],
+             [InlineKeyboardButton(text="🚨 CLOSE ALL OPEN",callback_data="closeallopen")],
+             [InlineKeyboardButton(text="🛰️ RUNTIME STATUS",callback_data="runtime_status")],
+             [InlineKeyboardButton(text="⬅️ KEMBALI",callback_data="menu")]]
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def settings_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -2030,7 +2171,6 @@ def settings_keyboard():
         [InlineKeyboardButton(text="⚡ LEVERAGE", callback_data="set_lev_menu")],
         [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
-
 
 def preset_keyboard(title, values, prefix, back="settings"):
     rows = []
@@ -2045,14 +2185,12 @@ def preset_keyboard(title, values, prefix, back="settings"):
     rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data=back)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def cex_api_keyboard():
     rows = []
     for ex_id in DEFAULT_CEX:
         rows.append([InlineKeyboardButton(text=f"🔑 SET / GANTI {ex_id.upper()}", callback_data=f"api_setup:{ex_id}")])
     rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="api_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def cex_control_keyboard(user_id='OWNER'):
     rows = []
@@ -2078,7 +2216,6 @@ def cex_control_keyboard(user_id='OWNER'):
     rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="api_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def api_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔑 SET / GANTI API", callback_data="api_setup_menu")],
@@ -2086,7 +2223,6 @@ def api_menu_keyboard():
         [InlineKeyboardButton(text="📋 LIHAT API & INFO AKUN", callback_data="api_status")],
         [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
-
 
 def leverage_keyboard():
     rows = []
@@ -2098,7 +2234,6 @@ def leverage_keyboard():
     rows.append([InlineKeyboardButton(text="⚡ SEMUA CEX", callback_data="lev_all")])
     rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def leverage_value_keyboard(target):
     values = [(5,'5x'), (10,'10x'), (20,'20x'), (25,'25x'), (50,'50x'), (75,'75x'), (100,'100x')]
@@ -2112,14 +2247,12 @@ def leverage_value_keyboard(target):
     rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="set_lev_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def db_read(query, params=()):
     conn = sqlite3.connect(DB_FILE, timeout=5)
     try:
         return conn.cursor().execute(query, params).fetchall()
     finally:
         conn.close()
-
 
 def build_settings_text(user_id='OWNER'):
     user_id = _account_user_id(user_id)
@@ -2145,7 +2278,6 @@ def build_settings_text(user_id='OWNER'):
         f"Min WR: {CONFIG['MIN_WR']}%\n\n"
         f"<b>BURSA:</b>\n{chr(10).join(lines) if lines else 'Belum ada'}"
     )
-
 
 def build_positions_text(user_id='OWNER'):
     user_id = _account_user_id(user_id)
@@ -2181,7 +2313,6 @@ def build_positions_text(user_id='OWNER'):
                 f"  TP: {tp:.8f}\n"
             )
     return text
-
 
 def positions_keyboard(user_id='OWNER'):
     user_id = _account_user_id(user_id)
@@ -2219,7 +2350,6 @@ def positions_keyboard(user_id='OWNER'):
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
 def build_stats_text(user_id='OWNER'):
     user_id = _account_user_id(user_id)
     if str(user_id) == 'OWNER':
@@ -2242,7 +2372,6 @@ def build_stats_text(user_id='OWNER'):
         f"Net PnL (estimasi): ${net:.2f}\n\n"
         f"{detail}"
     )
-
 
 def build_pairperf_text():
     rows = db_read(
@@ -2277,7 +2406,6 @@ def build_pairperf_text():
         "🗑️ <b>BLACKLIST</b>\n" + ("\n".join(black) or "Belum ada")
     )
 
-
 def build_cex_status_text(user_id='OWNER'):
     user_id = _account_user_id(user_id)
     rows = db_read("SELECT ex_id, api_key, enabled, account_label, account_info FROM user_cex_settings WHERE user_id=?", (str(user_id),))
@@ -2308,11 +2436,9 @@ def build_cex_status_text(user_id='OWNER'):
                 pass
     return "🏦 <b>CEX STATUS</b>\n\n" + "\n\n".join(lines)
 
-
 def _deep_find_values(obj, wanted_keys):
     found = {}
     wanted = {str(k).lower() for k in wanted_keys}
-
     def walk(x):
         if isinstance(x, dict):
             for k, v in x.items():
@@ -2325,17 +2451,14 @@ def _deep_find_values(obj, wanted_keys):
             for v in x:
                 if len(found) < len(wanted):
                     walk(v)
-
     walk(obj)
     return found
-
 
 def _safe_call(fn):
     try:
         return fn()
     except Exception:
         return None
-
 
 def extract_account_details(ex, balance):
     info = balance.get('info', {}) if isinstance(balance, dict) else {}
@@ -2347,14 +2470,12 @@ def extract_account_details(ex, balance):
         'subAccountName', 'accountType', 'email', 'marginMode',
         'unifiedMarginStatus', 'tradePermission', 'readOnly'
     ])
-
     def pick(*keys):
         for key in keys:
             value = values.get(key.lower())
             if value:
                 return value
         return '-'
-
     usdt = balance.get('USDT', {}) if isinstance(balance, dict) else {}
     free = total = used = None
     if isinstance(usdt, dict):
@@ -2367,7 +2488,6 @@ def extract_account_details(ex, balance):
                     else: used = float(val)
             except Exception:
                 pass
-
     details = {
         'username': pick('username', 'userName', 'user_name', 'nickname', 'nickName', 'displayName', 'display_name', 'accountName', 'account_name'),
         'uid': pick('uid', 'userId', 'user_id', 'memberId', 'member_id', 'accountId', 'account_id'),
@@ -2382,26 +2502,21 @@ def extract_account_details(ex, balance):
     }
     return details
 
-
 def enrich_account_details(ex, details):
-    # These calls only READ account data. They never place an order.
     positions = _safe_call(lambda: ex.fetch_positions())
     if isinstance(positions, list):
         details['open_positions'] = sum(1 for p in positions if isinstance(p, dict) and (p.get('contracts') or p.get('contractSize') or p.get('info')))
     else:
         details['open_positions'] = 'N/A'
-
     orders = _safe_call(lambda: ex.fetch_open_orders())
     if isinstance(orders, list):
         details['open_orders'] = len(orders)
     else:
         details['open_orders'] = 'N/A'
-
     details['private_api'] = 'READ OK'
     details['exchange'] = ex.id.upper()
     details['market_type'] = str(ex.options.get('defaultType', '-')).upper()
     return details
-
 
 def format_account_details(details):
     def money(v):
@@ -2423,7 +2538,6 @@ def format_account_details(details):
         f"📊 <b>Open Positions:</b> {val('open_positions')}\n"
         f"📋 <b>Open Orders:</b> {val('open_orders')}"
     )
-
 
 def build_api_status_text(user_id='OWNER'):
     user_id = _account_user_id(user_id)
@@ -2459,7 +2573,6 @@ def build_api_status_text(user_id='OWNER'):
         blocks.append("\n".join(lines))
     return "🔐 <b>API & INFORMASI AKUN</b>\n\n" + "\n\n".join(blocks)
 
-
 def validate_cex_api(ex_id, api, secret, password=''):
     if ex_id not in DEFAULT_CEX:
         return False, "CEX tidak dikenal.", None
@@ -2467,7 +2580,6 @@ def validate_cex_api(ex_id, api, secret, password=''):
         return False, "API key/secret kosong.", None
     if ex_id == 'bitget' and not password:
         return False, "Bitget membutuhkan API Passphrase.", None
-
     try:
         params = {
             'apiKey': api,
@@ -2478,15 +2590,11 @@ def validate_cex_api(ex_id, api, secret, password=''):
         }
         if ex_id == 'bitget':
             params['password'] = password
-
         ex = getattr(ccxt, ex_id)(params)
         ex.load_markets()
         balance = ex.fetch_balance()
         details = extract_account_details(ex, balance)
         details = enrich_account_details(ex, details)
-
-        # For Bitget, a successful private endpoint is not enough if the
-        # key cannot access futures. Make that explicit in the validation.
         if ex_id == 'bitget':
             try:
                 ex.fetch_positions()
@@ -2498,9 +2606,7 @@ def validate_cex_api(ex_id, api, secret, password=''):
                         'Aktifkan Futures/UTA position/order read & write '
                         'dan gunakan API Passphrase yang benar.'
                     ), None
-
         return True, "API valid dan private endpoint berhasil diakses.", details
-
     except Exception as e:
         detail = str(e)
         if ex_id == 'bitget' and ('40014' in detail or 'Incorrect permissions' in detail or 'future pos' in detail.lower()):
@@ -2510,40 +2616,27 @@ def validate_cex_api(ex_id, api, secret, password=''):
             )
         return False, detail[:1600], None
 
-
 async def safe_answer(callback: CallbackQuery, text=None, show_alert=False):
     try:
         await callback.answer(text or "OK", show_alert=show_alert)
     except Exception:
         pass
 
-
 async def send_main_menu(message: Message, delete_trigger: bool = False):
-    """Show one clean main menu per chat.
-
-    When /menu is used, the command message is removed and the previous
-    bot-generated main menu is removed before sending the new one.
-    """
     if not is_allowed_chat(message):
         return
-
     chat_id = message.chat.id
-
-    # Remove the previous bot menu, if we know its message id.
     previous_id = LAST_MENU_MESSAGE.get(chat_id)
     if previous_id:
         try:
             await bot.delete_message(chat_id=chat_id, message_id=previous_id)
         except Exception:
             pass
-
-    # Remove the /menu command itself when requested.
     if delete_trigger:
         try:
             await message.delete()
         except Exception:
             pass
-
     sent = await bot.send_message(
         chat_id=chat_id,
         text="🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:",
@@ -2552,27 +2645,19 @@ async def send_main_menu(message: Message, delete_trigger: bool = False):
     LAST_MENU_MESSAGE[chat_id] = sent.message_id
     return sent
 
-
-
 async def delete_backup_message_later(chat_id: int, message_id: int, delay: int = 300):
-    """Delete only the Telegram backup message after 5 minutes.
-    The local backup file is intentionally kept on the VPS for migration/restore.
-    """
     await asyncio.sleep(delay)
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
     except Exception:
         pass
 
-
 def create_database_backup():
-    """Create a consistent SQLite backup without copying a live WAL file blindly."""
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     raw_db = BACKUP_DIR / f"trades_{ts}.db"
     zip_path = BACKUP_DIR / f"alchemist_backup_{ts}.zip"
     src = sqlite3.connect(DB_FILE, timeout=20)
     try:
-        # Force WAL contents into the main DB before making the backup.
         try:
             src.execute("PRAGMA wal_checkpoint(FULL)")
         except Exception:
@@ -2584,7 +2669,6 @@ def create_database_backup():
             dst.close()
     finally:
         src.close()
-
     readme = (
         "ALCHEMIST BACKUP\n"
         "================\n"
@@ -2609,16 +2693,13 @@ def create_database_backup():
             except Exception: pass
     return zip_path
 
-
 def validate_restore_db(path):
-    """Validate that an uploaded file is an Alchemist SQLite DB before replacing it."""
     conn = sqlite3.connect(str(path), timeout=10)
     try:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         required = {"trades", "settings", "user_cex_settings", "vip_members"}
         if not required.issubset(tables):
             return False, f"Tabel wajib kurang: {', '.join(sorted(required - tables))}"
-        # Basic integrity check.
         integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
         if str(integrity).lower() != "ok":
             return False, f"SQLite integrity_check: {integrity}"
@@ -2626,18 +2707,14 @@ def validate_restore_db(path):
     finally:
         conn.close()
 
-
 def restore_database_from_file(source_path):
-    """Safely replace the live DB after validation and create a rollback backup first."""
     global IS_BOT_PAUSED
     ok, detail = validate_restore_db(source_path)
     if not ok:
         return False, detail
-
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     rollback = BACKUP_DIR / f"before_restore_{ts}.db"
     try:
-        # Backup current live DB first.
         src = sqlite3.connect(DB_FILE, timeout=20)
         try:
             try: src.execute("PRAGMA wal_checkpoint(FULL)")
@@ -2647,10 +2724,8 @@ def restore_database_from_file(source_path):
             finally: dst.close()
         finally:
             src.close()
-
         IS_BOT_PAUSED = True
         time.sleep(1.0)
-        # Remove stale WAL/SHM sidecars before atomic replacement.
         for suffix in ("-wal", "-shm"):
             sidecar = Path(DB_FILE + suffix)
             try: sidecar.unlink()
@@ -2662,7 +2737,6 @@ def restore_database_from_file(source_path):
         return True, str(rollback)
     except Exception as e:
         return False, str(e)
-
 
 @dp.callback_query(F.data == "backup_menu")
 async def cb_backup_menu(callback: CallbackQuery):
@@ -2682,7 +2756,6 @@ async def cb_backup_menu(callback: CallbackQuery):
         "⚠️ Saat migrasi, jalankan hanya satu instance bot.",
         reply_markup=kb
     )
-
 
 @dp.callback_query(F.data == "backup_create")
 async def cb_backup_create(callback: CallbackQuery):
@@ -2709,7 +2782,6 @@ async def cb_backup_restore(callback: CallbackQuery):
         ])
     )
 
-
 @dp.callback_query(F.data == "restore_cancel")
 async def cb_restore_cancel(callback: CallbackQuery):
     if not require_owner(callback):
@@ -2719,10 +2791,9 @@ async def cb_restore_cancel(callback: CallbackQuery):
     await safe_answer(callback, "Restore dibatalkan")
     await callback.message.edit_text("🤖 <b>ALCHEMIST v2</b>\n\nPilih menu:", reply_markup=role_keyboard(callback))
 
-
 @dp.message(F.document)
 async def handle_restore_document(message: Message):
-    if not is_allowed_chat(message): return
+    if not require_owner(message): return
     chat_id = message.chat.id
     if chat_id not in PENDING_RESTORE:
         return
@@ -2731,7 +2802,6 @@ async def handle_restore_document(message: Message):
     if not (name.endswith(".db") or name.endswith(".zip")):
         await message.answer("❌ Kirim file backup <code>.zip</code> atau database SQLite <code>.db</code> saja.")
         return
-
     PENDING_RESTORE.discard(chat_id)
     temp_path = BACKUP_DIR / f"incoming_restore_{int(time.time())}.db"
     downloaded_path = BACKUP_DIR / f"incoming_{int(time.time())}{Path(name).suffix}"
@@ -2759,28 +2829,25 @@ async def handle_restore_document(message: Message):
                 "Database sudah diganti dan bot sekarang <b>PAUSED</b>.\n"
                 "Cek <b>RUNTIME STATUS</b> / posisi terlebih dahulu sebelum RESUME.\n\n"
                 f"Rollback otomatis dibuat: <code>{html.escape(str(detail))}</code>",
-                reply_markup=main_keyboard()
+                reply_markup=main_keyboard(message)
             )
         else:
-            await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(detail))}</code>", reply_markup=role_keyboard(callback))
+            await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(detail))}</code>", reply_markup=role_keyboard(message))
     except Exception as e:
-        await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(e))}</code>", reply_markup=role_keyboard(callback))
+        await status.edit_text(f"❌ <b>RESTORE GAGAL</b>\n\n<code>{html.escape(str(e))}</code>", reply_markup=role_keyboard(message))
     finally:
         for cleanup_path in (temp_path, downloaded_path):
             try: cleanup_path.unlink()
             except Exception: pass
 
-
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message):
     await send_main_menu(message, delete_trigger=True)
-
 
 @dp.message(Command("start"))
 @dp.message(Command("help"))
 async def cmd_start(message: Message):
     await send_main_menu(message, delete_trigger=False)
-
 
 @dp.message(Command("backup"))
 async def cmd_backup(message: Message):
@@ -2791,7 +2858,6 @@ async def cmd_backup(message: Message):
         pass
     await message.answer("💾 Backup sedang dibuat... File hanya disimpan sementara di VPS dan akan dihapus otomatis.")
     asyncio.create_task(send_temporary_backup(message.chat.id))
-
 
 @dp.message(Command("restore"))
 async def cmd_restore(message: Message):
@@ -2806,14 +2872,11 @@ async def cmd_restore(message: Message):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ BATAL", callback_data="restore_cancel")]])
     )
 
-
 @dp.message(Command("settings", "setting"))
 async def cmd_settings(message: Message):
     if not require_owner(message):
         return
-        return
     await message.answer(build_settings_text(), reply_markup=role_keyboard(message))
-
 
 @dp.message(Command("posisi"))
 async def cmd_posisi(message: Message):
@@ -2821,41 +2884,33 @@ async def cmd_posisi(message: Message):
         return
     await message.answer(build_positions_text(str(message.chat.id)), reply_markup=positions_keyboard(str(message.chat.id)))
 
-
 @dp.message(Command("stat"))
 async def cmd_stat(message: Message):
     if not is_allowed_chat(message):
         return
     await message.answer(build_stats_text(_account_user_id(message.chat.id)), reply_markup=role_keyboard(message))
 
-
 @dp.message(Command("pairperf"))
 async def cmd_pairperf(message: Message):
     if not require_owner(message):
         return
-        return
     await message.answer(build_pairperf_text(), reply_markup=role_keyboard(message))
-
 
 @dp.message(Command("pause"))
 async def cmd_pause(message: Message):
     global IS_BOT_PAUSED
     if not require_owner(message):
         return
-        return
     IS_BOT_PAUSED = True
     await message.answer("⏸️ <b>Bot PAUSED</b>", reply_markup=role_keyboard(message))
-
 
 @dp.message(Command("resume"))
 async def cmd_resume(message: Message):
     global IS_BOT_PAUSED
     if not require_owner(message):
         return
-        return
     IS_BOT_PAUSED = False
     await message.answer("▶️ <b>Bot RESUMED</b>", reply_markup=role_keyboard(message))
-
 
 @dp.message(Command("cancelall"))
 async def cmd_cancelall(message: Message):
@@ -2864,11 +2919,9 @@ async def cmd_cancelall(message: Message):
     cancel_all_pending_orders_on_pause(_account_user_id(message.chat.id))
     await message.answer(build_positions_text(str(message.chat.id)), reply_markup=role_keyboard(message))
 
-
 @dp.message(Command("dryrun"))
 async def cmd_dryrun(message: Message):
     if not require_owner(message):
-        return
         return
     parts = (message.text or '').split()
     if len(parts) != 2 or parts[1].lower() not in ('on', 'off'):
@@ -2877,8 +2930,9 @@ async def cmd_dryrun(message: Message):
     value = parts[1].lower() == 'on'
     CONFIG['DRY_RUN'] = value
     update_db_setting('dry_run', 1.0 if value else 0.0)
-    await message.answer("✅ DRY RUN AKTIF" if value else "⚠️ REAL MONEY AKTIF", reply_markup=role_keyboard(message))
-
+    for ex_id in DEFAULT_CEX:
+        set_owner_dry_run(ex_id, value)
+    await message.answer("✅ DRY RUN AKTIF (semua CEX)" if value else "⚠️ REAL MONEY AKTIF (semua CEX)", reply_markup=role_keyboard(message))
 
 @dp.message(Command("setmargin"))
 async def cmd_setmargin(message: Message):
@@ -2892,7 +2946,6 @@ async def cmd_setmargin(message: Message):
     except Exception:
         await message.answer("⚠️ Format: /setmargin 2")
 
-
 @dp.message(Command("setmaxpos"))
 async def cmd_setmaxpos(message: Message):
     if not require_owner(message):
@@ -2904,7 +2957,6 @@ async def cmd_setmaxpos(message: Message):
         await message.answer(f"✅ Max Posisi: {value}", reply_markup=role_keyboard(message))
     except Exception:
         await message.answer("⚠️ Format: /setmaxpos 2")
-
 
 @dp.message(Command("setminwr"))
 async def cmd_setminwr(message: Message):
@@ -2918,7 +2970,6 @@ async def cmd_setminwr(message: Message):
     except Exception:
         await message.answer("⚠️ Format: /setminwr 40")
 
-
 @dp.message(Command("setmintrades"))
 async def cmd_setmintrades(message: Message):
     if not require_owner(message):
@@ -2930,7 +2981,6 @@ async def cmd_setmintrades(message: Message):
         await message.answer(f"✅ Min Trade: {value}x", reply_markup=role_keyboard(message))
     except Exception:
         await message.answer("⚠️ Format: /setmintrades 5")
-
 
 @dp.message(Command("setlev"))
 async def cmd_setlev(message: Message):
@@ -2956,7 +3006,6 @@ async def cmd_setlev(message: Message):
     except Exception:
         await message.answer("⚠️ Format: /setlev 50 atau /setlev bybit 50")
 
-
 @dp.message(Command("cex"))
 async def cmd_cex(message: Message):
     if not is_allowed_chat(message): return
@@ -2972,11 +3021,10 @@ async def cmd_cex(message: Message):
             (1 if action == 'on' else 0, user_id, ex_id)
         )
         conn.commit(); conn.close()
-        reload_exchanges()
+        await asyncio.to_thread(reload_exchanges)
         await message.answer(f"✅ CEX {ex_id.upper()} di-{action.upper()}!", reply_markup=role_keyboard(message))
     except Exception:
         await message.answer("⚠️ Format: /cex on/off <cex>")
-
 
 @dp.message(Command("setapi"))
 async def cmd_setapi(message: Message):
@@ -2987,7 +3035,6 @@ async def cmd_setapi(message: Message):
         reply_markup=cex_api_keyboard()
     )
 
-
 @dp.callback_query(F.data == "api_menu")
 async def cb_api_menu(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
@@ -2996,7 +3043,6 @@ async def cb_api_menu(callback: CallbackQuery):
         "🔐 <b>API MANAGEMENT</b>\n\nPilih tindakan:",
         reply_markup=api_menu_keyboard()
     )
-
 
 @dp.callback_query(F.data == "api_setup_menu")
 async def cb_api_setup_menu(callback: CallbackQuery):
@@ -3008,7 +3054,6 @@ async def cb_api_setup_menu(callback: CallbackQuery):
         " Untuk BITGET, setelah itu bot meminta API Passphrase.",
         reply_markup=cex_api_keyboard()
     )
-
 
 @dp.callback_query(F.data.startswith("api_setup:"))
 async def cb_api_setup(callback: CallbackQuery):
@@ -3035,7 +3080,6 @@ async def cb_api_setup(callback: CallbackQuery):
     )
     PENDING_API_SETUP[str(callback.message.chat.id)]['prompt_message_id'] = callback.message.message_id
 
-
 @dp.callback_query(F.data == "api_cancel")
 async def cb_api_cancel(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
@@ -3051,7 +3095,6 @@ async def cb_api_cancel(callback: CallbackQuery):
     except TelegramBadRequest:
         pass
 
-
 @dp.callback_query(F.data == "cex_control")
 async def cb_cex_control(callback: CallbackQuery):
     if not is_allowed_chat(callback):
@@ -3065,12 +3108,10 @@ async def cb_cex_control(callback: CallbackQuery):
         reply_markup=cex_control_keyboard(user_id)
     )
 
-
 @dp.callback_query(F.data.startswith("cex_toggle:"))
 async def cb_cex_toggle(callback: CallbackQuery):
     if not is_allowed_chat(callback):
         return
-
     _, ex_id, action = callback.data.split(":", 2)
     user_id = _account_user_id(callback.message.chat.id)
     row = db_read(
@@ -3081,7 +3122,6 @@ async def cb_cex_toggle(callback: CallbackQuery):
     if not row:
         await safe_answer(callback, "API akun ini belum diset.", True)
         return
-
     api, secret, password = row[0]
     if action == 'on' and (not api or not secret or (ex_id == 'bitget' and not password)):
         await safe_answer(
@@ -3090,7 +3130,6 @@ async def cb_cex_toggle(callback: CallbackQuery):
             True
         )
         return
-
     conn = sqlite3.connect(DB_FILE, timeout=5)
     conn.cursor().execute(
         "UPDATE user_cex_settings SET enabled=? WHERE user_id=? AND ex_id=?",
@@ -3098,16 +3137,13 @@ async def cb_cex_toggle(callback: CallbackQuery):
     )
     conn.commit()
     conn.close()
-
-    reload_exchanges()
+    await asyncio.to_thread(reload_exchanges)
     await safe_answer(callback, f"{ex_id.upper()} {action.upper()}")
     await callback.message.edit_text(
         "🏦 <b>CEX CONTROL</b>\n\n"
         "Credential dan status CEX terpisah untuk setiap akun.",
         reply_markup=cex_control_keyboard(user_id)
     )
-
-
 
 @dp.callback_query(F.data == "owner_vip")
 async def cb_owner_vip(callback: CallbackQuery):
@@ -3288,7 +3324,6 @@ async def cb_vip_maxtrades(callback: CallbackQuery):
     await safe_answer(callback, f"Max trade/hari {value}")
     await callback.message.edit_text(vip_recommended_settings_text(_chat_id(callback)), reply_markup=vip_settings_keyboard())
 
-
 @dp.callback_query(F.data == "owner_pair_filter")
 async def cb_owner_pair_filter(callback: CallbackQuery):
     if not is_owner(callback):
@@ -3363,7 +3398,6 @@ async def cb_owner_pair_remove(callback: CallbackQuery):
     await safe_answer(callback, "Daftar eligible dihitung otomatis dari performa Owner.")
     await callback.message.edit_text(owner_pair_filter_text(), reply_markup=owner_pair_filter_keyboard())
 
-
 @dp.callback_query(F.data == "risk_settings")
 async def cb_risk_settings(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
@@ -3421,7 +3455,6 @@ async def cb_vip_custom_setting(callback: CallbackQuery):
     if not is_vip(callback):
         await safe_answer(callback, "Fitur VIP saja.", True)
         return
-
     field = callback.data.split(":", 1)[1]
     labels = {
         'margin': ('💵 MARGIN', 'USD', '2.5'),
@@ -3432,7 +3465,6 @@ async def cb_vip_custom_setting(callback: CallbackQuery):
     if field not in labels:
         await safe_answer(callback, "Setting tidak valid.", True)
         return
-
     title, unit, example = labels[field]
     PENDING_VIP_SETTING[str(callback.message.chat.id)] = field
     await safe_answer(callback)
@@ -3443,34 +3475,40 @@ async def cb_vip_custom_setting(callback: CallbackQuery):
         "⚠️ Nilai ini hanya berlaku untuk akun VIP kamu."
     )
 
-
 @dp.callback_query(F.data == "vip_reset_settings")
 async def cb_vip_reset_settings(callback: CallbackQuery):
     if not is_vip(callback):
         await safe_answer(callback, "Fitur VIP saja.", True)
         return
-
     uid = _chat_id(callback)
     ensure_user_settings(uid)
     conn = sqlite3.connect(DB_FILE, timeout=10)
     try:
         conn.execute(
             """UPDATE user_settings
-               SET margin=2.0, max_pos=2, max_trades_day=10, leverage=20, auto_trade=1
+               SET margin=2.0, max_pos=3, max_trades_day=10, leverage=20, auto_trade=1
                WHERE user_id=?""",
             (uid,)
         )
+        # FIX: propagate ke cex_risk_settings juga
+        for ex_id in DEFAULT_CEX:
+            conn.execute(
+                "INSERT INTO cex_risk_settings (user_id, ex_id, margin, leverage, max_pos, max_trades_day) "
+                "VALUES (?, ?, 2.0, 20, 3, 10) "
+                "ON CONFLICT(user_id, ex_id) DO UPDATE SET "
+                "margin=2.0, leverage=20, max_pos=3, max_trades_day=10, "
+                "updated_at=datetime('now')",
+                (uid, ex_id)
+            )
         conn.commit()
     finally:
         conn.close()
-
     PENDING_VIP_SETTING.pop(str(uid), None)
     await safe_answer(callback, "Default dikembalikan.")
     await callback.message.edit_text(
         vip_recommended_settings_text(uid),
         reply_markup=vip_settings_keyboard()
     )
-
 
 @dp.callback_query(F.data == "vip_settings")
 async def cb_vip_settings(callback: CallbackQuery):
@@ -3489,6 +3527,8 @@ async def cb_vip_auto_trade(callback: CallbackQuery):
     new_value=0 if cfg['auto_trade'] else 1
     set_user_setting(uid, 'auto_trade', new_value)
     await safe_answer(callback, "Auto Trade ON" if new_value else "Auto Trade OFF")
+    # FIX: reload exchanges karena auto_trade=OFF harus stop exchange init
+    await asyncio.to_thread(reload_exchanges)
     await callback.message.edit_text(vip_recommended_settings_text(uid), reply_markup=vip_settings_keyboard())
 
 @dp.callback_query(F.data == "vip_auto_confirm")
@@ -3497,6 +3537,7 @@ async def cb_vip_auto_confirm(callback: CallbackQuery):
         await safe_answer(callback, "Fitur VIP saja.", True); return
     uid=_chat_id(callback)
     set_user_setting(uid, 'auto_trade', 1)
+    await asyncio.to_thread(reload_exchanges)
     await safe_answer(callback, "Auto Trade ON")
     await callback.message.edit_text(vip_recommended_settings_text(uid), reply_markup=vip_settings_keyboard())
 
@@ -3505,10 +3546,8 @@ async def cb_vip_duration(callback: CallbackQuery):
     if not require_owner(callback):
         await safe_answer(callback, "Akses Owner saja.", True)
         return
-
     _, duration, telegram_id = callback.data.split(":", 2)
     now = datetime.now(WIB)
-
     if duration == "lifetime":
         expires = None
         expiry_text = "♾️ LIFETIME"
@@ -3516,7 +3555,6 @@ async def cb_vip_duration(callback: CallbackQuery):
         days = int(duration)
         expires = (now + timedelta(days=days)).isoformat(timespec='seconds')
         expiry_text = f"📅 1 BULAN — {expires}"
-
     conn = sqlite3.connect(DB_FILE, timeout=10)
     try:
         conn.execute(
@@ -3530,7 +3568,6 @@ async def cb_vip_duration(callback: CallbackQuery):
         conn.commit()
     finally:
         conn.close()
-
     ensure_user_settings(telegram_id)
     PENDING_VIP_ACTION.pop(str(callback.message.chat.id), None)
     await safe_answer(callback, "VIP berhasil diaktifkan.")
@@ -3548,7 +3585,6 @@ async def cb_vip_custom(callback: CallbackQuery):
     if not require_owner(callback):
         await safe_answer(callback, "Akses Owner saja.", True)
         return
-
     telegram_id = callback.data.split(":", 1)[1]
     PENDING_VIP_ACTION[str(callback.message.chat.id)] = {
         'action': 'custom_duration',
@@ -3566,11 +3602,9 @@ async def cb_vip_custom(callback: CallbackQuery):
 async def handle_text(message: Message):
     if not is_allowed_chat(message):
         return
-
     chat_id = str(message.chat.id)
 
     vip_action = PENDING_VIP_ACTION.get(chat_id)
-
     if is_owner(message) and vip_action and vip_action.get("action") in ("owner_pair_set", "owner_pair_remove"):
         PENDING_VIP_ACTION.pop(chat_id, None)
         refresh_owner_eligible_pairs()
@@ -3628,7 +3662,6 @@ async def handle_text(message: Message):
                     raise ValueError("Max trade/hari harus 1-100.")
             else:
                 raise ValueError("Setting VIP tidak valid.")
-
             set_user_setting(chat_id, custom_field, value)
             PENDING_VIP_SETTING.pop(chat_id, None)
             await message.answer(
@@ -3653,12 +3686,10 @@ async def handle_text(message: Message):
             if action == 'add':
                 if not text.isdigit():
                     raise ValueError("Telegram ID harus angka.")
-
                 PENDING_VIP_ACTION[chat_id] = {
                     'action': 'choose_duration',
                     'telegram_id': text
                 }
-
                 await message.answer(
                     f"💎 <b>PILIH DURASI VIP</b>\n\n"
                     f"Telegram ID: <code>{text}</code>\n\n"
@@ -3680,11 +3711,9 @@ async def handle_text(message: Message):
                 months = int(text)
                 if months <= 0 or months > 120:
                     raise ValueError("Jumlah bulan harus 1-120.")
-
                 tid = vip_action['telegram_id']
                 now = datetime.now(WIB)
                 expires = (now + timedelta(days=30 * months)).isoformat(timespec='seconds')
-
                 conn = sqlite3.connect(DB_FILE, timeout=10)
                 try:
                     conn.execute(
@@ -3698,7 +3727,6 @@ async def handle_text(message: Message):
                     conn.commit()
                 finally:
                     conn.close()
-
                 PENDING_VIP_ACTION.pop(chat_id, None)
                 await message.answer(
                     f"✅ <b>VIP BERHASIL DIAKTIFKAN</b>\n\n"
@@ -3737,7 +3765,7 @@ async def handle_text(message: Message):
                     conn.commit()
                 finally:
                     conn.close()
-                ensure_user_settings(text)
+                ensure_user_settings(tid)
                 PENDING_VIP_ACTION.pop(chat_id, None)
                 await message.answer(
                     f"✅ VIP diperpanjang.\n\nID: <code>{tid}</code>\n"
@@ -3776,7 +3804,8 @@ async def handle_text(message: Message):
         return
 
     chat_id = message.chat.id
-    state = PENDING_API_SETUP.get(chat_id)
+    api_key_state = str(chat_id)
+    state = PENDING_API_SETUP.get(api_key_state)
     if not state:
         return
 
@@ -3786,7 +3815,6 @@ async def handle_text(message: Message):
 
     ex_id = state['ex_id']
 
-    # Delete the user's credential message immediately.
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message.message_id)
     except Exception:
@@ -3827,11 +3855,10 @@ async def handle_text(message: Message):
             state['ack_message_id'] = ack.message_id
             return
 
-    # Final credential is the secret for non-Bitget, or passphrase for Bitget.
     api = state.get('api', '')
     secret = state.get('secret', '')
     password = text if ex_id == 'bitget' else ''
-    PENDING_API_SETUP.pop(chat_id, None)
+    PENDING_API_SETUP.pop(api_key_state, None)
 
     for mid in (state.get('ack_message_id'), state.get('prompt_message_id')):
         if mid:
@@ -3848,7 +3875,6 @@ async def handle_text(message: Message):
         validate_cex_api, ex_id, api, secret, password
     )
 
-    # Do not keep credentials in this handler state after validation.
     api = ''
     secret = ''
     password = ''
@@ -3888,10 +3914,7 @@ async def handle_text(message: Message):
         'Trade Permission': account_details.get('trade_permission', '-'),
         'Read Only': account_details.get('read_only', '-')
     }
-    stored_info = {
-        k: v for k, v in stored_info.items()
-        if v not in (None, '', '-')
-    }
+    stored_info = {k: v for k, v in stored_info.items() if v not in (None, '', '-')}
 
     user_id = _account_user_id(chat_id)
     conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -3919,7 +3942,7 @@ async def handle_text(message: Message):
     conn.commit()
     conn.close()
 
-    reload_exchanges()
+    await asyncio.to_thread(reload_exchanges)
 
     await status_msg.edit_text(
         f"✅ <b>API {ex_id.upper()} VALID</b>\n\n"
@@ -3928,8 +3951,6 @@ async def handle_text(message: Message):
         "🔗 API sudah disimpan. CEX masih <b>OFF</b> sampai kamu menekan tombol ON.",
         reply_markup=cex_control_keyboard(user_id)
     )
-
-
 
 @dp.callback_query(F.data == "menu")
 async def cb_menu(callback: CallbackQuery):
@@ -3941,7 +3962,6 @@ async def cb_menu(callback: CallbackQuery):
     except TelegramBadRequest:
         pass
 
-
 @dp.callback_query(F.data == "positions")
 async def cb_positions(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
@@ -3952,7 +3972,6 @@ async def cb_positions(callback: CallbackQuery):
         if "message is not modified" not in str(e).lower():
             raise
 
-
 @dp.callback_query(F.data == "settings")
 async def cb_settings(callback: CallbackQuery):
     if not require_owner(callback):
@@ -3961,13 +3980,11 @@ async def cb_settings(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text(build_settings_text(str(callback.message.chat.id)), reply_markup=settings_keyboard())
 
-
 @dp.callback_query(F.data == "stats")
 async def cb_stats(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
     await callback.message.edit_text(build_stats_text(_account_user_id(callback.message.chat.id)), reply_markup=role_keyboard(callback))
-
 
 @dp.callback_query(F.data == "pairperf")
 async def cb_pairperf(callback: CallbackQuery):
@@ -3977,20 +3994,17 @@ async def cb_pairperf(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text(build_pairperf_text(), reply_markup=role_keyboard(callback))
 
-
 @dp.callback_query(F.data == "cex_status")
 async def cb_cex_status(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
     await callback.message.edit_text(build_cex_status_text(str(callback.message.chat.id)), reply_markup=role_keyboard(callback))
 
-
 @dp.callback_query(F.data == "api_status")
 async def cb_api_status(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     await safe_answer(callback)
     await callback.message.edit_text(build_api_status_text(str(callback.message.chat.id)), reply_markup=role_keyboard(callback))
-
 
 @dp.callback_query(F.data == "pause")
 async def cb_pause(callback: CallbackQuery):
@@ -4003,7 +4017,6 @@ async def cb_pause(callback: CallbackQuery):
     await safe_answer(callback, "Bot di-pause")
     await callback.message.edit_text("⏸️ <b>Bot PAUSED</b>\nPembukaan trade baru dihentikan.", reply_markup=role_keyboard(callback))
 
-
 @dp.callback_query(F.data == "resume")
 async def cb_resume(callback: CallbackQuery):
     global IS_BOT_PAUSED
@@ -4015,14 +4028,12 @@ async def cb_resume(callback: CallbackQuery):
     await safe_answer(callback, "Bot dilanjutkan")
     await callback.message.edit_text("▶️ <b>Bot RESUMED</b>\nBot kembali aktif.", reply_markup=role_keyboard(callback))
 
-
 @dp.callback_query(F.data == "runtime_status")
 async def cb_runtime_status(callback: CallbackQuery):
     if not is_allowed_chat(callback):
         return
     await safe_answer(callback)
     await callback.message.edit_text(build_runtime_status_text(_account_user_id(callback.message.chat.id)), reply_markup=runtime_status_keyboard(callback))
-
 
 @dp.callback_query(F.data == "bot_control")
 async def cb_bot_control(callback: CallbackQuery):
@@ -4037,7 +4048,6 @@ async def cb_bot_control(callback: CallbackQuery):
         "Gunakan tombol di bawah untuk mengubah kontrol yang memang tersedia di script.",
         reply_markup=bot_control_keyboard()
     )
-
 
 @dp.callback_query(F.data.startswith("dryrun_cex:"))
 async def cb_dryrun_cex(callback: CallbackQuery):
@@ -4056,27 +4066,21 @@ async def cb_dryrun_toggle(callback: CallbackQuery):
     update_db_setting('dry_run',1.0 if value else 0.0); await safe_answer(callback,"Semua CEX: DRY RUN" if value else "Semua CEX: REAL")
     await callback.message.edit_text("🎛️ <b>BOT CONTROL</b>\n\n"+"\n".join(f"• {x.upper()}: {'🧪 DRY RUN' if get_owner_dry_run(x) else '⚠️ REAL MONEY'}" for x in DEFAULT_CEX),reply_markup=bot_control_keyboard())
 
-
 @dp.callback_query(F.data == "daily_loss_toggle")
 async def cb_daily_loss_toggle(callback: CallbackQuery):
     global IS_BOT_PAUSED
     if not require_owner(callback):
         await safe_answer(callback, "Akses Owner saja.", True)
         return
-
     value = not CONFIG.get('DAILY_LOSS_LIMIT', True)
     CONFIG['DAILY_LOSS_LIMIT'] = value
     update_db_setting('daily_loss_limit', 1.0 if value else 0.0)
-
-    # If the limit is disabled, allow the engine to continue after a previous
-    # automatic daily-loss pause.
     if not value and IS_BOT_PAUSED:
         IS_BOT_PAUSED = False
         notify_runtime_status(
             "RESUMED",
             "▶️ <b>TRADING RESUMED</b>\nDaily Loss Limit dimatikan."
         )
-
     await safe_answer(
         callback,
         "Daily Loss Limit ON" if value else "Daily Loss Limit OFF"
@@ -4093,41 +4097,32 @@ async def cb_daily_loss_toggle(callback: CallbackQuery):
         reply_markup=bot_control_keyboard()
     )
 
-
 @dp.callback_query(F.data == "cancelall")
 async def cb_cancelall(callback: CallbackQuery):
     if not is_allowed_chat(callback):
         return
-
-    # OWNER may cancel all accounts.
-    # VIP may cancel ONLY its own pending orders.
     requester_id = "OWNER" if is_owner(callback) else str(callback.message.chat.id)
     cancel_all_pending_orders_on_pause(requester_id)
-
     await safe_answer(
         callback,
         "Pending order akun kamu diproses."
         if requester_id != "OWNER"
         else "Semua pending order diproses."
     )
-
     await callback.message.edit_text(
         build_positions_text(str(callback.message.chat.id)),
         reply_markup=positions_keyboard(str(callback.message.chat.id))
     )
 
-
 @dp.callback_query(F.data.startswith("closepos:"))
 async def cb_close_position(callback: CallbackQuery):
     if not is_allowed_chat(callback):
         return
-
     try:
         trade_id = int(callback.data.split(":", 1)[1])
     except (ValueError, IndexError):
         await safe_answer(callback, "ID posisi tidak valid.", show_alert=True)
         return
-
     requester = _account_user_id(callback.message.chat.id)
     owner_row = db_read("SELECT user_id FROM trades WHERE id=?", (trade_id,))
     if not owner_row:
@@ -4136,14 +4131,12 @@ async def cb_close_position(callback: CallbackQuery):
     if requester != 'OWNER' and str(owner_row[0][0]) != str(requester):
         await safe_answer(callback, "Posisi ini bukan milik akun kamu.", show_alert=True)
         return
-
     ok, detail = await asyncio.to_thread(close_open_trade, trade_id)
     if ok:
         await safe_answer(callback, "Posisi ditutup.")
         send_user_telegram(requester, f"🚨 <b>MANUAL CLOSE</b>\n{html.escape(detail)}")
     else:
         await safe_answer(callback, detail[:180], show_alert=True)
-
     try:
         await callback.message.edit_text(
             build_positions_text(str(callback.message.chat.id)),
@@ -4153,28 +4146,23 @@ async def cb_close_position(callback: CallbackQuery):
         if "message is not modified" not in str(e).lower():
             raise
 
-
 @dp.callback_query(F.data == "closeallopen")
 async def cb_close_all_open(callback: CallbackQuery):
     if not is_allowed_chat(callback):
         return
-
     requester = _account_user_id(callback.message.chat.id)
     results = await asyncio.to_thread(close_all_open_trades, requester)
     success = sum(1 for ok, _ in results if ok)
     failed = [detail for ok, detail in results if not ok]
-
     if not results:
         await safe_answer(callback, "Tidak ada posisi OPEN.", show_alert=True)
     elif failed:
         await safe_answer(callback, f"Berhasil {success}, gagal {len(failed)}.", show_alert=True)
     else:
         await safe_answer(callback, f"{success} posisi ditutup.")
-
     if results:
         lines = [f"• {detail}" for _, detail in results]
         send_user_telegram(requester, "🚨 <b>EMERGENCY CLOSE ALL OPEN</b>\n" + "\n".join(lines))
-
     try:
         await callback.message.edit_text(
             build_positions_text(str(callback.message.chat.id)),
@@ -4183,7 +4171,6 @@ async def cb_close_all_open(callback: CallbackQuery):
     except TelegramBadRequest as e:
         if "message is not modified" not in str(e).lower():
             raise
-
 
 @dp.callback_query(F.data == "set_margin_menu")
 async def cb_set_margin_menu(callback: CallbackQuery):
@@ -4193,16 +4180,14 @@ async def cb_set_margin_menu(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text("💵 <b>PILIH MARGIN / TRADE</b>", reply_markup=preset_keyboard("", [(1,'$1'),(2,'$2'),(5,'$5'),(10,'$10')], 'set_margin'))
 
-
 @dp.callback_query(F.data.startswith("set_margin:"))
 async def cb_set_margin(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback): return
     value=float(callback.data.split(':')[1])
     CONFIG['MARGIN_PER_TRADE']=value
     update_db_setting('margin', value)
     await safe_answer(callback, f"Margin ${value}")
     await callback.message.edit_text(f"✅ <b>Margin disetel:</b> ${value}", reply_markup=settings_keyboard())
-
 
 @dp.callback_query(F.data == "set_maxpos_menu")
 async def cb_set_maxpos_menu(callback: CallbackQuery):
@@ -4212,16 +4197,14 @@ async def cb_set_maxpos_menu(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text("📊 <b>PILIH MAX POSISI</b>", reply_markup=preset_keyboard("", [(1,'1'),(2,'2'),(3,'3'),(5,'5')], 'set_maxpos'))
 
-
 @dp.callback_query(F.data.startswith("set_maxpos:"))
 async def cb_set_maxpos(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback): return
     value=int(callback.data.split(':')[1])
     CONFIG['MAX_CONCURRENT_POSITIONS']=value
     update_db_setting('max_pos', value)
     await safe_answer(callback, f"Max posisi {value}")
     await callback.message.edit_text(f"✅ <b>Max posisi:</b> {value}", reply_markup=settings_keyboard())
-
 
 @dp.callback_query(F.data == "set_minwr_menu")
 async def cb_set_minwr_menu(callback: CallbackQuery):
@@ -4231,16 +4214,14 @@ async def cb_set_minwr_menu(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text("🎯 <b>PILIH MINIMUM WIN RATE</b>", reply_markup=preset_keyboard("", [(30,'30%'),(40,'40%'),(50,'50%'),(60,'60%'),(70,'70%')], 'set_minwr'))
 
-
 @dp.callback_query(F.data.startswith("set_minwr:"))
 async def cb_set_minwr(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback): return
     value=float(callback.data.split(':')[1])
     CONFIG['MIN_WR']=value
     update_db_setting('min_wr', value)
     await safe_answer(callback, f"Min WR {value}%")
     await callback.message.edit_text(f"✅ <b>Min Win Rate:</b> {value}%", reply_markup=settings_keyboard())
-
 
 @dp.callback_query(F.data == "set_mintrades_menu")
 async def cb_set_mintrades_menu(callback: CallbackQuery):
@@ -4250,16 +4231,14 @@ async def cb_set_mintrades_menu(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text("📈 <b>PILIH MINIMUM TRADE</b>", reply_markup=preset_keyboard("", [(3,'3'),(5,'5'),(10,'10'),(20,'20')], 'set_mintrades'))
 
-
 @dp.callback_query(F.data.startswith("set_mintrades:"))
 async def cb_set_mintrades(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback): return
     value=int(callback.data.split(':')[1])
     CONFIG['MIN_TRADES']=value
     update_db_setting('min_trades', value)
     await safe_answer(callback, f"Min trades {value}")
     await callback.message.edit_text(f"✅ <b>Min Trades:</b> {value}", reply_markup=settings_keyboard())
-
 
 @dp.callback_query(F.data == "set_lev_menu")
 async def cb_set_lev_menu(callback: CallbackQuery):
@@ -4269,7 +4248,6 @@ async def cb_set_lev_menu(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text("⚡ <b>PILIH CEX UNTUK LEVERAGE</b>", reply_markup=leverage_keyboard())
 
-
 @dp.callback_query(F.data == "lev_all")
 async def cb_lev_all(callback: CallbackQuery):
     if not require_owner(callback):
@@ -4278,18 +4256,16 @@ async def cb_lev_all(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text("⚡ <b>LEVERAGE SEMUA CEX</b>", reply_markup=leverage_value_keyboard('all'))
 
-
 @dp.callback_query(F.data.startswith("lev_ex:"))
 async def cb_lev_ex(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback): return
     ex_id=callback.data.split(':',1)[1]
     await safe_answer(callback)
     await callback.message.edit_text(f"⚡ <b>LEVERAGE {ex_id.upper()}</b>\nSaat ini: {CONFIG['LEVERAGE'].get(ex_id,50)}x", reply_markup=leverage_value_keyboard(ex_id))
 
-
 @dp.callback_query(F.data.startswith("lev_set:"))
 async def cb_lev_set(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
+    if not require_owner(callback): return
     _, target, value_s = callback.data.split(':',2)
     value=int(value_s)
     if target == 'all':
@@ -4306,16 +4282,12 @@ async def cb_lev_set(callback: CallbackQuery):
     await safe_answer(callback, "Leverage diperbarui")
     await callback.message.edit_text(text, reply_markup=settings_keyboard())
 
-
 async def aiogram_polling():
-    # IMPORTANT: Aiogram polling runs in the MAIN THREAD.
-    # Python signal handlers cannot be installed from a worker thread.
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(
         bot,
         allowed_updates=dp.resolve_used_update_types()
     )
-
 
 # =================================================================
 # WEB DASHBOARD & FLASK SERVER
@@ -4328,17 +4300,11 @@ def dashboard():
 
 @app.route('/api/cex-monitor')
 def api_cex_monitor():
-    """Return live CEX configuration/connection state for the web dashboard.
-
-    This endpoint only reads local bot state/database metadata. It does not
-    call private exchange endpoints on every dashboard refresh.
-    """
     try:
         rows = db_read(
             "SELECT ex_id, api_key, enabled, account_label, account_info "
-            "FROM cex_settings ORDER BY ex_id"
+            "FROM user_cex_settings WHERE user_id='OWNER' ORDER BY ex_id"
         )
-
         items = []
         for ex_id, api_key, enabled, account_label, account_info in rows:
             info = {}
@@ -4347,32 +4313,21 @@ def api_cex_monitor():
                     info = json.loads(account_info)
                 except Exception:
                     info = {}
-
             configured = bool(api_key)
-            loaded = ex_id in exchanges
+            loaded = _exchange_key('OWNER', ex_id) in exchanges
             enabled = bool(enabled)
-
             if not enabled:
-                state = 'OFF'
-                state_icon = '🔴'
+                state = 'OFF'; state_icon = '🔴'
             elif not configured:
-                state = 'API NOT SET'
-                state_icon = '🟠'
+                state = 'API NOT SET'; state_icon = '🟠'
             elif loaded:
-                state = 'ON / READY'
-                state_icon = '🟢'
+                state = 'ON / READY'; state_icon = '🟢'
             else:
-                state = 'ON / NOT LOADED'
-                state_icon = '🟡'
-
+                state = 'ON / NOT LOADED'; state_icon = '🟡'
             items.append({
-                'id': ex_id,
-                'name': ex_id.upper(),
-                'enabled': enabled,
-                'configured': configured,
-                'loaded': loaded,
-                'state': state,
-                'state_icon': state_icon,
+                'id': ex_id, 'name': ex_id.upper(),
+                'enabled': enabled, 'configured': configured, 'loaded': loaded,
+                'state': state, 'state_icon': state_icon,
                 'leverage': CONFIG['LEVERAGE'].get(ex_id, 50),
                 'account': account_label or 'Belum diverifikasi',
                 'account_type': info.get('Account Type', '-'),
@@ -4385,7 +4340,6 @@ def api_cex_monitor():
                 'trade_permission': info.get('Trade Permission', '-'),
                 'read_only': info.get('Read Only', '-')
             })
-
         return jsonify({
             'ok': True,
             'bot_paused': bool(IS_BOT_PAUSED),
@@ -4398,31 +4352,26 @@ def api_cex_monitor():
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e), 'cex': []}), 500
 
-
 @app.route('/api/stats')
 def api_stats():
-    """Dashboard statistics from the same SQLite DB used by the bot."""
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         df = pd.read_sql_query(
             "SELECT id, symbol, side, status, created_at "
-            "FROM trades WHERE status IN ('CLOSED (TP)', 'CLOSED (SL)') "
+            "FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)') "
             "ORDER BY id ASC",
             conn
         )
         conn.close()
-
         if df.empty:
             return jsonify({
-                'ok': True,
-                'dates': [], 'pnl': [],
+                'ok': True, 'dates': [], 'pnl': [],
                 'win_rate': 0, 'wins': 0, 'losses': 0,
                 'total_trades': 0, 'profit_factor': 0,
                 'net_pnl': 0, 'avg_win': 0, 'avg_loss': 0,
                 'max_drawdown': 0, 'best_trade': 0, 'worst_trade': 0,
                 'recent': [], 'daily_pnl': {}, 'daily_trades': {}
             })
-
         margin = float(CONFIG.get('MARGIN_PER_TRADE', 2.0))
         df['pnl_value'] = df['status'].apply(
             lambda x: margin if x == 'CLOSED (TP)' else -margin
@@ -4431,16 +4380,13 @@ def api_stats():
         running_peak = df['cum_pnl'].cummax()
         drawdown = running_peak - df['cum_pnl']
         max_drawdown = float(drawdown.max()) if not drawdown.empty else 0.0
-
         dt = pd.to_datetime(df['created_at'], errors='coerce')
         df['date_only'] = dt.dt.strftime('%d %b %H:%M')
         df['day_key'] = dt.dt.strftime('%Y-%m-%d')
-
         wins = int((df['status'] == 'CLOSED (TP)').sum())
         losses = int((df['status'] == 'CLOSED (SL)').sum())
         total = wins + losses
         win_rate = round((wins / total) * 100, 1) if total else 0.0
-
         gross_profit = float(df.loc[df['pnl_value'] > 0, 'pnl_value'].sum())
         gross_loss = abs(float(df.loc[df['pnl_value'] < 0, 'pnl_value'].sum()))
         profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
@@ -4449,48 +4395,28 @@ def api_stats():
         net_pnl = round(float(df['pnl_value'].sum()), 2)
         best_trade = round(float(df['pnl_value'].max()), 2)
         worst_trade = round(float(df['pnl_value'].min()), 2)
-
         daily = (
             df.dropna(subset=['day_key'])
               .groupby('day_key', as_index=False)['pnl_value']
               .sum()
         )
-        daily_pnl = {
-            str(row['day_key']): round(float(row['pnl_value']), 2)
-            for _, row in daily.iterrows()
-        }
-        daily_trades = (
-            df.dropna(subset=['day_key'])
-              .groupby('day_key')
-              .size()
-              .to_dict()
-        )
+        daily_pnl = {str(row['day_key']): round(float(row['pnl_value']), 2) for _, row in daily.iterrows()}
+        daily_trades = df.dropna(subset=['day_key']).groupby('day_key').size().to_dict()
         daily_trades = {str(k): int(v) for k, v in daily_trades.items()}
-
         recent = df.tail(10)[::-1].to_dict('records')
         return jsonify({
-            'ok': True,
-            'dates': df['date_only'].tolist(),
-            'pnl': df['cum_pnl'].tolist(),
-            'win_rate': win_rate,
-            'wins': wins,
-            'losses': losses,
-            'total_trades': total,
-            'profit_factor': profit_factor,
-            'net_pnl': net_pnl,
-            'avg_win': avg_win,
-            'avg_loss': avg_loss,
+            'ok': True, 'dates': df['date_only'].tolist(),
+            'pnl': df['cum_pnl'].tolist(), 'win_rate': win_rate,
+            'wins': wins, 'losses': losses, 'total_trades': total,
+            'profit_factor': profit_factor, 'net_pnl': net_pnl,
+            'avg_win': avg_win, 'avg_loss': avg_loss,
             'max_drawdown': round(max_drawdown, 2),
-            'best_trade': best_trade,
-            'worst_trade': worst_trade,
-            'recent': recent,
-            'daily_pnl': daily_pnl,
-            'daily_trades': daily_trades
+            'best_trade': best_trade, 'worst_trade': worst_trade,
+            'recent': recent, 'daily_pnl': daily_pnl, 'daily_trades': daily_trades
         })
     except Exception as e:
         return jsonify({
-            'ok': False,
-            'error': str(e),
+            'ok': False, 'error': str(e),
             'dates': [], 'pnl': [], 'win_rate': 0, 'wins': 0, 'losses': 0,
             'total_trades': 0, 'profit_factor': 0, 'net_pnl': 0,
             'avg_win': 0, 'avg_loss': 0, 'max_drawdown': 0,
@@ -4498,30 +4424,23 @@ def api_stats():
             'daily_pnl': {}, 'daily_trades': {}
         }), 500
 
-
 @app.route('/api/trade-detail')
 def api_trade_detail():
-    """Return the latest 30 trades for the dashboard."""
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
         rows = conn.execute(
             "SELECT id, exchange_id, symbol, side, entry_price, sl_price, "
             "tp_price, order_id, bars_count, status, created_at "
-            "FROM trades ORDER BY id DESC LIMIT 30"
+            "FROM trades WHERE user_id='OWNER' ORDER BY id DESC LIMIT 30"
         ).fetchall()
         conn.close()
-        cols = [
-            'id', 'exchange', 'symbol', 'side', 'entry', 'sl', 'tp',
-            'order_id', 'bars', 'status', 'created_at'
-        ]
+        cols = ['id', 'exchange', 'symbol', 'side', 'entry', 'sl', 'tp', 'order_id', 'bars', 'status', 'created_at']
         return jsonify({'ok': True, 'trades': [dict(zip(cols, row)) for row in rows]})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e), 'trades': []}), 500
 
-
 @app.route('/api/engine-status')
 def api_engine_status():
-    """Live engine state for the web dashboard."""
     try:
         return jsonify({
             'ok': True,
@@ -4542,10 +4461,8 @@ def api_engine_status():
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
-
 @app.route('/api/errors')
 def api_errors():
-    """Recent runtime errors for the dashboard Error Center."""
     return jsonify({'ok': True, 'errors': list(reversed(ERROR_HISTORY[-20:]))})
 
 def notify_runtime_status(new_status, text):
@@ -4555,22 +4472,25 @@ def notify_runtime_status(new_status, text):
         last_runtime_status = new_status
         send_telegram(text)
 
-
+# ===== FIX #10: reset harian pakai WIB =====
 def main_loop():
     global daily_sl_count, IS_BOT_PAUSED
-
     last_hb = time.time()
+    last_reset_day = None
     send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>\n🟢 Trading engine siap. Menunggu kondisi scan.")
 
     while True:
         try:
             now = datetime.now(WIB)
+            today_str = now.date().isoformat()
 
-            if now.hour == 7 and now.minute == 0 and now.second < 15:
+            # Reset harian pada 00:00 WIB
+            if last_reset_day != today_str and now.hour == 0:
+                last_reset_day = today_str
                 daily_sl_count = 0
                 if IS_BOT_PAUSED:
                     IS_BOT_PAUSED = False
-                    send_telegram("🌅 <b>NEW DAY RESET</b>\nBot otomatis kembali aktif.")
+                    send_telegram("🌅 <b>NEW DAY RESET (WIB)</b>\nBot otomatis kembali aktif.")
 
             if time.time() - last_hb >= 21600:
                 send_telegram(
@@ -4583,9 +4503,8 @@ def main_loop():
 
             check_and_update_daily_sl()
             update_orders_and_positions()
-            _submit_async(update_public_signal_outcomes())
+            _submit_async(_public_cycle())
             if now.hour == 7 and now.minute == 0 and now.second < 15:
-                _submit_async(send_public_daily_report())
                 if now.weekday() == 6:
                     _submit_async(_public_weekly_report())
 
@@ -4612,34 +4531,23 @@ def main_loop():
                     'WAITING',
                     "⏹️ <b>STOP TRADE / WAITING</b>\nDi luar kill zone. Bot tidak membuka trade baru dan menunggu sesi berikutnya."
                 )
-
         except Exception as e:
             send_error_alert(str(e))
-
         time.sleep(10)
-
 
 async def app_main():
     global MAIN_ASYNC_LOOP
     MAIN_ASYNC_LOOP = asyncio.get_running_loop()
-    # Initialize shared state before any worker starts.
     init_db()
     load_settings()
     _refresh_owner_pair_state_from_db()
-    # Rebuild eligible pairs immediately from existing Owner history.
-    # This preserves prior test/performance results instead of showing only CORE pairs until the next scan.
     refresh_owner_eligible_pairs()
     reload_exchanges()
-
-    # Trading engine runs in a worker thread.
     threading.Thread(
         target=main_loop,
         name='trading-engine',
         daemon=True
     ).start()
-
-    # Flask runs in a worker thread. use_reloader=False prevents Flask
-    # from spawning a second process/thread and interfering with the bot.
     threading.Thread(
         target=lambda: app.run(
             host='0.0.0.0',
@@ -4649,13 +4557,10 @@ async def app_main():
         name='flask-dashboard',
         daemon=True
     ).start()
-
-    # Aiogram MUST stay in the main thread.
     try:
         await aiogram_polling()
     finally:
         await bot.session.close()
-
 
 if __name__ == '__main__':
     try:
