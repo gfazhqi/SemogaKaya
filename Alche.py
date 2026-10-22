@@ -69,9 +69,6 @@ ERROR_COOLDOWN = 60
 MANUAL_ALERT_PAIRS = set()
 CORE_PAIRS = ('BTC/USDT', 'ETH/USDT')
 DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
-# HARD RULE: scanner trades crypto USDT perpetual swaps only.
-CRYPTO_ONLY = True
-ONE_WAY_ONLY = True
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
 def _table_columns(conn, table):
@@ -831,32 +828,7 @@ def update_orders_and_positions():
                     tag = " (DRY RUN)" if is_sim else ""
 
                     if status == 'PENDING':
-                        # REAL orders: the exchange is authoritative.
-                        # Never mark a live LIMIT order as FILLED merely because
-                        # an M15 candle touched the entry price. The exchange can
-                        # still have the order resting/pending.
-                        if not is_sim:
-                            n_stat = 'PENDING'
-                            try:
-                                live_order = ex.fetch_order(str(ord_id), sym)
-                                live_status = str(live_order.get('status', '')).lower()
-                                filled_qty = float(live_order.get('filled') or 0)
-
-                                if live_status == 'closed':
-                                    n_stat = 'OPEN'
-                                elif live_status in ('canceled', 'cancelled', 'expired', 'rejected'):
-                                    n_stat = 'CANCELLED (Exchange)'
-                                else:
-                                    # open / partially-filled / unknown-but-filled:
-                                    # keep PENDING until the exchange confirms closed.
-                                    n_stat = 'PENDING'
-                            except Exception:
-                                # If exchange status cannot be verified, keep the
-                                # order PENDING. Never generate a false FILLED alert.
-                                n_stat = 'PENDING'
-                                runtime['last_reason'] = f'{sym}: exchange order status unavailable; kept PENDING'
-                        else:
-                            n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
+                        n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
 
                         if n_stat == 'OPEN':
                             send_user_telegram(user_id, 
@@ -1343,15 +1315,87 @@ def _is_retryable_market_error(ex_id, exc):
     )
 
 
-def _valid_usdt_swap_symbols(ex_id, ex):
-    """Return active crypto USDT-settled perpetual symbols only.
+NON_CRYPTO_MARKET_TYPES = {
+    'stock', 'stocks', 'equity', 'equities', 'etf', 'index', 'indices',
+    'forex', 'fiat', 'commodity', 'commodities', 'bond', 'bonds',
+    'tokenized_stock', 'tokenized_equity', 'security', 'securities',
+}
 
-    All exchanges are restricted to crypto perpetual contracts. Spot,
-    dated futures, options, forex, equities, commodities, tokenized/non-
-    crypto instruments, and other non-swap products are excluded here.
-    The strategy itself remains M15/H1/D1.
+
+def _text_looks_non_crypto(value):
+    text = str(value or '').strip().lower()
+    if not text:
+        return False
+    return any(token in text for token in (
+        'stock', 'equity', 'etf', 'index', 'indices', 'forex', 'fiat',
+        'commodity', 'bond', 'security', 'tokenized stock', 'tokenized equity',
+    ))
+
+
+def _is_crypto_usdt_perpetual_market(ex, sym, market):
+    """Strictly reject non-crypto perpetuals such as tokenized stocks.
+
+    Some CEXs list equity/tokenized-stock perpetuals using the same
+    ``contract + swap + USDT settle`` shape as crypto futures. Therefore the
+    contract/settle check alone is not enough. Prefer CCXT currency metadata,
+    then exchange market metadata, and fail closed when a market is explicitly
+    identified as non-crypto.
     """
-    markets = EXCHANGE_MARKETS.get(ex_id) or getattr(ex, 'markets', {}) or {}
+    base = str(market.get('base', '')).upper()
+    if not base:
+        return False
+
+    # CCXT currency metadata is the strongest generic discriminator.
+    currencies = getattr(ex, 'currencies', None) or {}
+    cur = currencies.get(base) or currencies.get(str(market.get('baseId', '')).upper())
+    if isinstance(cur, dict):
+        ctype = str(cur.get('type', '')).strip().lower()
+        if ctype in NON_CRYPTO_MARKET_TYPES:
+            return False
+        if ctype == 'crypto':
+            return True
+        # Some exchanges expose a crypto flag instead of type.
+        if cur.get('crypto') is True:
+            return True
+        if cur.get('crypto') is False:
+            return False
+
+    info = market.get('info') if isinstance(market.get('info'), dict) else {}
+    metadata_values = [
+        market.get('type'), market.get('category'), market.get('assetType'),
+        market.get('instrumentType'), market.get('contractType'),
+        info.get('type'), info.get('category'), info.get('assetType'),
+        info.get('asset_type'), info.get('instrumentType'),
+        info.get('instrument_type'), info.get('securityType'),
+        info.get('security_type'), info.get('productType'), info.get('product_type'),
+    ]
+    if any(_text_looks_non_crypto(v) for v in metadata_values):
+        return False
+
+    # Explicit legacy/non-crypto symbols seen in old versions must never be
+    # reintroduced into the Owner/VIP scanner.
+    legacy_non_crypto_bases = {
+        'AAPL', 'AMZN', 'AMD', 'COIN', 'CMCSA', 'GOOG', 'GOOGL', 'META',
+        'MSFT', 'NFLX', 'NVDA', 'ORCL', 'TSLA', 'MSTR', 'QQQ', 'SPY',
+        'NDAQ', 'HOOD', 'PLTR', 'INTC', 'BA', 'DIS', 'PYPL', 'UBER',
+    }
+    if base in legacy_non_crypto_bases:
+        return False
+
+    # If no metadata says the instrument is non-crypto, keep the normal crypto
+    # CEX market. This preserves legitimate crypto assets whose currency type
+    # is omitted by an exchange while still rejecting explicitly tagged stocks.
+    return True
+
+
+def _valid_usdt_swap_symbols(exchange_key, ex_id, ex):
+    """Return active USDT-settled *crypto* perpetual symbols only.
+
+    Tokenized-stock/equity perpetuals are deliberately excluded even when the
+    exchange exposes them as contract/swap/USDT markets. This is the final
+    scanner gate used by both Owner and VIP.
+    """
+    markets = EXCHANGE_MARKETS.get(exchange_key) or getattr(ex, 'markets', {}) or {}
     symbols = []
 
     for sym, m in markets.items():
@@ -1359,28 +1403,20 @@ def _valid_usdt_swap_symbols(ex_id, ex):
             continue
         if not m.get('active', True):
             continue
-        # Crypto perpetuals only. Require CCXT's contract+swap flags and
-        # a USDT quote/settlement. Do not accept spot, dated futures,
-        # options, FX, equities, commodities, or other market types.
         if m.get('contract') is not True:
             continue
         if m.get('swap') is not True:
-            continue
-        if m.get('spot') is True or m.get('option') is True or m.get('future') is True:
             continue
         if str(m.get('quote', '')).upper() != 'USDT':
             continue
         if str(m.get('settle', '')).upper() != 'USDT':
             continue
-        if not m.get('base'):
-            continue
-        # Skip obvious test/expired/legacy instruments.
         if any(x in sym.upper() for x in ('TEST', '1000', 'BULL', 'BEAR')):
+            continue
+        if not _is_crypto_usdt_perpetual_market(ex, sym, m):
             continue
         symbols.append(sym)
 
-    # Core pairs first, then deterministic order. We do not cap by the first
-    # 60 dictionary entries because that made some CEXs effectively invisible.
     core = [s for s in CORE_PAIRS if s in symbols]
     rest = sorted(s for s in symbols if s not in core)
     return core + rest
@@ -1419,7 +1455,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         return 0
 
     try:
-        symbols = _valid_usdt_swap_symbols(ex_id, ex)
+        symbols = _valid_usdt_swap_symbols(exchange_key, ex_id, ex)
         runtime['last_scan'] = datetime.now(WIB).strftime('%H:%M:%S')
         runtime['last_reason'] = f'{len(symbols)} valid USDT perpetual markets'
 
@@ -1454,6 +1490,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             # USDT perpetual pairs to discover future eligible candidates.
             # Turning the Owner filter OFF intentionally removes this VIP pair gate.
             scan_symbols = [sym for sym in scan_symbols if is_pair_owner_eligible(sym)]
+        user_cfg = get_user_settings(user_id) if not user_is_owner else None
         if not user_is_owner and not user_cfg['auto_trade']:
             runtime['last_reason'] = 'VIP Auto Trade OFF'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
@@ -1536,7 +1573,17 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             lev = int(risk_cfg['leverage'])
             margin = float(risk_cfg['margin'])
             dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
-            qty = (margin * lev) / en
+            # Market execution uses the live price for sizing. The retracement
+            # level from analyze_smc_retrace remains the strategy reference
+            # (and is retained for SL/TP calculation/public signal context).
+            try:
+                live_price = float(ex.fetch_ticker(sym).get('last') or en)
+            except Exception:
+                live_price = float(en)
+            if live_price <= 0:
+                runtime['last_reason'] = f'{sym}: invalid live price'
+                continue
+            qty = (margin * lev) / live_price
             mode = "[DRY RUN]" if dry_run else "[REAL TRADE]"
             ord_id = f"sim_{int(time.time()*1000)}"
 
@@ -1569,15 +1616,30 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     order_params['oneWayMode'] = True
                     order_params['hedged'] = False
 
+            actual_entry = float(live_price)
+            trade_status = 'OPEN'
+            order_type = 'MARKET'
+
+            if not dry_run:
                 try:
-                    ord_id = str(ex.create_order(
+                    result = ex.create_order(
                         sym,
-                        'limit',
+                        'market',
                         'buy' if sig == 'BUY' else 'sell',
                         qty,
-                        en,
+                        None,
                         params=order_params
-                    )['id'])
+                    )
+                    ord_id = str(result.get('id') or '')
+                    if not ord_id:
+                        raise RuntimeError('Exchange tidak mengembalikan order ID.')
+                    avg = result.get('average')
+                    filled = result.get('filled')
+                    if avg not in (None, '', 0):
+                        actual_entry = float(avg)
+                    elif filled and result.get('cost'):
+                        actual_entry = float(result['cost']) / float(filled)
+                    trade_status = 'OPEN'
                 except Exception as e:
                     send_error_alert(f"Order Fails {ex_id}/{sym}: {e}")
                     continue
@@ -1588,8 +1650,8 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     "INSERT INTO trades "
                     "(user_id, exchange_id, symbol, order_type, side, entry_price, "
                     "sl_price, tp_price, order_id, status) "
-                    "VALUES (?, ?, ?, 'LIMIT', ?, ?, ?, ?, ?, 'PENDING')",
-                    (user_id, ex_id, sym, sig, en, sl, tp, ord_id)
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, ex_id, sym, order_type, sig, actual_entry, sl, tp, ord_id, trade_status)
                 )
                 conn.commit()
             finally:
@@ -1599,7 +1661,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 user_id,
                 f"🎯 <b>{mode}</b>\n"
                 f"CEX: {ex_id.upper()} | {sym} | {sig}\n"
-                f"Entry: {en:.5f}"
+                f"Entry: {actual_entry:.5f}"
             )
             try:
                 # Public channel is broadcast-only; this never opens or changes a trade.
@@ -1827,6 +1889,18 @@ PENDING_VIP_SETTING = {}
 DEFAULT_OWNER_ELIGIBLE_PAIRS = list(CORE_PAIRS)
 OWNER_PAIR_FILTER = {'enabled': True, 'eligible_pairs': list(DEFAULT_OWNER_ELIGIBLE_PAIRS), 'updated_at': None}
 
+def canonical_pair(symbol):
+    """Normalize exchange symbols for Owner/VIP performance matching.
+
+    CCXT perpetual symbols are commonly returned as BTC/USDT:USDT while the
+    bot's CORE_PAIRS and historical records may use BTC/USDT.  Eligibility
+    must compare the same canonical pair, otherwise valid pairs never match.
+    """
+    text = str(symbol or '').strip().upper()
+    if ':' in text:
+        text = text.split(':', 1)[0]
+    return text
+
 def _refresh_owner_pair_state_from_db():
     enabled, pairs = _load_owner_pair_filter_state()
     # Core pair is always present; all non-core eligibility is recalculated
@@ -1839,57 +1913,52 @@ def _refresh_owner_pair_state_from_db():
     )
 
 def _pair_performance_snapshot():
-    """Read Owner performance without discarding legacy result labels.
-
-    Older Alchemist builds used several closed-result spellings (for example
-    CLOSED (TP), TP, WIN, CLOSED (SL), SL and LOSS).  Treat only clear TP/WIN
-    or SL/LOSS results as closed outcomes so old test history remains visible.
-    Pending/open/cancelled orders are never counted.
-    """
+    """Build Owner-only closed-trade performance by canonical crypto pair."""
     out = {}
     rows = db_read(
         "SELECT symbol, status FROM trades WHERE UPPER(COALESCE(user_id,'OWNER'))='OWNER'"
     )
     for sym, stat in rows:
-        sym = normalize_crypto_symbol(sym) if 'normalize_crypto_symbol' in globals() else str(sym).upper()
+        pair = canonical_pair(sym)
+        if not pair or pair in {'', 'N/A'}:
+            continue
         st = str(stat or '').strip().upper()
         is_win = ('TP' in st) or st in {'WIN', 'WON', 'PROFIT', 'CLOSED WIN'}
         is_loss = ('SL' in st) or st in {'LOSS', 'LOSE', 'LOST', 'CLOSED LOSS'}
         if not (is_win or is_loss):
             continue
-        out.setdefault(sym, {'w': 0, 'l': 0})
+        out.setdefault(pair, {'w': 0, 'l': 0})
         if is_win:
-            out[sym]['w'] += 1
+            out[pair]['w'] += 1
         else:
-            out[sym]['l'] += 1
+            out[pair]['l'] += 1
     return out
 
 def refresh_owner_eligible_pairs():
-    """Rebuild the global VIP pair universe from Owner history.
+    """Rebuild VIP eligibility from Owner closed performance.
 
-    BTC/USDT and ETH/USDT are permanent core pairs. Every other pair must
-    meet MIN_TRADES + MIN_WR using Owner's closed trade history. A pair that
-    later falls below either threshold is automatically removed.
+    BTC/USDT and ETH/USDT are permanent core pairs. Every other crypto pair
+    needs MIN_TRADES and MIN_WR. Symbols are canonicalized so BTC/USDT and
+    BTC/USDT:USDT are treated as the same pair.
     """
     enabled = bool(OWNER_PAIR_FILTER.get('enabled', True))
     perf = _pair_performance_snapshot()
-    eligible = set(CORE_PAIRS)
+    eligible = {canonical_pair(x) for x in CORE_PAIRS}
+    min_trades = int(CONFIG.get('MIN_TRADES', 20))
+    min_wr = float(CONFIG.get('MIN_WR', 50.0))
 
     if enabled:
-        min_trades = int(CONFIG.get('MIN_TRADES', 20))
-        min_wr = float(CONFIG.get('MIN_WR', 60.0))
         for sym, data in perf.items():
-            sym = str(sym).upper()
-            if sym in CORE_PAIRS:
+            pair = canonical_pair(sym)
+            if pair in eligible:
                 continue
             total = int(data.get('w', 0)) + int(data.get('l', 0))
             wr = (float(data.get('w', 0)) / total * 100.0) if total else 0.0
             if total >= min_trades and wr >= min_wr:
-                eligible.add(sym)
+                eligible.add(pair)
     else:
-        # Filter OFF means VIP may use all symbols the Owner scanner can see.
-        # The core pair still remains explicitly eligible.
-        eligible.update(perf.keys())
+        # Filter OFF means VIP can use all crypto pairs known from Owner history.
+        eligible.update(canonical_pair(x) for x in perf.keys())
 
     _save_owner_pair_filter(enabled, eligible)
     OWNER_PAIR_FILTER['eligible_pairs'] = sorted(eligible)
@@ -1897,12 +1966,13 @@ def refresh_owner_eligible_pairs():
     return eligible
 
 def get_owner_eligible_pairs():
-    return sorted(set(str(x).upper() for x in (OWNER_PAIR_FILTER.get('eligible_pairs') or CORE_PAIRS)))
+    return sorted(set(canonical_pair(x) for x in (OWNER_PAIR_FILTER.get('eligible_pairs') or CORE_PAIRS)))
 
 def is_pair_owner_eligible(symbol):
     if not OWNER_PAIR_FILTER.get('enabled', True):
         return True
-    return str(symbol).upper() in set(get_owner_eligible_pairs())
+    return canonical_pair(symbol) in set(get_owner_eligible_pairs())
+
 
 def get_owner_dry_run(ex_id):
     return bool(CONFIG.get('DRY_RUN_CEX', {}).get(ex_id, CONFIG.get('DRY_RUN', True)))
@@ -2180,11 +2250,12 @@ def build_pairperf_text():
     )
     pair_perf = {}
     for sym, stat in rows:
-        pair_perf.setdefault(sym, {'w': 0, 'l': 0})
+        pair = canonical_pair(sym)
+        pair_perf.setdefault(pair, {'w': 0, 'l': 0})
         if 'TP' in stat:
-            pair_perf[sym]['w'] += 1
+            pair_perf[pair]['w'] += 1
         else:
-            pair_perf[sym]['l'] += 1
+            pair_perf[pair]['l'] += 1
 
     active, wait, black = [], [], []
     for sym, data in pair_perf.items():
