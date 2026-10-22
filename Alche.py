@@ -89,6 +89,9 @@ AUTO_UPDATE_STARTUP_TIMEOUT_SECONDS = 90
 AUTO_UPDATE_LAST_NOTIFIED = None
 AUTO_UPDATE_BRANCH = "main"
 AUTO_UPDATE_INTERVAL_MINUTES = 5
+AUTO_UPDATE_CHECK_SECONDS = 300
+AUTO_UPDATE_LAST_REMOTE = None
+AUTO_UPDATE_NOTIFICATION_SENT = False
 AUTO_UPDATE_REQUIRE_CLEAN_GIT = True
 AUTO_UPDATE_BACKUP_DIR = ".update_backups"
 
@@ -360,6 +363,46 @@ def _apply_approved_update():
     clear_auto_update_pending()
     return True, f"Update berhasil. Backup: {backup.name}"
 
+
+async def auto_update_monitor():
+    """Reliable async GitHub monitor. Detects once, then notifies Owner."""
+    global AUTO_UPDATE_LAST_REMOTE, AUTO_UPDATE_NOTIFICATION_SENT
+
+    while True:
+        try:
+            if AUTO_UPDATE_ENABLED:
+                root = Path(__file__).resolve().parent
+
+                if not (AUTO_UPDATE_REQUIRE_CLEAN_GIT and not _git_clean()):
+                    fetch = _run_git("fetch", "origin", AUTO_UPDATE_BRANCH, "--prune")
+                    if fetch.returncode == 0:
+                        current = _git_head()
+                        remote = _git_remote_head()
+
+                        if current and remote and current != remote:
+                            if AUTO_UPDATE_LAST_REMOTE != remote:
+                                AUTO_UPDATE_LAST_REMOTE = remote
+                                AUTO_UPDATE_NOTIFICATION_SENT = False
+
+                            if not AUTO_UPDATE_NOTIFICATION_SENT:
+                                request_auto_update_approval(current, remote)
+                                sent = await notify_owner_update_available()
+                                if sent:
+                                    AUTO_UPDATE_NOTIFICATION_SENT = True
+                                    print(
+                                        f"[AUTO-UPDATE] notification sent: "
+                                        f"{current[:12]} -> {remote[:12]}"
+                                    )
+                                else:
+                                    print(
+                                        "[AUTO-UPDATE] update detected but Owner notification "
+                                        "could not be sent"
+                                    )
+        except Exception as exc:
+            print(f"[AUTO-UPDATE] monitor error: {exc}")
+
+        await asyncio.sleep(AUTO_UPDATE_CHECK_SECONDS)
+
 def auto_update_once():
     """Detect a new revision and request owner approval; never auto-restart."""
     if not AUTO_UPDATE_ENABLED:
@@ -399,12 +442,9 @@ def auto_update_once():
 
 
 def auto_update_loop():
-    while True:
-        try:
-            auto_update_once()
-        except Exception as exc:
-            print(f"[AUTO-UPDATE] {exc}")
-        time.sleep(max(60, int(AUTO_UPDATE_INTERVAL_MINUTES * 60)))
+    """Deprecated compatibility wrapper. Use auto_update_monitor() on the bot loop."""
+    return None
+
 
 def is_dry_run_mode():
     """This build intentionally keeps simulation mode ON 24/7 until disabled in code."""
@@ -4411,12 +4451,6 @@ async def app_main():
         await bot.session.close()
 
 if __name__ == '__main__':
-
-    threading.Thread(
-        target=auto_update_loop,
-        name="auto-update",
-        daemon=True
-    ).start()
     try:
         asyncio.run(app_main())
     except (KeyboardInterrupt, SystemExit):
