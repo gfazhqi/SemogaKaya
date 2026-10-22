@@ -1490,8 +1490,19 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                         qty,
                         en,
                         params={
-                            'stopLoss': {'price': sl},
-                            'takeProfit': {'price': tp}
+                            # Bitget/CCXT attached TP/SL: send both aliases and
+                            # explicit numeric values so older/newer CCXT builds
+                            # cannot lose the trigger price during normalization.
+                            'stopLoss': {
+                                'triggerPrice': float(sl),
+                                'stopPrice': float(sl),
+                                'type': 'mark_price',
+                            },
+                            'takeProfit': {
+                                'triggerPrice': float(tp),
+                                'stopPrice': float(tp),
+                                'type': 'mark_price',
+                            },
                         }
                     )['id'])
                 except Exception as e:
