@@ -69,9 +69,7 @@ DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
 # ===== FIX CONSTANTS =====
-MAX_PENDING_BARS = 4            # 4 bar M15 = 1 jam
-PENDING_TIMEOUT_SECONDS = MAX_PENDING_BARS * 15 * 60  # 60 menit nyata
-SCANNER_LOOP_INTERVAL = 10
+MAX_PENDING_MINUTES = 60
 POSITION_MODE_CACHE = {}
 POSITION_MODE_CACHE_TTL = 3600
 ORDER_UNKNOWN_COUNT = {}
@@ -245,7 +243,6 @@ def set_cex_risk_setting(user_id, ex_id, field, value):
             conn.commit()
         finally: conn.close()
 
-# ===== FIX: SINKRONISASI GLOBAL MAX POS KE CEX SETTINGS =====
 def _sync_global_max_pos_to_cex(value):
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -761,11 +758,13 @@ def update_orders_and_positions():
             c = conn.cursor()
             rows = c.execute(
                 "SELECT id, user_id, exchange_id, symbol, side, entry_price, sl_price, "
-                "tp_price, order_id, bars_count, status, created_at FROM trades WHERE status IN ('PENDING', 'OPEN')"
+                "tp_price, order_id, bars_count, status, "
+                "CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', created_at) AS INTEGER) AS elapsed_seconds "
+                "FROM trades WHERE status IN ('PENDING', 'OPEN')"
             ).fetchall()
 
             live_positions_by_ex = {}
-            for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, created_at in rows:
+            for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, elapsed_sec in rows:
                 ex_key = _exchange_key(user_id, ex_id)
                 if status == 'OPEN' and not str(ord_id).startswith('sim_') and ex_key not in live_positions_by_ex:
                     ex = exchanges.get(ex_key)
@@ -773,24 +772,16 @@ def update_orders_and_positions():
                         try: live_positions_by_ex[ex_key] = ex.fetch_positions()
                         except Exception: live_positions_by_ex[ex_key] = None
 
-            for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, created_at in rows:
+            for t_id, user_id, ex_id, sym, side, en, sl, tp, ord_id, bars, status, elapsed_sec in rows:
                 ex_key = _exchange_key(user_id, ex_id)
                 if ex_key not in exchanges: continue
                 try:
                     ex = exchanges[ex_key]
-                    # Timeout dihitung dari umur order sebenarnya, bukan jumlah loop monitor.
-                    now_ts = time.time()
-                    try:
-                        created_ts = datetime.fromisoformat(str(created_at).replace('Z', '+00:00')).timestamp() if created_at else now_ts
-                    except Exception:
-                        created_ts = now_ts
-                    elapsed = max(0.0, now_ts - created_ts)
-                    n_bars = int(elapsed // (15 * 60))
                     is_sim = str(ord_id).startswith('sim_')
                     tag = " (DRY RUN)" if is_sim else ""
 
                     if status == 'PENDING':
-                        if elapsed >= PENDING_TIMEOUT_SECONDS:
+                        if elapsed_sec is not None and elapsed_sec >= (MAX_PENDING_MINUTES * 60):
                             cancel_ok = True
                             if not is_sim:
                                 try: ex.cancel_order(str(ord_id), sym)
@@ -803,9 +794,9 @@ def update_orders_and_positions():
                                         cancel_ok = False
                                         send_error_alert(f"Timeout cancel {ex_id}/{sym} order={ord_id}: {e}")
                             if cancel_ok:
-                                c.execute("UPDATE trades SET status='CANCELLED (Timeout)', bars_count=? WHERE id=? AND status='PENDING'", (n_bars, t_id))
+                                c.execute("UPDATE trades SET status='CANCELLED (Timeout)' WHERE id=? AND status='PENDING'", (t_id,))
                                 if c.rowcount:
-                                    send_user_telegram(user_id, f"⏱️ <b>PENDING TIMEOUT</b> {sym} ({ex_id.upper()})\nTidak fill dalam {MAX_PENDING_BARS} bar M15 — dibatalkan.")
+                                    send_user_telegram(user_id, f"⏱️ <b>PENDING TIMEOUT</b> {sym} ({ex_id.upper()})\nTidak fill dalam {MAX_PENDING_MINUTES} menit — dibatalkan.")
                             continue
 
                         if not is_sim:
@@ -837,9 +828,7 @@ def update_orders_and_positions():
                                 send_user_telegram(user_id, f"⚪ <b>AUTO-CANCEL (DRY RUN)</b> {sym}\nAlasan: {n_stat}")
 
                         if n_stat != 'PENDING':
-                            c.execute("UPDATE trades SET status=?, bars_count=? WHERE id=? AND status='PENDING'", (n_stat, n_bars, t_id))
-                        else:
-                            c.execute("UPDATE trades SET bars_count=? WHERE id=? AND status='PENDING'", (n_bars, t_id))
+                            c.execute("UPDATE trades SET status=? WHERE id=? AND status='PENDING'", (n_stat, t_id))
 
                     elif status == 'OPEN':
                         if not is_sim:
@@ -948,8 +937,8 @@ def runtime_status_keyboard(obj=None):
 # =================================================================
 # PUBLIC CHANNEL
 # =================================================================
-PUBLIC_DAILY_MIN = 3
-PUBLIC_DAILY_MAX = 6
+PUBLIC_DAILY_MIN = 1
+PUBLIC_DAILY_MAX = 1000
 PUBLIC_STATE = {'date': None, 'target': None, 'published': 0, 'signals': []}
 
 def _public_target_path(): return Path("public_signal_target.json")
@@ -960,10 +949,9 @@ def _public_get_target(today):
         obj = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
         if obj.get('date') == today:
             target = int(obj.get('target', 0))
-            if PUBLIC_DAILY_MIN <= target <= PUBLIC_DAILY_MAX: return target
+            if target >= PUBLIC_DAILY_MIN: return target
     except Exception: pass
-    import random
-    target = random.randint(PUBLIC_DAILY_MIN, PUBLIC_DAILY_MAX)
+    target = 1000
     try: path.write_text(json.dumps({'date': today, 'target': target}), encoding='utf-8')
     except Exception: pass
     return target
@@ -1319,39 +1307,38 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             runtime['last_reason'] = 'VIP Auto Trade OFF'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
         
-        # ===== FIX: CEK MAX POSISI GLOBAL DAN PER-CEX =====
+        # ===== CEK MAX POSISI GLOBAL DAN PER-CEX =====
         active_count = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')", (user_id, ex_id))[0][0]
         global_active = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND status IN ('PENDING','OPEN')", (user_id,))[0][0]
         user_max_pos = int(risk_cfg['max_pos'])
         global_max = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', 2))
         
-        slots = max(0, user_max_pos - active_count)
-        global_slots = max(0, global_max - global_active)
-        final_slots = min(slots, global_slots)
-        
         today_trades = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')", (user_id, ex_id))[0][0]
-        if today_trades >= int(risk_cfg['max_trades_day']):
-            runtime['last_reason'] = f"Max entry/trade tercapai ({today_trades}/{risk_cfg['max_trades_day']})"
-            EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
         today_losses = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status='CLOSED (SL)' AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')", (user_id, ex_id))[0][0]
-        if today_losses >= int(risk_cfg['max_loss']):
-            runtime['last_reason'] = f"Max loss tercapai ({today_losses}/{risk_cfg['max_loss']})"
-            EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
+
+        can_open_trade = True
+        reason_cant_trade = ""
         
-        can_create = final_slots > 0
-        if not can_create:
-            if slots <= 0 and global_slots <= 0:
-                runtime['last_reason'] = f'SCAN ONLY — Max Posisi Global ({global_active}/{global_max}) & CEX tercapai'
-            elif global_slots <= 0:
-                runtime['last_reason'] = f'SCAN ONLY — Max Posisi Global tercapai ({global_active}/{global_max})'
-            else:
-                runtime['last_reason'] = f'SCAN ONLY — Max Posisi CEX tercapai ({active_count}/{user_max_pos})'
+        if active_count >= user_max_pos:
+            can_open_trade = False
+            reason_cant_trade = f'Max Posisi CEX ({active_count}/{user_max_pos})'
+        elif global_active >= global_max:
+            can_open_trade = False
+            reason_cant_trade = f'Max Posisi Global ({global_active}/{global_max})'
+        elif today_trades >= int(risk_cfg['max_trades_day']):
+            can_open_trade = False
+            reason_cant_trade = f"Max entry/trade ({today_trades}/{risk_cfg['max_trades_day']})"
+        elif today_losses >= int(risk_cfg['max_loss']):
+            can_open_trade = False
+            reason_cant_trade = f"Max loss ({today_losses}/{risk_cfg['max_loss']})"
+            
+        if not can_open_trade:
+            runtime['last_reason'] = f'Scan Only. {reason_cant_trade}'
 
         created = 0
         rate_limited = 0
-        cycle_created_symbols = set() # ANTI-DUPLIKAT DI SATU SIKLUS
+        cycle_created_symbols = set()
         for sym in scan_symbols:
-            if can_create and created >= final_slots: break # Batasi pembuatan trade; scanner tetap berjalan
             if is_manual_alert_symbol(sym): continue
             if sym in cycle_created_symbols: continue 
             
@@ -1377,28 +1364,20 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 d1[-1][1]
             )
             if not sig or en <= 0:
-                runtime['last_reason'] = f'{sym}: no setup / filter'
                 continue
             if sig == 'BUY':
                 if not (sl < en < tp):
-                    runtime['last_reason'] = f'{sym}: invalid BUY setup (sl={sl:.6g}, en={en:.6g}, tp={tp:.6g})'
                     continue
             else:
                 if not (tp < en < sl):
-                    runtime['last_reason'] = f'{sym}: invalid SELL setup (tp={tp:.6g}, en={en:.6g}, sl={sl:.6g})'
                     continue
             
-            # ANTI-DUPLIKAT DI DATABASE (Tidak peduli BUY atau SELL)
+            # ANTI-DUPLIKAT DI DATABASE
             exists = db_read(
                 "SELECT 1 FROM trades WHERE user_id=? AND exchange_id=? AND symbol=? AND status IN ('PENDING','OPEN') LIMIT 1", 
                 (user_id, ex_id, sym)
             )
             if exists:
-                runtime['last_reason'] = f'{sym}: already has active trade (BUY/SELL)'
-                continue
-
-            if not can_create:
-                runtime['last_reason'] = f'{sym}: setup ditemukan, tapi slot penuh — scan saja'
                 continue
 
             lev = int(risk_cfg['leverage'])
@@ -1412,11 +1391,21 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             try: live_price = float(ex.fetch_ticker(sym).get('last') or en)
             except Exception: live_price = float(en)
             if live_price <= 0 or en <= 0:
-                runtime['last_reason'] = f'{sym}: invalid price'; continue
+                continue
             if sig == 'BUY' and float(en) >= live_price:
-                runtime['last_reason'] = f'{sym}: BUY retracement already crossed; skip stale limit'; continue
+                continue
             if sig == 'SELL' and float(en) <= live_price:
-                runtime['last_reason'] = f'{sym}: SELL retracement already crossed; skip stale limit'; continue
+                continue
+
+            # === KIRIM SINYAL ===
+            try:
+                if user_is_owner:
+                    _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
+            except Exception: pass
+
+            if not can_open_trade:
+                runtime['last_reason'] = f'{sym}: {sig} signal generated (No Open)'
+                continue
 
             lev_to_set = lev
             if not dry_run:
@@ -1437,7 +1426,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             try: qty = float(ex.amount_to_precision(sym, qty))
             except Exception: pass
             if qty <= 0:
-                runtime['last_reason'] = f'{sym}: qty=0 setelah precision'; continue
+                continue
 
             market = EXCHANGE_MARKETS.get(exchange_key, {}).get(sym, {})
             limits = (market.get('limits') or {}).get('cost') or {}
@@ -1446,7 +1435,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             except Exception: min_cost = 0
             notional = qty * en
             if min_cost and notional < min_cost:
-                runtime['last_reason'] = f'{sym}: notional ${notional:.4f} < min ${min_cost:.2f}'; continue
+                continue
 
             mode = "[DRY RUN]" if dry_run else "[REAL TRADE]"
             ord_id = f"sim_{int(time.time()*1000)}"
@@ -1534,16 +1523,20 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 f"Qty: {qty:g} | Notional: ${notional:.4f}\n"
                 f"Status: <b>{status_text}</b>"
             )
-            try:
-                if user_is_owner:
-                    _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
-            except Exception: pass
             created += 1
-            cycle_created_symbols.add(sym) # Tandai sudah dibuat
+            cycle_created_symbols.add(sym)
             runtime['signals'] = runtime.get('signals', 0) + 1
             runtime['created'] = runtime.get('created', 0) + 1
             runtime['last_reason'] = f'{sym}: {sig} setup created'
             set_runtime_event(f'{ex_id.upper()} {sym} {sig} setup created')
+            
+            # Update can_open_trade
+            active_count_after = active_count + created
+            global_active_after = global_active + created
+            if active_count_after >= user_max_pos or global_active_after >= global_max:
+                can_open_trade = False
+                reason_cant_trade = f'Max Posisi reached'
+                runtime['last_reason'] = f'Max Posisi reached, Scan Only'
 
         if rate_limited:
             runtime['last_reason'] = (f'{rate_limited} symbol request kena 100410, skip lokal; scanner tetap jalan')
@@ -3413,7 +3406,7 @@ def main_loop():
                 notify_runtime_status('WAITING', "⏹️ <b>STOP TRADE / WAITING</b>\nDi luar kill zone. Bot tidak membuka trade baru dan menunggu sesi berikutnya.")
         except Exception as e:
             send_error_alert(str(e))
-        time.sleep(SCANNER_LOOP_INTERVAL)
+        time.sleep(10)
 
 async def app_main():
     global MAIN_ASYNC_LOOP
