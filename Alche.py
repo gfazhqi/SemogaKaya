@@ -579,6 +579,7 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
             sig = 'SELL'
     return sig, en, sl, tp
 
+# ===== FIX 110025 (One-Way Mode Not Modified) =====
 def ensure_one_way_mode(ex, ex_id, symbol):
     cache_key = f"{ex_id}::{id(ex)}"
     now = time.time()
@@ -604,13 +605,20 @@ def ensure_one_way_mode(ex, ex_id, symbol):
         return True, 'one-way mode confirmed/set'
     except Exception as e:
         msg = str(e); low = msg.lower()
-        harmless = ('no need to change' in low or ('already' in low and ('one-way' in low or 'one_way' in low or 'oneway' in low)) or 'same position mode' in low or ('position mode' in low and 'unchanged' in low))
+        harmless = (
+            '110025' in low or 
+            'not modified' in low or
+            'no need to change' in low or 
+            ('already' in low and ('one-way' in low or 'one_way' in low or 'oneway' in low)) or 
+            'same position mode' in low or 
+            ('position mode' in low and 'unchanged' in low)
+        )
         if harmless:
             POSITION_MODE_CACHE[cache_key] = now
             return True, 'one-way mode already active'
         return False, msg[:500]
 
-# ===== FIX: CROSS margin mode (forced) =====
+# ===== FIX 110026 (Margin Mode Not Modified) =====
 def _ensure_cross_margin(ex, ex_id, sym):
     key = f"{ex_id}::{id(ex)}::{sym}"
     if key in MARGIN_MODE_SET:
@@ -630,13 +638,19 @@ def _ensure_cross_margin(ex, ex_id, sym):
         return True, None
     except Exception as e:
         low = str(e).lower()
-        harmless = ('no need to change' in low or ('already' in low and 'margin' in low) or 'same margin mode' in low or ('margin mode' in low and 'unchanged' in low))
+        harmless = (
+            '110026' in low or
+            'not modified' in low or
+            'no need to change' in low or 
+            ('already' in low and 'margin' in low) or 
+            'same margin mode' in low or 
+            ('margin mode' in low and 'unchanged' in low)
+        )
         if harmless:
             MARGIN_MODE_SET.add(key)
             return True, 'already cross'
         return False, str(e)[:300]
 
-# ===== FIX: auto-adjust leverage to max pair =====
 def _get_max_leverage_for_pair(ex, ex_id, symbol):
     cache_key = f"{ex_id}::{symbol}"
     now = time.time()
@@ -1324,7 +1338,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             if sig == 'SELL' and float(en) <= live_price:
                 runtime['last_reason'] = f'{sym}: SELL retracement already crossed; skip stale limit'; continue
 
-            # ===== AUTO-ADJUST LEVERAGE (sebelum qty) =====
+            # AUTO-ADJUST LEVERAGE
             lev_to_set = lev
             if not dry_run:
                 max_lev, lev_src = _get_max_leverage_for_pair(ex, ex_id, sym)
@@ -1340,7 +1354,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                             f"(Sumber: {lev_src})"
                         )
 
-            # ===== qty pakai lev_to_set =====
+            # qty pakai lev_to_set
             qty = (margin * lev_to_set) / float(en)
             try: qty = float(ex.amount_to_precision(sym, qty))
             except Exception: pass
@@ -1360,7 +1374,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             ord_id = f"sim_{int(time.time()*1000)}"
 
             if not dry_run:
-                # ===== set_leverage (harmless error suppression) =====
+                # set_leverage (harmless error suppression)
                 _lev_ok = False; _lev_err = None
                 try:
                     ex.set_leverage(lev_to_set, sym); _lev_ok = True
@@ -1383,13 +1397,13 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                         send_error_alert(f"set_leverage gagal {ex_id}/{sym} (lev={lev_to_set}x, max_pair={max_lev}): {_lev_err}")
                         continue
 
-                # ===== CROSS margin mode =====
+                # CROSS margin mode
                 ok_mm, mm_err = _ensure_cross_margin(ex, ex_id, sym)
                 if not ok_mm:
                     send_error_alert(f"set_margin_mode (cross) gagal {ex_id}/{sym}: {mm_err}")
                     continue
 
-                # ===== one-way mode =====
+                # one-way mode
                 ok_mode, mode_msg = ensure_one_way_mode(ex, ex_id, sym)
                 if not ok_mode:
                     send_error_alert(f"Order Fails {ex_id}/{sym}: One-Way Mode wajib aktif: {mode_msg}")
