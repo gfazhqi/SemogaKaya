@@ -40,12 +40,20 @@ WIB = timezone(timedelta(hours=7))
 DB_LOCK = threading.RLock()
 BOT_STARTED_AT = time.time()
 LAST_EVENT_TEXT = 'Booting'
+LAST_EVENT_TIME = BOT_STARTED_AT
+MAIN_ASYNC_LOOP = None
+last_error_time = 0.0
+PUBLIC_LAST_DAILY_REPORT_DATE = None
+PUBLIC_LAST_WEEKLY_REPORT_DATE = None
 last_runtime_status = 'BOOTING'
 ERROR_HISTORY = []
 ERROR_HISTORY_MAX = 50
 LAST_MENU_MESSAGE = {}
 PENDING_API_SETUP = {}
 EXCHANGE_RUNTIME = {}
+# Per-account/per-CEX CCXT instances. Key format: USER_ID::CEX.
+# This must exist before init_db/load_settings/reload_exchanges can run.
+exchanges = {}
 EXCHANGE_SCAN_NEXT = {}
 EXCHANGE_SCAN_CURSOR = {}
 EXCHANGE_LAST_CANDLE = {}
@@ -2369,7 +2377,7 @@ def validate_restore_db(path):
     conn = sqlite3.connect(str(path), timeout=10)
     try:
         tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
-        required = {"trades", "settings", "cex_settings"}
+        required = {"trades", "settings", "user_cex_settings", "vip_members"}
         if not required.issubset(tables):
             return False, f"Tabel wajib kurang: {', '.join(sorted(required - tables))}"
         # Basic integrity check.
