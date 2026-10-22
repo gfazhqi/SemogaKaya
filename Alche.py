@@ -58,7 +58,7 @@ EXCHANGE_MARKETS = {}
 EXCHANGE_REQUEST_NEXT = {}
 IS_BOT_PAUSED = False
 daily_sl_count = 0
-SCANNER_MIN_INTERVAL = 15
+SCANNER_MIN_INTERVAL = 5         # FIX: Scanner lebih cepat (5 detik)
 BINGX_REQUEST_SPACING = 0.35
 MAX_DAILY_SL = 3
 SL_BUFFER_PERCENT = 0.001
@@ -1346,7 +1346,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         if not symbols:
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
         if ex_id == 'bingx':
-            batch_size = 8
+            batch_size = 15 # FIX: Batch size lebih besar
             cursor = EXCHANGE_SCAN_CURSOR.get(exchange_key, 0) % len(symbols)
             scan_symbols = [symbols[(cursor + i) % len(symbols)] for i in range(min(batch_size, len(symbols)))]
             EXCHANGE_SCAN_CURSOR[exchange_key] = (cursor + len(scan_symbols)) % len(symbols)
@@ -1365,29 +1365,29 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             runtime['last_reason'] = 'VIP Auto Trade OFF'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
         
+        # ===== CEK MAX POSISI UNTUK REAL MONEY SAJA =====
+        dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
+        
         active_count = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')", (user_id, ex_id))[0][0]
         global_active = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND status IN ('PENDING','OPEN')", (user_id,))[0][0]
         user_max_pos = int(risk_cfg['max_pos'])
         global_max = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', 2))
         
-        today_trades = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')", (user_id, ex_id))[0][0]
         today_losses = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status='CLOSED (SL)' AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')", (user_id, ex_id))[0][0]
 
         can_open_trade = True
         reason_cant_trade = ""
         
-        if active_count >= user_max_pos:
-            can_open_trade = False
-            reason_cant_trade = f'Max Posisi CEX ({active_count}/{user_max_pos})'
-        elif global_active >= global_max:
-            can_open_trade = False
-            reason_cant_trade = f'Max Posisi Global ({global_active}/{global_max})'
-        elif today_trades >= int(risk_cfg['max_trades_day']):
-            can_open_trade = False
-            reason_cant_trade = f"Max entry/trade ({today_trades}/{risk_cfg['max_trades_day']})"
-        elif today_losses >= int(risk_cfg['max_loss']):
-            can_open_trade = False
-            reason_cant_trade = f"Max loss ({today_losses}/{risk_cfg['max_loss']})"
+        if not dry_run: # Hanya cek limit jika bukan Dry Run
+            if active_count >= user_max_pos:
+                can_open_trade = False
+                reason_cant_trade = f'Max Posisi CEX ({active_count}/{user_max_pos})'
+            elif global_active >= global_max:
+                can_open_trade = False
+                reason_cant_trade = f'Max Posisi Global ({global_active}/{global_max})'
+            elif today_losses >= int(risk_cfg['max_loss']):
+                can_open_trade = False
+                reason_cant_trade = f"Max loss ({today_losses}/{risk_cfg['max_loss']})"
         
         news_paused, news_time = is_news_time()
         if news_paused:
@@ -1426,7 +1426,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     continue
                 continue
             
-            # GUARD: Pastikan data candle cukup untuk perhitungan
             if not m15 or len(m15) < 7 or not h1 or len(h1) < 2 or not d1 or len(d1) < 1: continue
             
             try:
@@ -1456,7 +1455,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
 
             lev = int(risk_cfg['leverage'])
             margin = float(risk_cfg['margin'])
-            dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
             try:
                 en = float(ex.price_to_precision(sym, en))
                 sl = float(ex.price_to_precision(sym, sl))
@@ -1606,12 +1604,13 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             runtime['last_reason'] = f'{sym}: {sig} setup created'
             set_runtime_event(f'{ex_id.upper()} {sym} {sig} setup created')
             
-            active_count_after = active_count + created
-            global_active_after = global_active + created
-            if active_count_after >= user_max_pos or global_active_after >= global_max:
-                can_open_trade = False
-                reason_cant_trade = f'Max Posisi reached'
-                runtime['last_reason'] = f'Max Posisi reached, Scan Only'
+            if not dry_run:
+                active_count_after = active_count + created
+                global_active_after = global_active + created
+                if active_count_after >= user_max_pos or global_active_after >= global_max:
+                    can_open_trade = False
+                    reason_cant_trade = f'Max Posisi reached'
+                    runtime['last_reason'] = f'Max Posisi reached, Scan Only'
 
         if rate_limited:
             runtime['last_reason'] = (f'{rate_limited} symbol request kena 100410, skip lokal; scanner tetap jalan')
@@ -1697,7 +1696,7 @@ def require_owner(obj):
 
 def owner_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 PAIR PERFORMANCE", callback_data="owner_pair_filter")],
+        [InlineKeyboardButton(text="📊 VIP FILTER", callback_data="owner_pair_filter")], # FIX: Nama diganti agar tidak bingung
         [InlineKeyboardButton(text="👥 MANAGE VIP", callback_data="owner_vip")],
         [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"), InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
         [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings"), InlineKeyboardButton(text="🏆 PAIR PERFORMANCE", callback_data="pairperf")],
@@ -2006,28 +2005,32 @@ def build_stats_text(user_id='OWNER'):
     )
 
 def build_pairperf_text():
-    rows = db_read("SELECT symbol, status FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')")
-    pair_perf = {}
-    for sym, stat in rows:
-        pair = canonical_pair(sym)
-        pair_perf.setdefault(pair, {'w': 0, 'l': 0})
-        if 'TP' in stat: pair_perf[pair]['w'] += 1
-        else: pair_perf[pair]['l'] += 1
-    active, wait, black = [], [], []
-    for sym, data in pair_perf.items():
-        total = data['w'] + data['l']
-        wr = data['w'] / total * 100 if total else 0
-        core = sym in CORE_PAIRS
-        line = f"• {sym}{' [CORE]' if core else ''}: {data['w']}W/{data['l']}L (WR: {wr:.1f}%)"
-        if total < CONFIG['MIN_TRADES']: wait.append(line)
-        elif core or wr >= CONFIG['MIN_WR']: active.append(line)
-        else: black.append(line)
-    return (
-        "🏆 <b>PERFORMA KOIN</b>\n\n"
-        "🔥 <b>AKTIF</b>\n" + ("\n".join(active) or "Belum ada") + "\n\n"
-        "⏳ <b>EVALUASI</b>\n" + ("\n".join(wait) or "Belum ada") + "\n\n"
-        "🗑️ <b>BLACKLIST</b>\n" + ("\n".join(black) or "Belum ada")
-    )
+    # FIX: Wrap dengan try-except agar jika ada data aneh bot tidak crash
+    try:
+        rows = db_read("SELECT symbol, status FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')")
+        pair_perf = {}
+        for sym, stat in rows:
+            pair = canonical_pair(sym)
+            pair_perf.setdefault(pair, {'w': 0, 'l': 0})
+            if 'TP' in stat: pair_perf[pair]['w'] += 1
+            else: pair_perf[pair]['l'] += 1
+        active, wait, black = [], [], []
+        for sym, data in pair_perf.items():
+            total = data['w'] + data['l']
+            wr = data['w'] / total * 100 if total else 0
+            core = sym in CORE_PAIRS
+            line = f"• {sym}{' [CORE]' if core else ''}: {data['w']}W/{data['l']}L (WR: {wr:.1f}%)"
+            if total < CONFIG['MIN_TRADES']: wait.append(line)
+            elif core or wr >= CONFIG['MIN_WR']: active.append(line)
+            else: black.append(line)
+        return (
+            "🏆 <b>PERFORMA KOIN</b>\n\n"
+            "🔥 <b>AKTIF</b>\n" + ("\n".join(active) or "Belum ada") + "\n\n"
+            "⏳ <b>EVALUASI</b>\n" + ("\n".join(wait) or "Belum ada") + "\n\n"
+            "🗑️ <b>BLACKLIST</b>\n" + ("\n".join(black) or "Belum ada")
+        )
+    except Exception as e:
+        return f"Error: {html.escape(str(e))}"
 
 def build_cex_status_text(user_id='OWNER'):
     user_id = _account_user_id(user_id)
@@ -3078,8 +3081,12 @@ async def cb_stats(callback: CallbackQuery):
 @dp.callback_query(F.data == "pairperf")
 async def cb_pairperf(callback: CallbackQuery):
     if not require_owner(callback): await safe_answer(callback, "Akses Owner saja.", True); return
-    await safe_answer(callback)
-    await callback.message.edit_text(build_pairperf_text(), reply_markup=role_keyboard(callback))
+    try:
+        await safe_answer(callback)
+        text = build_pairperf_text()
+        await callback.message.edit_text(text, reply_markup=role_keyboard(callback))
+    except Exception as e:
+        await callback.message.answer(f"Error: {html.escape(str(e))}")
 
 @dp.callback_query(F.data == "cex_status")
 async def cb_cex_status(callback: CallbackQuery):
@@ -3490,7 +3497,7 @@ def main_loop():
                 notify_runtime_status('WAITING', "⏹️ <b>STOP TRADE / WAITING</b>\nDi luar kill zone. Bot tidak membuka trade baru dan menunggu sesi berikutnya.")
         except Exception as e:
             send_error_alert(str(e))
-        time.sleep(10)
+        time.sleep(5) # FIX: Sleep lebih cepat (5 detik)
 
 async def app_main():
     global MAIN_ASYNC_LOOP
@@ -3499,7 +3506,7 @@ async def app_main():
     
     # Start Fast Monitor Thread (3 detik)
     threading.Thread(target=fast_trade_monitor, name='fast-monitor', daemon=True).start()
-    # Start Scanner Thread (10 detik loop)
+    # Start Scanner Thread (5 detik loop)
     threading.Thread(target=main_loop, name='trading-engine', daemon=True).start()
     # Start Flask Web Dashboard
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, use_reloader=False), name='flask-dashboard', daemon=True).start()
