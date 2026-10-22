@@ -69,6 +69,9 @@ ERROR_COOLDOWN = 60
 MANUAL_ALERT_PAIRS = set()
 CORE_PAIRS = ('BTC/USDT', 'ETH/USDT')
 DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
+# HARD RULE: scanner trades crypto USDT perpetual swaps only.
+CRYPTO_ONLY = True
+ONE_WAY_ONLY = True
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
 def _table_columns(conn, table):
@@ -701,6 +704,33 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
     return sig, en, sl, tp
 
 
+def ensure_one_way_mode(ex, ex_id, symbol):
+    """Ensure the derivatives account uses one-way mode before live orders.
+    Returns (ok, message). Never silently switches to hedge mode.
+    """
+    try:
+        if not getattr(ex, 'has', {}).get('setPositionMode', False):
+            return True, 'setPositionMode unsupported; using exchange default'
+        params = {}
+        if ex_id == 'bitget':
+            params['productType'] = 'USDT-FUTURES'
+        ex.set_position_mode(False, symbol, params)
+        return True, 'one-way mode confirmed/set'
+    except Exception as e:
+        msg = str(e)
+        # Exchanges commonly return a harmless "already in this mode" error.
+        low = msg.lower()
+        harmless = (
+            'no need to change' in low or
+            'already' in low and ('one-way' in low or 'one_way' in low or 'oneway' in low) or
+            'same position mode' in low or
+            '40774' not in low and 'position mode' in low and 'unchanged' in low
+        )
+        if harmless:
+            return True, 'one-way mode already active'
+        return False, msg[:500]
+
+
 def _fetch_last_closed_m15(ex_instance, symbol):
     """Return the latest CLOSED M15 candle."""
     try:
@@ -801,7 +831,32 @@ def update_orders_and_positions():
                     tag = " (DRY RUN)" if is_sim else ""
 
                     if status == 'PENDING':
-                        n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
+                        # REAL orders: the exchange is authoritative.
+                        # Never mark a live LIMIT order as FILLED merely because
+                        # an M15 candle touched the entry price. The exchange can
+                        # still have the order resting/pending.
+                        if not is_sim:
+                            n_stat = 'PENDING'
+                            try:
+                                live_order = ex.fetch_order(str(ord_id), sym)
+                                live_status = str(live_order.get('status', '')).lower()
+                                filled_qty = float(live_order.get('filled') or 0)
+
+                                if live_status == 'closed':
+                                    n_stat = 'OPEN'
+                                elif live_status in ('canceled', 'cancelled', 'expired', 'rejected'):
+                                    n_stat = 'CANCELLED (Exchange)'
+                                else:
+                                    # open / partially-filled / unknown-but-filled:
+                                    # keep PENDING until the exchange confirms closed.
+                                    n_stat = 'PENDING'
+                            except Exception:
+                                # If exchange status cannot be verified, keep the
+                                # order PENDING. Never generate a false FILLED alert.
+                                n_stat = 'PENDING'
+                                runtime['last_reason'] = f'{sym}: exchange order status unavailable; kept PENDING'
+                        else:
+                            n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
 
                         if n_stat == 'OPEN':
                             send_user_telegram(user_id, 
@@ -1289,10 +1344,12 @@ def _is_retryable_market_error(ex_id, exc):
 
 
 def _valid_usdt_swap_symbols(ex_id, ex):
-    """Return active USDT-settled perpetual symbols only.
+    """Return active crypto USDT-settled perpetual symbols only.
 
-    This intentionally avoids random/expired/non-contract instruments that
-    can appear in fetch_tickers(). The strategy itself remains M15/H1/D1.
+    All exchanges are restricted to crypto perpetual contracts. Spot,
+    dated futures, options, forex, equities, commodities, tokenized/non-
+    crypto instruments, and other non-swap products are excluded here.
+    The strategy itself remains M15/H1/D1.
     """
     markets = EXCHANGE_MARKETS.get(ex_id) or getattr(ex, 'markets', {}) or {}
     symbols = []
@@ -1302,13 +1359,20 @@ def _valid_usdt_swap_symbols(ex_id, ex):
             continue
         if not m.get('active', True):
             continue
+        # Crypto perpetuals only. Require CCXT's contract+swap flags and
+        # a USDT quote/settlement. Do not accept spot, dated futures,
+        # options, FX, equities, commodities, or other market types.
         if m.get('contract') is not True:
             continue
         if m.get('swap') is not True:
             continue
+        if m.get('spot') is True or m.get('option') is True or m.get('future') is True:
+            continue
         if str(m.get('quote', '')).upper() != 'USDT':
             continue
         if str(m.get('settle', '')).upper() != 'USDT':
+            continue
+        if not m.get('base'):
             continue
         # Skip obvious test/expired/legacy instruments.
         if any(x in sym.upper() for x in ('TEST', '1000', 'BULL', 'BEAR')):
@@ -1482,6 +1546,29 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 except Exception:
                     pass
 
+                ok_mode, mode_msg = ensure_one_way_mode(ex, ex_id, sym)
+                if not ok_mode:
+                    send_error_alert(f"Order Fails {ex_id}/{sym}: One-Way Mode wajib aktif: {mode_msg}")
+                    continue
+
+                order_params = {
+                    'stopLoss': {
+                        'triggerPrice': float(sl),
+                        'stopPrice': float(sl),
+                        'type': 'mark_price',
+                    },
+                    'takeProfit': {
+                        'triggerPrice': float(tp),
+                        'stopPrice': float(tp),
+                        'type': 'mark_price',
+                    },
+                }
+                # Bitget explicitly requires oneWayMode=True when the account
+                # is in one-way position mode. Do not send hedge/tradeSide.
+                if ex_id == 'bitget':
+                    order_params['oneWayMode'] = True
+                    order_params['hedged'] = False
+
                 try:
                     ord_id = str(ex.create_order(
                         sym,
@@ -1489,21 +1576,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                         'buy' if sig == 'BUY' else 'sell',
                         qty,
                         en,
-                        params={
-                            # Bitget/CCXT attached TP/SL: send both aliases and
-                            # explicit numeric values so older/newer CCXT builds
-                            # cannot lose the trigger price during normalization.
-                            'stopLoss': {
-                                'triggerPrice': float(sl),
-                                'stopPrice': float(sl),
-                                'type': 'mark_price',
-                            },
-                            'takeProfit': {
-                                'triggerPrice': float(tp),
-                                'stopPrice': float(tp),
-                                'type': 'mark_price',
-                            },
-                        }
+                        params=order_params
                     )['id'])
                 except Exception as e:
                     send_error_alert(f"Order Fails {ex_id}/{sym}: {e}")
