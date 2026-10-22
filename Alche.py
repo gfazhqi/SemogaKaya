@@ -56,7 +56,8 @@ EXCHANGE_SCAN_CURSOR = {}
 EXCHANGE_LAST_CANDLE = {}
 EXCHANGE_MARKETS = {}
 EXCHANGE_REQUEST_NEXT = {}
-SYMBOL_COOLDOWN = {}             # FIX: Cooldown per pair (30 menit) agar tidak spam order
+SYMBOL_COOLDOWN = {}
+SCAN_LOCK = threading.Lock()             # FIX: Cooldown per pair (30 menit) agar tidak spam order
 IS_BOT_PAUSED = False
 daily_sl_count = 0
 SCANNER_MIN_INTERVAL = 5         # Scan berjalan tiap 5 detik
@@ -73,6 +74,80 @@ CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': Tru
 MAX_PENDING_MINUTES = 60
 POSITION_MODE_CACHE = {}
 POSITION_MODE_CACHE_TTL = 3600
+
+TRADE_TERMINAL_STATUSES = {
+    'CLOSED (TP)', 'CLOSED (SL)', 'CLOSED (UNKNOWN)', 'CANCELLED', 'ERROR'
+}
+
+def _utc_now_sql():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+def _trade_is_active(status):
+    return str(status) in ('PENDING', 'OPEN')
+
+def atomic_reserve_trade_slot(user_id, exchange_id, symbol):
+    """Atomically reserve a PENDING slot before any REAL order is submitted."""
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            active_cex = conn.execute(
+                "SELECT COUNT(*) FROM trades "
+                "WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')",
+                (str(user_id), str(exchange_id))
+            ).fetchone()[0]
+            active_global = conn.execute(
+                "SELECT COUNT(*) FROM trades "
+                "WHERE user_id=? AND status IN ('PENDING','OPEN')",
+                (str(user_id),)
+            ).fetchone()[0]
+            max_cex = int(get_cex_max_positions(user_id, exchange_id))
+            max_global = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', max_cex))
+
+            if active_cex >= max_cex or active_global >= max_global:
+                conn.rollback()
+                return False, "MAX_POSITION"
+
+            duplicate = conn.execute(
+                "SELECT 1 FROM trades WHERE user_id=? AND exchange_id=? AND symbol=? "
+                "AND status IN ('PENDING','OPEN') LIMIT 1",
+                (str(user_id), str(exchange_id), str(symbol))
+            ).fetchone()
+            if duplicate:
+                conn.rollback()
+                return False, "DUPLICATE_ACTIVE"
+
+            # Reservation is represented by a short-lived DB row. The caller
+            # must immediately convert this row into the actual trade row.
+            conn.commit()
+            return True, "RESERVED"
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+def record_realized_pnl(trade_id, realized_pnl, exit_price=None, close_reason=None):
+    """Persist exchange-realized PnL instead of estimating from margin."""
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            if 'realized_pnl' not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl REAL DEFAULT 0")
+            if 'exit_price' not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN exit_price REAL")
+            if 'close_reason' not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN close_reason TEXT")
+            conn.execute(
+                "UPDATE trades SET realized_pnl=?, exit_price=COALESCE(?, exit_price), "
+                "close_reason=COALESCE(?, close_reason) WHERE id=?",
+                (float(realized_pnl or 0), exit_price, close_reason, int(trade_id))
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
 ORDER_UNKNOWN_COUNT = {}
 MARGIN_MODE_SET = set()
 PUBLIC_SIGNAL_MAX_AGE = 7 * 86400
@@ -808,6 +883,48 @@ def _real_exchange_order_state(ex_instance, symbol, order_id):
             send_error_alert(f"Order {order_id} ({symbol}) UNKNOWN 5x — cek manual di exchange!")
         return "UNKNOWN"
 
+
+def fetch_realized_pnl_from_exchange(ex, symbol, order_id, side=None):
+    """Best-effort realized PnL from exchange fills; never invents PnL."""
+    try:
+        if not hasattr(ex, 'fetch_my_trades'):
+            return None, None
+        trades = ex.fetch_my_trades(symbol, limit=100)
+        matched = []
+        for tr in trades or []:
+            info = tr.get('info') or {}
+            oid = tr.get('order') or info.get('orderId') or info.get('order_id')
+            if str(oid) == str(order_id):
+                matched.append(tr)
+        if not matched:
+            return None, None
+
+        pnl = 0.0
+        exit_price = None
+        found_pnl = False
+        for tr in matched:
+            info = tr.get('info') or {}
+            raw = (
+                tr.get('realizedPnl')
+                if tr.get('realizedPnl') is not None
+                else info.get('realizedPnl', info.get('realized_pnl'))
+            )
+            if raw is not None:
+                try:
+                    pnl += float(raw)
+                    found_pnl = True
+                except Exception:
+                    pass
+            price = tr.get('price')
+            if price is not None:
+                try:
+                    exit_price = float(price)
+                except Exception:
+                    pass
+        return (pnl if found_pnl else None), exit_price
+    except Exception:
+        return None, None
+
 def update_orders_and_positions():
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -1467,10 +1584,11 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             )
             if last_signal_row:
                 try:
+                    raw_created = str(last_signal_row[0]).split('.')[0]
                     last_created = datetime.strptime(
-                        str(last_signal_row[0]).split('.')[0],
+                        raw_created,
                         "%Y-%m-%d %H:%M:%S"
-                    ).replace(tzinfo=WIB)
+                    ).replace(tzinfo=timezone.utc).astimezone(WIB)
                     if (now - last_created).total_seconds() < 60:
                         continue
                 except Exception:
@@ -1697,6 +1815,15 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         return 0
 
 def scan_markets():
+    if not SCAN_LOCK.acquire(blocking=False):
+        return
+    try:
+        return scan_markets_unlocked()
+    finally:
+        SCAN_LOCK.release()
+
+
+def scan_markets_unlocked():
     try:
         pair_perf = {}
         rows = db_read("SELECT symbol, status FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')")
@@ -1992,6 +2119,24 @@ def leverage_value_keyboard(target):
     if row: rows.append(row)
     rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="set_lev_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def ensure_trade_accounting_columns():
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            additions = [
+                ('realized_pnl', 'REAL DEFAULT 0'),
+                ('exit_price', 'REAL'),
+                ('close_reason', 'TEXT'),
+            ]
+            for name, decl in additions:
+                if name not in cols:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {decl}")
+            conn.commit()
+        finally:
+            conn.close()
 
 def db_read(query, params=()):
     conn = sqlite3.connect(DB_FILE, timeout=5)
@@ -3191,6 +3336,9 @@ async def cb_force_scan(callback: CallbackQuery):
     await safe_answer(callback, "Memulai Force Scan...")
     for k in list(EXCHANGE_SCAN_NEXT.keys()):
         EXCHANGE_SCAN_NEXT[k] = 0
+    if SCAN_LOCK.locked():
+        await callback.message.answer("⚠️ <b>SCAN SUDAH BERJALAN</b>\nTunggu scanner yang sedang aktif selesai.")
+        return
     threading.Thread(target=scan_markets, daemon=True).start()
     await callback.message.answer("⚡ <b>FORCE SCAN TRIGGERED</b>\nBot sedang memindai semua CEX sekarang.")
 
@@ -3444,12 +3592,18 @@ def api_cex_monitor():
 def api_stats():
     try:
         conn = sqlite3.connect(DB_FILE, timeout=10)
-        df = pd.read_sql_query("SELECT id, symbol, side, status, created_at FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)') ORDER BY id ASC", conn)
+        df = pd.read_sql_query("SELECT id, symbol, side, status, created_at, realized_pnl FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)') ORDER BY id ASC", conn)
         conn.close()
         if df.empty:
             return jsonify({'ok': True, 'dates': [], 'pnl': [], 'win_rate': 0, 'wins': 0, 'losses': 0, 'total_trades': 0, 'profit_factor': 0, 'net_pnl': 0, 'avg_win': 0, 'avg_loss': 0, 'max_drawdown': 0, 'best_trade': 0, 'worst_trade': 0, 'recent': [], 'daily_pnl': {}, 'daily_trades': {}})
         margin = float(CONFIG.get('MARGIN_PER_TRADE', 2.0))
-        df['pnl_value'] = df['status'].apply(lambda x: margin if x == 'CLOSED (TP)' else -margin)
+        if 'realized_pnl' in df.columns:
+            df['pnl_value'] = pd.to_numeric(df['realized_pnl'], errors='coerce').fillna(0.0)
+            legacy_mask = (df['pnl_value'].abs() < 1e-12)
+            df.loc[legacy_mask & (df['status'] == 'CLOSED (TP)'), 'pnl_value'] = margin
+            df.loc[legacy_mask & (df['status'] == 'CLOSED (SL)'), 'pnl_value'] = -margin
+        else:
+            df['pnl_value'] = df['status'].apply(lambda x: margin if x == 'CLOSED (TP)' else -margin)
         df['cum_pnl'] = df['pnl_value'].cumsum()
         running_peak = df['cum_pnl'].cummax()
         drawdown = running_peak - df['cum_pnl']
