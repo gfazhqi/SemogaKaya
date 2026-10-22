@@ -69,7 +69,7 @@ DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
 # ===== FIX CONSTANTS =====
-MAX_PENDING_BARS = 4            # FIX: 4 bar M15 = 1 Jam (sebelumnya 20 bar / 5 jam)
+MAX_PENDING_BARS = 4            # 4 bar M15 = 1 Jam
 POSITION_MODE_CACHE = {}
 POSITION_MODE_CACHE_TTL = 3600
 ORDER_UNKNOWN_COUNT = {}
@@ -726,7 +726,6 @@ def _real_exchange_order_state(ex_instance, symbol, order_id):
     except ccxt.OrderNotFound:
         ORDER_UNKNOWN_COUNT.pop(str(order_id), None); return "FILLED_OR_CANCELLED"
     except Exception as e:
-        # FIX: Deteksi teks error Bybit manual jika CCXT tidak melempar OrderNotFound
         err_str = str(e).lower()
         if "110001" in err_str or "not exists" in err_str or "not found" in err_str or "does not exist" in err_str:
             ORDER_UNKNOWN_COUNT.pop(str(order_id), None)
@@ -1312,9 +1311,12 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
 
         created = 0
         rate_limited = 0
+        cycle_created_symbols = set() # ANTI-DUPLIKAT DI SATU SIKLUS
         for sym in scan_symbols:
             if created >= slots: break
             if is_manual_alert_symbol(sym): continue
+            if sym in cycle_created_symbols: continue # Skip jika sudah dibuat di siklus ini
+            
             try:
                 if ex_id == 'bingx':
                     m15 = _bingx_ohlcv(ex, sym, '15m', 50)
@@ -1347,10 +1349,16 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 if not (tp < en < sl):
                     runtime['last_reason'] = f'{sym}: invalid SELL setup (tp={tp:.6g}, en={en:.6g}, sl={sl:.6g})'
                     continue
-            exists = db_read("SELECT 1 FROM trades WHERE user_id=? AND exchange_id=? AND symbol=? AND side=? AND status IN ('PENDING','OPEN') LIMIT 1", (user_id, ex_id, sym, sig))
+            
+            # ANTI-DUPLIKAT DI DATABASE (Tidak peduli BUY atau SELL)
+            exists = db_read(
+                "SELECT 1 FROM trades WHERE user_id=? AND exchange_id=? AND symbol=? AND status IN ('PENDING','OPEN') LIMIT 1", 
+                (user_id, ex_id, sym)
+            )
             if exists:
-                runtime['last_reason'] = f'{sym}: duplicate setup'
+                runtime['last_reason'] = f'{sym}: already has active trade (BUY/SELL)'
                 continue
+
             lev = int(risk_cfg['leverage'])
             margin = float(risk_cfg['margin'])
             dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
@@ -1489,6 +1497,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
             except Exception: pass
             created += 1
+            cycle_created_symbols.add(sym) # Tandai sudah dibuat
             runtime['signals'] = runtime.get('signals', 0) + 1
             runtime['created'] = runtime.get('created', 0) + 1
             runtime['last_reason'] = f'{sym}: {sig} setup created'
