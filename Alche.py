@@ -235,6 +235,24 @@ def get_cex_risk_settings(user_id, ex_id):
     r=rows[0]
     return {'margin':float(r[0]),'leverage':int(r[1]),'max_pos':int(r[2]),'max_trades_day':int(r[3]),'max_loss':int(r[4])}
 
+def _count_today_trades(user_id, ex_id=None):
+    """Count trades created today in WIB."""
+    uid = str(user_id)
+    if ex_id is None:
+        rows = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? "
+            "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
+            (uid,)
+        )
+    else:
+        rows = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? "
+            "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
+            (uid, str(ex_id).lower())
+        )
+    return int(rows[0][0]) if rows else 0
+
+
 def set_cex_risk_setting(user_id, ex_id, field, value):
     if field not in DEFAULT_CEX_RISK: raise ValueError('Setting risiko tidak valid.')
     ensure_cex_risk_settings(user_id,ex_id)
@@ -1357,7 +1375,8 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             runtime['last_reason'] = 'VIP tidak aktif / expired'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
         risk_cfg = get_cex_risk_settings(user_id, ex_id)
-        refresh_owner_eligible_pairs()
+        # Pair eligibility is maintained by startup/owner controls; avoid
+        # rewriting SQLite on every scanner cycle.
         if not user_is_owner and OWNER_PAIR_FILTER.get('enabled', True):
             scan_symbols = [sym for sym in scan_symbols if is_pair_owner_eligible(sym)]
         user_cfg = get_user_settings(user_id) if not user_is_owner else None
@@ -1373,21 +1392,37 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         user_max_pos = int(risk_cfg['max_pos'])
         global_max = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', 2))
         
-        today_losses = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status='CLOSED (SL)' AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')", (user_id, ex_id))[0][0]
+        today_losses = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? "
+            "AND status='CLOSED (SL)' "
+            "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
+            (user_id, ex_id)
+        )[0][0]
+        today_trades_cex = _count_today_trades(user_id, ex_id)
+        today_trades_user = _count_today_trades(user_id)
+        max_trades_cex = int(risk_cfg['max_trades_day'])
 
         can_open_trade = True
         reason_cant_trade = ""
-        
-        if not dry_run: # Hanya cek limit jika bukan Dry Run
-            if active_count >= user_max_pos:
+
+        # Apply risk limits consistently in DRY RUN and REAL mode.
+        if active_count >= user_max_pos:
+            can_open_trade = False
+            reason_cant_trade = f'Max Posisi CEX ({active_count}/{user_max_pos})'
+        elif global_active >= global_max:
+            can_open_trade = False
+            reason_cant_trade = f'Max Posisi Global ({global_active}/{global_max})'
+        elif today_trades_cex >= max_trades_cex:
+            can_open_trade = False
+            reason_cant_trade = f"Max trade CEX/hari ({today_trades_cex}/{max_trades_cex})"
+        elif today_losses >= int(risk_cfg['max_loss']):
+            can_open_trade = False
+            reason_cant_trade = f"Max loss ({today_losses}/{risk_cfg['max_loss']})"
+        elif not user_is_owner:
+            user_max_trades = int(get_user_settings(user_id)['max_trades_day'])
+            if today_trades_user >= user_max_trades:
                 can_open_trade = False
-                reason_cant_trade = f'Max Posisi CEX ({active_count}/{user_max_pos})'
-            elif global_active >= global_max:
-                can_open_trade = False
-                reason_cant_trade = f'Max Posisi Global ({global_active}/{global_max})'
-            elif today_losses >= int(risk_cfg['max_loss']):
-                can_open_trade = False
-                reason_cant_trade = f"Max loss ({today_losses}/{risk_cfg['max_loss']})"
+                reason_cant_trade = f"Max trade akun/hari ({today_trades_user}/{user_max_trades})"
         
         news_paused, news_time = is_news_time()
         if news_paused:
@@ -1410,9 +1445,36 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             if is_manual_alert_symbol(sym): continue
             if sym in cycle_created_symbols: continue 
             
-            # CEK COOLDOWN: Jika koin ini baru entry, jangan di-scan dulu (30 menit)
-            cooldown_until = SYMBOL_COOLDOWN.get(sym, 0)
-            if now < cooldown_until: continue
+            # ANTI-DUPLICATE:
+            # Tidak ada fixed cooldown 30 menit.
+            # Pair hanya ditahan jika masih memiliki PENDING/OPEN trade.
+            active_same_pair = db_read(
+                "SELECT 1 FROM trades "
+                "WHERE user_id=? AND exchange_id=? AND symbol=? "
+                "AND status IN ('PENDING','OPEN') LIMIT 1",
+                (user_id, ex_id, sym)
+            )
+            if active_same_pair:
+                continue
+
+            # Anti-duplicate singkat agar signal identik tidak dibuat
+            # berulang-ulang sebelum database sempat berubah.
+            last_signal_row = db_read(
+                "SELECT created_at FROM trades "
+                "WHERE user_id=? AND exchange_id=? AND symbol=? "
+                "ORDER BY id DESC LIMIT 1",
+                (user_id, ex_id, sym)
+            )
+            if last_signal_row:
+                try:
+                    last_created = datetime.strptime(
+                        str(last_signal_row[0]).split('.')[0],
+                        "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=WIB)
+                    if (now - last_created).total_seconds() < 60:
+                        continue
+                except Exception:
+                    pass
             
             try:
                 if ex_id == 'bingx':
@@ -1481,8 +1543,9 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
             except Exception: pass
 
-            # SET COOLDOWN 30 MENIT (1800 detik)
-            SYMBOL_COOLDOWN[sym] = time.time() + 1800
+            # Cool down a detected setup even if risk limits block opening.
+            # This prevents repeated signal spam every scanner cycle.
+            # Fixed 30-minute cooldown removed; PENDING/OPEN protection is used instead.
 
             if not can_open_trade:
                 runtime['last_reason'] = f'{sym}: {sig} signal generated (No Open)'
@@ -1565,15 +1628,13 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     ord_id = str(result.get('id') or '')
                     if not ord_id: raise RuntimeError('Exchange tidak mengembalikan order ID.')
                 except Exception as e_first:
+                    # Never create a live entry without the intended SL/TP protection.
                     err_text = str(e_first)
-                    try:
-                        result = ex.create_order(sym, 'limit', 'buy' if sig == 'BUY' else 'sell', qty, float(en), params=None)
-                        ord_id = str(result.get('id') or '')
-                        if not ord_id: raise RuntimeError('Fallback order tidak mengembalikan order ID.')
-                        send_error_alert(f"SL/TP attach gagal {ex_id}/{sym} — order entry dibuat TANPA SL/TP. Alasan: {err_text[:200]}. Pasang manual atau cek log!")
-                    except Exception as e_fallback:
-                        send_error_alert(f"Order Fails {ex_id}/{sym}: primary={err_text[:200]} | fallback={e_fallback}")
-                        continue
+                    send_error_alert(
+                        f"Order dibatalkan {ex_id}/{sym}: SL/TP attach gagal; "
+                        f"entry TIDAK dibuat. Alasan: {err_text[:350]}"
+                    )
+                    continue
                 avg = result.get('average'); filled = result.get('filled')
                 if avg not in (None, '', 0): actual_entry = float(avg)
                 elif filled and result.get('cost'): actual_entry = float(result['cost']) / float(filled)
@@ -3471,10 +3532,11 @@ def main_loop():
         try:
             now = datetime.now(WIB)
             today_str = now.date().isoformat()
-            if last_reset_day != today_str and now.hour == 0:
+            if last_reset_day != today_str:
+                was_new_day = last_reset_day is not None
                 last_reset_day = today_str
                 daily_sl_count = 0
-                if IS_BOT_PAUSED:
+                if was_new_day and IS_BOT_PAUSED:
                     IS_BOT_PAUSED = False
                     send_telegram("🌅 <b>NEW DAY RESET (WIB)</b>\nBot otomatis kembali aktif.")
             if time.time() - last_hb >= 21600:
