@@ -72,6 +72,9 @@ CORE_PAIRS = ('BTC/USDT', 'ETH/USDT')
 DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
 
 AUTO_UPDATE_ENABLED = True
+AUTO_UPDATE_APPROVAL_REQUIRED = True
+AUTO_UPDATE_PENDING = {}
+AUTO_UPDATE_LAST_NOTIFIED = None
 AUTO_UPDATE_BRANCH = "main"
 AUTO_UPDATE_INTERVAL_MINUTES = 5
 AUTO_UPDATE_REQUIRE_CLEAN_GIT = True
@@ -176,8 +179,96 @@ def _backup_current_revision():
 def _safe_restart():
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
+
+def _auto_update_has_active_execution():
+    """Conservative pre-update guard: do not restart during active execution."""
+    try:
+        # DB is authoritative for bot lifecycle. OPEN positions are allowed to
+        # remain protected at the exchange, but no restart is initiated while
+        # an entry/order transition is in progress.
+        rows = db_read(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE status IN ('PENDING','ENTRY_PENDING','EXIT_PENDING','PROTECTING')"
+        )
+        return bool(rows and int(rows[0][0]) > 0)
+    except Exception:
+        return True
+
+def _auto_update_status_text():
+    pending = AUTO_UPDATE_PENDING.get("global")
+    if not pending:
+        return None
+    current = pending.get("current", "?")[:12]
+    remote = pending.get("remote", "?")[:12]
+    return (
+        "🔔 <b>UPDATE TERSEDIA</b>\n\n"
+        f"Versi aktif: <code>{current}</code>\n"
+        f"Versi baru: <code>{remote}</code>\n\n"
+        "Update tidak diterapkan otomatis. Pilih aksi di bawah."
+    )
+
+def auto_update_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🚀 UPDATE SEKARANG", callback_data="auto_update:apply"),
+            InlineKeyboardButton(text="⏳ TUNDA", callback_data="auto_update:defer")
+        ],
+        [InlineKeyboardButton(text="🔄 CEK LAGI", callback_data="auto_update:check")]
+    ])
+
+def request_auto_update_approval(current, remote):
+    AUTO_UPDATE_PENDING["global"] = {
+        "current": current,
+        "remote": remote,
+        "detected_at": datetime.utcnow().isoformat(),
+    }
+    return _auto_update_status_text()
+
+def clear_auto_update_pending():
+    AUTO_UPDATE_PENDING.pop("global", None)
+
+def _apply_approved_update():
+    """Apply only the already-approved remote revision."""
+    pending = AUTO_UPDATE_PENDING.get("global")
+    if not pending:
+        return False, "Tidak ada update yang menunggu persetujuan."
+
+    if _auto_update_has_active_execution():
+        return False, "Masih ada execution transition aktif. Update ditunda agar aman."
+
+    root = Path(__file__).resolve().parent
+    if AUTO_UPDATE_REQUIRE_CLEAN_GIT and not _git_clean():
+        return False, "Working tree tidak clean. Update dibatalkan."
+
+    remote = pending["remote"]
+    backup = _backup_current_revision()
+
+    worktree = root / ".auto_update_validate"
+    if worktree.exists():
+        shutil.rmtree(worktree, ignore_errors=True)
+
+    add = _run_git("worktree", "add", "--detach", str(worktree), remote)
+    if add.returncode != 0:
+        return False, f"Validasi update gagal: {add.stderr.strip()}"
+
+    try:
+        ok, detail = _validate_python_tree(worktree)
+    finally:
+        _run_git("worktree", "remove", "--force", str(worktree))
+        shutil.rmtree(worktree, ignore_errors=True)
+
+    if not ok:
+        return False, f"Validasi Python gagal: {detail}"
+
+    pull = _run_git("merge", "--ff-only", remote)
+    if pull.returncode != 0:
+        return False, f"Update gagal: {pull.stderr.strip()}"
+
+    clear_auto_update_pending()
+    return True, f"Update berhasil. Backup: {backup.name}"
+
 def auto_update_once():
-    """Check GitHub, validate, backup, fast-forward update, then restart."""
+    """Detect a new revision and request owner approval; never auto-restart."""
     if not AUTO_UPDATE_ENABLED:
         return False
 
@@ -196,37 +287,24 @@ def auto_update_once():
     if not current or not remote or current == remote:
         return False
 
-    backup = _backup_current_revision()
-    print(f"[AUTO-UPDATE] new revision detected: {remote[:12]}")
-
-    # Validate the remote commit before changing the live tree.
-    worktree = root / ".auto_update_validate"
-    if worktree.exists():
-        shutil.rmtree(worktree, ignore_errors=True)
-
-    add = _run_git("worktree", "add", "--detach", str(worktree), remote)
-    if add.returncode != 0:
-        print(f"[AUTO-UPDATE] validation worktree failed: {add.stderr.strip()}")
+    existing = AUTO_UPDATE_PENDING.get("global")
+    if existing and existing.get("remote") == remote:
         return False
 
+    msg = request_auto_update_approval(current, remote)
+    print(f"[AUTO-UPDATE] approval required: {current[:12]} -> {remote[:12]}")
     try:
-        ok, detail = _validate_python_tree(worktree)
-    finally:
-        _run_git("worktree", "remove", "--force", str(worktree))
-        shutil.rmtree(worktree, ignore_errors=True)
-
-    if not ok:
-        print(f"[AUTO-UPDATE] validation failed: {detail}")
-        return False
-
-    pull = _run_git("merge", "--ff-only", remote)
-    if pull.returncode != 0:
-        print(f"[AUTO-UPDATE] fast-forward failed: {pull.stderr.strip()}")
-        return False
-
-    print(f"[AUTO-UPDATE] updated successfully. Backup: {backup}")
-    _safe_restart()
+        # Notify through the bot only when an owner chat id is already configured.
+        owner_chat = globals().get('OWNER_CHAT_ID') or globals().get('OWNER_ID')
+        if owner_chat and 'bot' in globals():
+            asyncio.run_coroutine_threadsafe(
+                bot.send_message(owner_chat, msg, reply_markup=auto_update_keyboard()),
+                asyncio.get_event_loop()
+            )
+    except Exception:
+        pass
     return True
+
 
 def auto_update_loop():
     while True:
@@ -3621,6 +3699,76 @@ async def handle_text(message: Message):
         f"✅ <b>API {ex_id.upper()} VALID</b>\n\nPrivate endpoint berhasil diakses.\n\n{format_account_details(account_details)}\n\n🔗 API sudah disimpan. CEX masih <b>OFF</b> sampai kamu menekan tombol ON.",
         reply_markup=cex_control_keyboard(user_id)
     )
+
+
+@dp.callback_query(F.data.startswith("auto_update:"))
+async def cb_auto_update(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+
+    action = callback.data.split(":", 1)[1]
+
+    if action == "defer":
+        clear_auto_update_pending()
+        await safe_answer(callback, "Update ditunda.")
+        await callback.message.edit_text(
+            "⏳ <b>UPDATE DITUNDA</b>\n\n"
+            "Bot tetap berjalan dengan versi saat ini.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 CEK UPDATE", callback_data="auto_update:check")],
+                [InlineKeyboardButton(text="⬅️ MENU", callback_data="menu")]
+            ])
+        )
+        return
+
+    if action == "check":
+        auto_update_once()
+        msg = _auto_update_status_text()
+        await safe_answer(callback)
+        if msg:
+            await callback.message.edit_text(msg, reply_markup=auto_update_keyboard())
+        else:
+            await callback.message.edit_text(
+                "✅ <b>TIDAK ADA UPDATE BARU</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⬅️ MENU", callback_data="menu")]
+                ])
+            )
+        return
+
+    if action == "apply":
+        await safe_answer(callback, "Memeriksa keamanan update...")
+        pending = AUTO_UPDATE_PENDING.get("global")
+        if not pending:
+            await callback.message.edit_text("❌ Tidak ada update yang menunggu persetujuan.")
+            return
+
+        if _auto_update_has_active_execution():
+            await callback.message.edit_text(
+                "⏳ <b>UPDATE DITUNDA</b>\n\n"
+                "Masih ada proses execution yang sedang transisi.\n"
+                "Tidak ada restart dilakukan sekarang.",
+                reply_markup=auto_update_keyboard()
+            )
+            return
+
+        ok, detail = _apply_approved_update()
+        if not ok:
+            await callback.message.edit_text(
+                f"❌ <b>UPDATE GAGAL / DITUNDA</b>\n\n{html.escape(detail)}",
+                reply_markup=auto_update_keyboard()
+            )
+            return
+
+        # Approved update is now on disk. Restart so Python loads the new code.
+        await callback.message.edit_text(
+            "✅ <b>UPDATE SIAP</b>\n\n"
+            "Versi baru sudah diterapkan.\n"
+            "Bot akan restart otomatis lalu melakukan reconciliation."
+        )
+        _safe_restart()
+        return
 
 @dp.callback_query(F.data == "menu")
 async def cb_menu(callback: CallbackQuery):
