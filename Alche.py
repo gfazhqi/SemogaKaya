@@ -71,9 +71,21 @@ MANUAL_ALERT_PAIRS = set()
 CORE_PAIRS = ('BTC/USDT', 'ETH/USDT')
 DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
 
+
+PAIR_TIER_MIN_TRADES = 20
+PAIR_TIER_ACTIVE_WR = 50.0
+PAIR_TIER_S_WR = 70.0
+PAIR_TIER_A_WR = 60.0
+PAIR_TIER_B_WR = 50.0
+PAIR_TIER_MIN_PROFIT_FACTOR = 1.05
+PAIR_TIER_MIN_RECENT_TRADES = 5
+PAIR_TIER_RECENT_LOOKBACK_DAYS = 30
+
 AUTO_UPDATE_ENABLED = True
-AUTO_UPDATE_APPROVAL_REQUIRED = True
+AUTO_UPDATE_APPROVAL_REQUIRED = True  # GitHub push never restarts the bot without Owner approval.
 AUTO_UPDATE_PENDING = {}
+UPDATE_STATE_FILE = ".auto_update_state.json"
+AUTO_UPDATE_STARTUP_TIMEOUT_SECONDS = 90
 AUTO_UPDATE_LAST_NOTIFIED = None
 AUTO_UPDATE_BRANCH = "main"
 AUTO_UPDATE_INTERVAL_MINUTES = 5
@@ -81,7 +93,7 @@ AUTO_UPDATE_REQUIRE_CLEAN_GIT = True
 AUTO_UPDATE_BACKUP_DIR = ".update_backups"
 
 DRY_RUN_ALWAYS_ON = True
-DRY_RUN_BYPASS_SESSION = False  # DRY RUN uses the exact same session gate as REAL mode.  # Persistent 24/7 simulation mode; never expires.
+DRY_RUN_BYPASS_SESSION = True  # Research/backtest collection only; REAL keeps normal session filter.  # DRY RUN uses the exact same session gate as REAL mode.  # Persistent 24/7 simulation mode; never expires.
 
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
@@ -180,6 +192,64 @@ def _safe_restart():
     os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
+
+def _write_update_state(data):
+    try:
+        path = Path(__file__).resolve().parent / UPDATE_STATE_FILE
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"[AUTO-UPDATE] state write failed: {exc}")
+
+def _read_update_state():
+    try:
+        path = Path(__file__).resolve().parent / UPDATE_STATE_FILE
+        if not path.exists():
+            return {}
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def _clear_update_state():
+    try:
+        path = Path(__file__).resolve().parent / UPDATE_STATE_FILE
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+def _rollback_to_revision(revision):
+    if not revision:
+        return False, "No previous revision available."
+    r = _run_git("reset", "--hard", revision)
+    if r.returncode != 0:
+        return False, r.stderr.strip()
+    return True, "Rollback completed."
+
+def _mark_update_pending_restart(previous_revision, new_revision, backup_name):
+    _write_update_state({
+        "pending_restart": True,
+        "previous_revision": previous_revision,
+        "new_revision": new_revision,
+        "backup": backup_name,
+        "started_at": datetime.utcnow().isoformat(),
+    })
+
+def _startup_update_recovery():
+    """If the previous approved update left a restart marker, verify startup."""
+    state = _read_update_state()
+    if not state.get("pending_restart"):
+        return
+
+    previous = state.get("previous_revision")
+    new = state.get("new_revision")
+    if _git_head() != new:
+        _clear_update_state()
+        return
+
+    # Successful import/startup reaches this function. Clear the marker.
+    _clear_update_state()
+    print(f"[AUTO-UPDATE] startup verified for {new[:12] if new else 'unknown'}")
+
 def _auto_update_has_active_execution():
     """Conservative pre-update guard: do not restart during active execution."""
     try:
@@ -206,6 +276,24 @@ def _auto_update_status_text():
         f"Versi baru: <code>{remote}</code>\n\n"
         "Update tidak diterapkan otomatis. Pilih aksi di bawah."
     )
+
+
+async def notify_owner_update_available():
+    try:
+        msg = _auto_update_status_text()
+        if not msg:
+            return False
+        owner_chat = globals().get("OWNER_CHAT_ID") or globals().get("OWNER_ID")
+        if owner_chat and "bot" in globals():
+            await bot.send_message(
+                owner_chat,
+                msg,
+                reply_markup=auto_update_keyboard()
+            )
+            return True
+    except Exception as exc:
+        print(f"[AUTO-UPDATE] owner notification failed: {exc}")
+    return False
 
 def auto_update_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -264,6 +352,11 @@ def _apply_approved_update():
     if pull.returncode != 0:
         return False, f"Update gagal: {pull.stderr.strip()}"
 
+    _mark_update_pending_restart(
+        previous_revision=pending.get("current"),
+        new_revision=remote,
+        backup_name=backup.name
+    )
     clear_auto_update_pending()
     return True, f"Update berhasil. Backup: {backup.name}"
 
@@ -294,15 +387,14 @@ def auto_update_once():
     msg = request_auto_update_approval(current, remote)
     print(f"[AUTO-UPDATE] approval required: {current[:12]} -> {remote[:12]}")
     try:
-        # Notify through the bot only when an owner chat id is already configured.
-        owner_chat = globals().get('OWNER_CHAT_ID') or globals().get('OWNER_ID')
-        if owner_chat and 'bot' in globals():
+        loop = globals().get("BOT_LOOP")
+        if loop and loop.is_running():
             asyncio.run_coroutine_threadsafe(
-                bot.send_message(owner_chat, msg, reply_markup=auto_update_keyboard()),
-                asyncio.get_event_loop()
+                notify_owner_update_available(),
+                loop
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[AUTO-UPDATE] notification scheduling failed: {exc}")
     return True
 
 
@@ -2556,36 +2648,101 @@ def build_stats_text(user_id='OWNER'):
         f"Win Rate: {wr:.1f}%\nNet PnL (estimasi): ${net:.2f}\n\n{detail}"
     )
 
+
+def calculate_pair_research_tier(wins, losses, gross_profit=0.0, gross_loss=0.0,
+                                 recent_wins=0, recent_losses=0):
+    total = int(wins) + int(losses)
+    wr = (wins / total * 100.0) if total else 0.0
+    pf = (float(gross_profit) / abs(float(gross_loss))) if gross_loss else (
+        float("inf") if gross_profit > 0 else 0.0
+    )
+    recent_total = int(recent_wins) + int(recent_losses)
+    recent_wr = (recent_wins / recent_total * 100.0) if recent_total else None
+
+    if total < PAIR_TIER_MIN_TRADES:
+        return "EVALUASI", wr, pf, recent_wr
+
+    if (
+        wr >= PAIR_TIER_S_WR
+        and pf >= PAIR_TIER_MIN_PROFIT_FACTOR
+        and (recent_total < PAIR_TIER_MIN_RECENT_TRADES or recent_wr >= PAIR_TIER_S_WR)
+    ):
+        return "S", wr, pf, recent_wr
+
+    if wr >= PAIR_TIER_A_WR and pf >= PAIR_TIER_MIN_PROFIT_FACTOR:
+        return "A", wr, pf, recent_wr
+
+    if wr >= PAIR_TIER_B_WR:
+        return "B", wr, pf, recent_wr
+
+    return "BLACKLIST", wr, pf, recent_wr
+
 def build_pairperf_text():
     try:
-        rows = db_read("SELECT symbol, status FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')")
+        rows = db_read(
+            "SELECT symbol, status FROM trades "
+            "WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')"
+        )
         pair_perf = {}
         for sym, stat in rows:
             pair = canonical_pair(sym)
-            pair_perf.setdefault(pair, {'w': 0, 'l': 0})
-            if 'TP' in stat: pair_perf[pair]['w'] += 1
-            else: pair_perf[pair]['l'] += 1
-        active, wait, black = [], [], []
-        for sym, data in sorted(pair_perf.items()):
-            total = data['w'] + data['l']; wr = data['w'] / total * 100 if total else 0
-            core = sym in CORE_PAIRS
-            line = f"• {sym}{' [CORE]' if core else ''}: {data['w']}W/{data['l']}L (WR: {wr:.1f}%)"
-            if total < CONFIG['MIN_TRADES']: wait.append(line)
-            elif core or wr >= CONFIG['MIN_WR']: active.append(line)
-            else: black.append(line)
-        text = "\n".join([
-            "🏆 <b>PERFORMA KOIN</b>", "", "🔥 <b>AKTIF</b>", "\n".join(active) or "Belum ada",
-            "", "⏳ <b>EVALUASI</b>", "\n".join(wait) or "Belum ada",
-            "", "🗑️ <b>BLACKLIST</b>", "\n".join(black) or "Belum ada"
-        ])
-        LIMIT=3800
-        if len(text)>LIMIT:
-            cut=text[:LIMIT].rfind("\n")
-            text=text[:cut if cut>0 else LIMIT]
-            text += "\n\n⚠️ <i>Daftar dipotong karena batas Telegram. Statistik pair tetap tersimpan.</i>"
-        return text
+            d = pair_perf.setdefault(pair, {'w': 0, 'l': 0})
+            if 'TP' in stat:
+                d['w'] += 1
+            else:
+                d['l'] += 1
+
+        tiers = {"S": [], "A": [], "B": [], "EVALUASI": [], "BLACKLIST": []}
+        for pair, d in sorted(pair_perf.items()):
+            tier, wr, pf, recent_wr = calculate_pair_research_tier(
+                d['w'], d['l']
+            )
+            line = (
+                f"• {pair}: {d['w']}W/{d['l']}L | "
+                f"WR {wr:.1f}% | PF {pf:.2f}"
+            )
+            if pair in CORE_PAIRS:
+                line += " | CORE"
+            tiers[tier].append(line)
+
+        min_wr = float(CONFIG.get('MIN_WR', 50.0))
+        min_trades = int(CONFIG.get('MIN_TRADES', 20))
+
+        sections = [
+            "🏆 <b>PAIR PERFORMANCE — RESEARCH</b>",
+            f"🎯 Custom filter: WR ≥ {min_wr:.1f}% | Trades ≥ {min_trades}",
+            "🧪 DRY RUN: 24/7 research mode (session bypass)",
+            "",
+            "💎 <b>TIER S — PRIORITAS</b>",
+            "\n".join(tiers["S"]) or "Belum ada",
+            "",
+            "🥇 <b>TIER A — BAGUS</b>",
+            "\n".join(tiers["A"]) or "Belum ada",
+            "",
+            "🥈 <b>TIER B — CUKUP</b>",
+            "\n".join(tiers["B"]) or "Belum ada",
+            "",
+            "⏳ <b>EVALUASI</b>",
+            "\n".join(tiers["EVALUASI"]) or "Belum ada",
+            "",
+            "⛔ <b>BLACKLIST</b>",
+            "\n".join(tiers["BLACKLIST"]) or "Belum ada",
+        ]
+        result = "\n".join(sections)
+
+        if len(result) > 3800:
+            result = result[:3800]
+            cut = result.rfind("\n")
+            if cut > 0:
+                result = result[:cut]
+            result += (
+                "\n\n⚠️ <i>Daftar dipotong karena batas Telegram. "
+                "Statistik tetap tersimpan.</i>"
+            )
+        return result
     except Exception as e:
         return f"Error: {html.escape(str(e))}"
+
 
 def build_cex_status_text(user_id='OWNER'):
     user_id = _account_user_id(user_id)
