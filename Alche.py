@@ -11,9 +11,9 @@ import html
 import json
 import zipfile
 import shutil
-import tempfile
+import os
 import re
-import random
+import tempfile
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
@@ -32,40 +32,82 @@ from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 PUBLIC_CHANNEL_ID = getattr(__import__('config'), 'PUBLIC_CHANNEL_ID', '')
 VIP_JOIN_URL = getattr(__import__('config'), 'VIP_JOIN_URL', '')
 
-DB_FILE = 'trades.db'
+# =================================================================
+# RUNTIME / DATABASE DEFAULTS
+# =================================================================
+DB_FILE = getattr(__import__('config'), 'DB_FILE', 'alche.db')
 WIB = timezone(timedelta(hours=7))
-MAX_DAILY_SL = 2
-SL_BUFFER_PERCENT = 0.0005
-CORE_PAIRS = ['BTC/USDT', 'ETH/USDT']
-MANUAL_ALERT_PAIRS = []
-DEFAULT_CEX = {'bingx': {'type':'swap'}, 'bitget': {'type':'swap'}, 'bybit': {'type':'linear'}, 'binance': {'type':'future'}}
-BINGX_REQUEST_SPACING = 0.35
-SCANNER_MIN_INTERVAL = 30
-exchanges = {}
-EXCHANGE_MARKETS = {}
-EXCHANGE_SCAN_NEXT = {}
-EXCHANGE_LAST_CANDLE = {}
-EXCHANGE_SCAN_CURSOR = {}
-EXCHANGE_REQUEST_NEXT = {}
-EXCHANGE_RUNTIME = {}
 DB_LOCK = threading.RLock()
 BOT_STARTED_AT = time.time()
-MAIN_ASYNC_LOOP = None
-IS_BOT_PAUSED = False
-daily_sl_count = 0
-last_error_time = 0
-ERROR_COOLDOWN = 300
+LAST_EVENT_TEXT = 'Booting'
+last_runtime_status = 'BOOTING'
 ERROR_HISTORY = []
 ERROR_HISTORY_MAX = 50
-last_runtime_status = None
-LAST_EVENT_TEXT = 'Bot initialized'
-LAST_EVENT_TIME = time.time()
 LAST_MENU_MESSAGE = {}
-PUBLIC_LAST_DAILY_REPORT_DATE = None
-PUBLIC_LAST_WEEKLY_REPORT_DATE = None
-CONFIG = {'MARGIN_PER_TRADE':2.0,'MAX_CONCURRENT_POSITIONS':2,'LEVERAGE':{ex:50 for ex in DEFAULT_CEX},'DRY_RUN':True,'MIN_TRADES':5,'MIN_WR':40.0,'DAILY_LOSS_LIMIT':True}
-OWNER_PAIR_FILTER_ENABLED = True
-DEFAULT_OWNER_PAIRS = tuple(CORE_PAIRS)
+PENDING_API_SETUP = {}
+EXCHANGE_RUNTIME = {}
+EXCHANGE_SCAN_NEXT = {}
+EXCHANGE_SCAN_CURSOR = {}
+EXCHANGE_LAST_CANDLE = {}
+EXCHANGE_MARKETS = {}
+EXCHANGE_REQUEST_NEXT = {}
+IS_BOT_PAUSED = False
+daily_sl_count = 0
+SCANNER_MIN_INTERVAL = 15
+BINGX_REQUEST_SPACING = 0.35
+MAX_DAILY_SL = 3
+SL_BUFFER_PERCENT = 0.001
+ERROR_COOLDOWN = 60
+MANUAL_ALERT_PAIRS = set()
+CORE_PAIRS = tuple(getattr(__import__('config'), 'CORE_PAIRS', ('BTC/USDT','ETH/USDT','SOL/USDT','BNB/USDT','XRP/USDT','DOGE/USDT','ADA/USDT','AVAX/USDT')))
+DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
+CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 3, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 60.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
+
+def _table_columns(conn, table):
+    return {row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()}
+
+def init_db():
+    Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=15)
+        try:
+            c = conn.cursor()
+            c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id TEXT PRIMARY KEY, margin REAL NOT NULL DEFAULT 2.0, max_pos INTEGER NOT NULL DEFAULT 3, max_trades_day INTEGER NOT NULL DEFAULT 10, leverage INTEGER NOT NULL DEFAULT 20, auto_trade INTEGER NOT NULL DEFAULT 1)")
+            c.execute("CREATE TABLE IF NOT EXISTS user_cex_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, api_key TEXT DEFAULT '', secret TEXT DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, password TEXT DEFAULT '', account_label TEXT DEFAULT '', account_info TEXT DEFAULT '', PRIMARY KEY (user_id, ex_id))")
+            c.execute("CREATE TABLE IF NOT EXISTS vip_members (telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', status TEXT DEFAULT 'ACTIVE', expires_at TEXT, added_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'OWNER', exchange_id TEXT NOT NULL, symbol TEXT NOT NULL, order_type TEXT DEFAULT 'LIMIT', side TEXT NOT NULL, entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL, order_id TEXT DEFAULT '', bars_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_eligible (symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_filter (id INTEGER PRIMARY KEY CHECK (id=1), enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            for col, definition in {'user_id': "TEXT NOT NULL DEFAULT 'OWNER'", 'bars_count': 'INTEGER NOT NULL DEFAULT 0', 'created_at': 'TEXT DEFAULT CURRENT_TIMESTAMP'}.items():
+                if col not in _table_columns(conn, 'trades'): c.execute(f'ALTER TABLE trades ADD COLUMN {col} {definition}')
+            for col, definition in {'secret': "TEXT DEFAULT ''", 'password': "TEXT DEFAULT ''", 'account_label': "TEXT DEFAULT ''", 'account_info': "TEXT DEFAULT ''"}.items():
+                if col not in _table_columns(conn, 'user_cex_settings'): c.execute(f'ALTER TABLE user_cex_settings ADD COLUMN {col} {definition}')
+            for k,v in {'margin':'2.0','max_pos':'3','dry_run':'1','min_trades':'20','min_wr':'60','daily_loss_limit':'1'}.items(): c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(k,v))
+            for ex_id in DEFAULT_CEX:
+                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'lev_{ex_id}','20'))
+                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'dry_run_{ex_id}','1'))
+            c.execute('INSERT OR IGNORE INTO owner_pair_filter(id,enabled) VALUES (1,1)')
+            for pair in CORE_PAIRS: c.execute('INSERT OR IGNORE INTO owner_pair_eligible(symbol,enabled,updated_at) VALUES (?,?,?)',(pair,1,datetime.now(WIB).isoformat(timespec='seconds')))
+            conn.commit()
+        finally: conn.close()
+
+def _load_owner_pair_filter_state():
+    rows=db_read('SELECT enabled FROM owner_pair_filter WHERE id=1'); enabled=bool(rows[0][0]) if rows else True
+    pairs=[r[0] for r in db_read('SELECT symbol FROM owner_pair_eligible WHERE enabled=1 ORDER BY symbol')]
+    return enabled, pairs or list(CORE_PAIRS)
+
+def _save_owner_pair_filter(enabled,pairs):
+    now=datetime.now(WIB).isoformat(timespec='seconds')
+    with DB_LOCK:
+        conn=sqlite3.connect(DB_FILE,timeout=10)
+        try:
+            conn.execute('UPDATE owner_pair_filter SET enabled=?, updated_at=? WHERE id=1',(1 if enabled else 0,now))
+            conn.execute('UPDATE owner_pair_eligible SET enabled=0, updated_at=?',(now,))
+            for pair in sorted(set(pairs)):
+                conn.execute('INSERT INTO owner_pair_eligible(symbol,enabled,updated_at) VALUES (?,?,?) ON CONFLICT(symbol) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at',(pair,1,now))
+            conn.commit()
+        finally: conn.close()
 
 # =================================================================
 # VIP USER SETTINGS — SIMPLE MODE
@@ -92,51 +134,6 @@ def vip_recommended_settings_text(user_id=None):
         + VIP_WARNING_TEXT
     )
 
-
-
-def _table_columns(conn, table):
-    return {row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()}
-
-
-def _ensure_column(conn, table, column, definition):
-    if column not in _table_columns(conn, table):
-        conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
-
-
-def init_db():
-    conn = sqlite3.connect(DB_FILE, timeout=15)
-    try:
-        c = conn.cursor()
-        c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'OWNER', exchange_id TEXT, symbol TEXT, order_type TEXT, side TEXT, entry_price REAL, sl_price REAL, tp_price REAL, order_id TEXT, bars_count INTEGER DEFAULT 0, status TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        _ensure_column(conn,'trades','user_id',"TEXT NOT NULL DEFAULT 'OWNER'")
-        _ensure_column(conn,'trades','bars_count','INTEGER DEFAULT 0')
-        c.execute("UPDATE trades SET user_id='OWNER' WHERE user_id IS NULL OR user_id=''")
-        c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value REAL)")
-        for k,v in {'margin':2.0,'max_pos':2.0,'dry_run':1.0,'min_trades':5.0,'min_wr':40.0,'daily_loss_limit':1.0}.items(): c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',(k,v))
-        for ex in DEFAULT_CEX: c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)',(f'lev_{ex}',50.0))
-        c.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id TEXT PRIMARY KEY, margin REAL NOT NULL DEFAULT 2.0, max_pos INTEGER NOT NULL DEFAULT 3, max_trades_day INTEGER NOT NULL DEFAULT 10, leverage INTEGER NOT NULL DEFAULT 20, auto_trade INTEGER NOT NULL DEFAULT 1)")
-        for col,definition in [('margin','REAL NOT NULL DEFAULT 2.0'),('max_pos','INTEGER NOT NULL DEFAULT 3'),('max_trades_day','INTEGER NOT NULL DEFAULT 10'),('leverage','INTEGER NOT NULL DEFAULT 20'),('auto_trade','INTEGER NOT NULL DEFAULT 1')]: _ensure_column(conn,'user_settings',col,definition)
-        c.execute("INSERT OR IGNORE INTO user_settings(user_id) VALUES('OWNER')")
-        c.execute("CREATE TABLE IF NOT EXISTS vip_members (telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'ACTIVE', expires_at TEXT, added_at TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS user_cex_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, api_key TEXT DEFAULT '', secret TEXT DEFAULT '', password TEXT DEFAULT '', enabled INTEGER DEFAULT 0, account_label TEXT DEFAULT '', account_info TEXT DEFAULT '', PRIMARY KEY(user_id,ex_id))")
-        for col,definition in [('password',"TEXT DEFAULT ''"),('enabled','INTEGER DEFAULT 0'),('account_label',"TEXT DEFAULT ''"),('account_info',"TEXT DEFAULT ''")]: _ensure_column(conn,'user_cex_settings',col,definition)
-        for ex in DEFAULT_CEX: c.execute("INSERT OR IGNORE INTO user_cex_settings(user_id,ex_id,api_key,secret,password,enabled,account_label,account_info) VALUES('OWNER',?,?,?,?,0,'','')",(ex,'','',''))
-        c.execute("CREATE TABLE IF NOT EXISTS cex_settings (ex_id TEXT PRIMARY KEY, api_key TEXT DEFAULT '', secret TEXT DEFAULT '', enabled INTEGER DEFAULT 0, account_label TEXT DEFAULT '', account_info TEXT DEFAULT '', password TEXT DEFAULT '')")
-        for ex in DEFAULT_CEX: c.execute('INSERT OR IGNORE INTO cex_settings(ex_id) VALUES(?)',(ex,))
-        c.execute("CREATE TABLE IF NOT EXISTS owner_pair_filter (id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT, manual_include_json TEXT NOT NULL DEFAULT '[]', manual_exclude_json TEXT NOT NULL DEFAULT '[]')")
-        c.execute("INSERT OR IGNORE INTO owner_pair_filter(id,enabled,updated_at,manual_include_json,manual_exclude_json) VALUES(1,1,?,'[]','[]')",(datetime.now(WIB).isoformat(timespec='seconds'),))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def load_owner_pair_filter_state():
-    global OWNER_PAIR_FILTER_ENABLED
-    try:
-        row=db_read('SELECT enabled FROM owner_pair_filter WHERE id=1')
-        OWNER_PAIR_FILTER_ENABLED=bool(row[0][0]) if row else True
-    except Exception:
-        OWNER_PAIR_FILTER_ENABLED=True
 
 def ensure_user_settings(user_id):
     uid = str(user_id)
@@ -205,6 +202,8 @@ def load_settings():
             CONFIG['DAILY_LOSS_LIMIT'] = bool(row[1])
         elif row[0].startswith('lev_'):
             CONFIG['LEVERAGE'][row[0].split('_', 1)[1]] = int(row[1])
+        elif row[0].startswith('dry_run_'):
+            CONFIG.setdefault('DRY_RUN_CEX', {})[row[0].split('_', 2)[2]] = bool(float(row[1]))
 
     conn.close()
 
@@ -447,7 +446,7 @@ def close_open_trade(trade_id):
             is_sim = str(order_id).startswith('sim_')
             ex = exchanges.get(_exchange_key(user_id, ex_id))
 
-            if (CONFIG.get('DRY_RUN', True) if str(user_id) == 'OWNER' else False) or is_sim:
+            if is_sim:
                 cur = conn.execute(
                     "UPDATE trades SET status='CLOSED (MANUAL)' "
                     "WHERE id=? AND status='OPEN'",
@@ -549,7 +548,7 @@ def cancel_all_pending_orders_on_pause(user_id='OWNER'):
                     ).fetchall()
 
                 for t_id, row_user_id, ex_id, sym, ord_id in rows:
-                    if _exchange_key(row_user_id, ex_id) in exchanges and not str(ord_id).startswith('sim_'):
+                    if ex_id in exchanges and not str(ord_id).startswith('sim_'):
                         try:
                             exchanges[_exchange_key(row_user_id, ex_id)].cancel_order(ord_id, sym)
                         except Exception:
@@ -815,39 +814,21 @@ def _fmt_uptime(seconds):
 
 
 def build_runtime_status_text(user_id='OWNER'):
-    # VIP can see runtime/account status, but the internal strategy is Owner-only.
-    is_vip_view = str(user_id) != 'OWNER'
-    mode = '🧪 DRY RUN' if CONFIG.get('DRY_RUN', True) else '⚠️ REAL'
+    user_id = _account_user_id(user_id)
+    mode = ' | '.join(f"{x.upper()}: {'DRY' if get_owner_dry_run(x) else 'REAL'}" for x in DEFAULT_CEX) if str(user_id)=='OWNER' else '⚠️ REAL'
     engine = '⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'
     kill = '🟢 ACTIVE' if is_kill_zone() else '🔴 INACTIVE'
-    if is_vip_view:
-        pending = db_read(
-            "SELECT COUNT(*) FROM trades WHERE user_id=? AND status='PENDING'",
-            (str(user_id),)
-        )[0][0]
-        opened = db_read(
-            "SELECT COUNT(*) FROM trades WHERE user_id=? AND status='OPEN'",
-            (str(user_id),)
-        )[0][0]
-        total_today = db_read(
-            "SELECT COUNT(*) FROM trades WHERE user_id=? AND created_at >= date('now','start of day')",
-            (str(user_id),)
-        )[0][0]
-    else:
-        pending = db_read("SELECT COUNT(*) FROM trades WHERE status='PENDING'")[0][0]
-        opened = db_read("SELECT COUNT(*) FROM trades WHERE status='OPEN'")[0][0]
-        total_today = db_read(
-            "SELECT COUNT(*) FROM trades WHERE created_at >= date('now','start of day')"
-        )[0][0]
+    pending = db_read("SELECT COUNT(*) FROM trades WHERE status='PENDING'")[0][0]
+    opened = db_read("SELECT COUNT(*) FROM trades WHERE status='OPEN'")[0][0]
+    total_today = db_read(
+        "SELECT COUNT(*) FROM trades WHERE created_at >= date('now','start of day')"
+    )[0][0]
     lines = [
         "🤖 <b>ALCHEMIST — RUNTIME STATUS</b>",
         "",
         f"{engine} | {mode}",
         f"⏱ Uptime: {_fmt_uptime(time.time() - BOT_STARTED_AT)}",
-    ]
-    if not is_vip_view:
-        lines.append("🧠 Strategy: SMC M15 + H1 EMA50 + Daily Open")
-    lines += [
+        *( [f"🧠 Strategy: SMC M15 + H1 EMA50 + Daily Open"] if str(user_id)=='OWNER' else [] ),
         f"🕐 Kill Zone: {kill}",
         "",
         "🔎 <b>SCANNER PER CEX</b>",
@@ -881,12 +862,8 @@ def build_runtime_status_text(user_id='OWNER'):
 
 
 def runtime_status_keyboard(obj=None):
-    # BOT CONTROL is an Owner-only control. Never expose it in a VIP runtime view.
-    rows = [
-        [InlineKeyboardButton(text="🔄 REFRESH", callback_data="runtime_status")],
-        [InlineKeyboardButton(text="📊 POSISI", callback_data="positions")],
-    ]
-    if obj is not None and is_owner(obj):
+    rows=[[InlineKeyboardButton(text="🔄 REFRESH", callback_data="runtime_status")],[InlineKeyboardButton(text="📊 POSISI", callback_data="positions")]]
+    if obj is None or is_owner(obj):
         rows.append([InlineKeyboardButton(text="🎛️ BOT CONTROL", callback_data="bot_control")])
     rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -971,10 +948,6 @@ def _public_crypto_symbol(sym):
     if any(x in base for x in ('UP', 'DOWN', 'BULL', 'BEAR')) or re.search(r'\d+[LS]$', base):
         return False
     return True
-
-
-def _is_public_crypto_symbol(sym):
-    return _public_crypto_symbol(sym)
 
 
 VIP_WARNING_TEXT = (
@@ -1217,73 +1190,6 @@ def _submit_async(coro):
 # MARKET SCANNER
 # =================================================================
 # LOGIC TRADE TIDAK DIUBAH
-
-def normalize_crypto_symbol(symbol):
-    raw=str(symbol or '').upper().strip()
-    if ':' in raw: raw=raw.split(':',1)[0]
-    return raw.replace('-', '/')
-
-
-def is_valid_crypto_perpetual_symbol(symbol):
-    canonical=normalize_crypto_symbol(symbol)
-    if not re.fullmatch(r'[A-Z0-9]{2,20}/USDT',canonical): return False
-    base=canonical.split('/',1)[0]
-    if base in {'XAU','XAG','WTI','USOIL','EUR','GBP','JPY','AUD','CAD','CHF','NZD'}: return False
-    if any(x in base for x in ('UP','DOWN','BULL','BEAR')): return False
-    if re.search(r'\d+[LS]$',base): return False
-    return True
-
-
-def _owner_pair_performance():
-    perf={}
-    for sym,stat in db_read("SELECT symbol,status FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)','CLOSED (SL)')"):
-        key=normalize_crypto_symbol(sym)
-        if not is_valid_crypto_perpetual_symbol(key): continue
-        perf.setdefault(key,{'w':0,'l':0})
-        perf[key]['w' if 'TP' in str(stat) else 'l']+=1
-    return perf
-
-
-def get_owner_eligible_pairs():
-    try:
-        row=db_read('SELECT enabled,manual_include_json,manual_exclude_json FROM owner_pair_filter WHERE id=1')
-        enabled=bool(row[0][0]) if row else OWNER_PAIR_FILTER_ENABLED
-        includes=json.loads(row[0][1] or '[]') if row else []
-        excludes=json.loads(row[0][2] or '[]') if row else []
-    except Exception:
-        enabled,includes,excludes=OWNER_PAIR_FILTER_ENABLED,[],[]
-    if not enabled: return set()
-    eligible=set(DEFAULT_OWNER_PAIRS)
-    perf=_owner_pair_performance()
-    for sym,d in perf.items():
-        total=d['w']+d['l']
-        if total>=CONFIG.get('MIN_TRADES',5) and d['w']/total*100>=CONFIG.get('MIN_WR',40.0): eligible.add(sym)
-    eligible.update(normalize_crypto_symbol(x) for x in includes if is_valid_crypto_perpetual_symbol(x))
-    eligible.difference_update(normalize_crypto_symbol(x) for x in excludes if is_valid_crypto_perpetual_symbol(x))
-    return eligible
-
-
-def is_pair_owner_eligible(symbol):
-    canonical=normalize_crypto_symbol(symbol)
-    if not is_valid_crypto_perpetual_symbol(canonical): return False
-    row=db_read('SELECT enabled FROM owner_pair_filter WHERE id=1')
-    enabled=bool(row[0][0]) if row else OWNER_PAIR_FILTER_ENABLED
-    return True if not enabled else canonical in get_owner_eligible_pairs()
-
-
-def owner_pair_filter_text():
-    row=db_read('SELECT enabled FROM owner_pair_filter WHERE id=1')
-    enabled=bool(row[0][0]) if row else OWNER_PAIR_FILTER_ENABLED
-    pairs=sorted(get_owner_eligible_pairs())
-    return ('🏆 <b>OWNER PAIR PERFORMANCE FILTER</b>\n\n'
-            f"Status: {'🟢 ON' if enabled else '🔴 OFF'}\n"
-            'Sumber performa: <b>akun OWNER</b>\n'
-            f'Pair eligible: <b>{len(pairs)}</b>\n\n' + ('\n'.join(f'• {x}' for x in pairs) if pairs else '• Tidak ada pair eligible') + '\n\n⚠️ Semua VIP mengikuti hasil filter Owner.')
-
-
-def owner_pair_filter_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🟢/🔴 FILTER ON/OFF',callback_data='owner_pair_toggle')],[InlineKeyboardButton(text='🔄 REFRESH HASIL OWNER',callback_data='owner_pair_filter')],[InlineKeyboardButton(text='⬅️ KEMBALI',callback_data='menu')]])
-
 def _is_retryable_market_error(ex_id, exc):
     text = str(exc).lower()
     return (
@@ -1320,14 +1226,15 @@ def _valid_usdt_swap_symbols(ex_id, ex):
         if str(m.get('settle', '')).upper() != 'USDT':
             continue
         # Skip obvious test/expired/legacy instruments.
-        if not is_valid_crypto_perpetual_symbol(sym):
+        if any(x in sym.upper() for x in ('TEST', '1000', 'BULL', 'BEAR')):
             continue
         symbols.append(sym)
 
-    core_names={normalize_crypto_symbol(x) for x in CORE_PAIRS}
-    core=[s for s in symbols if normalize_crypto_symbol(s) in core_names]
-    rest=sorted(s for s in symbols if s not in core)
-    return core+rest
+    # Core pairs first, then deterministic order. We do not cap by the first
+    # 60 dictionary entries because that made some CEXs effectively invisible.
+    core = [s for s in CORE_PAIRS if s in symbols]
+    rest = sorted(s for s in symbols if s not in core)
+    return core + rest
 
 
 def _bingx_ohlcv(ex, symbol, timeframe, limit):
@@ -1391,6 +1298,9 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
 
         user_is_owner = (str(user_id) == 'OWNER')
         user_cfg = get_user_settings(user_id) if not user_is_owner else None
+        refresh_owner_eligible_pairs()
+        if not user_is_owner and OWNER_PAIR_FILTER.get('enabled', True):
+            scan_symbols = [sym for sym in scan_symbols if is_pair_owner_eligible(sym)]
         if not user_is_owner and not user_cfg['auto_trade']:
             runtime['last_reason'] = 'VIP Auto Trade OFF'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
@@ -1425,17 +1335,9 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             if created >= slots:
                 break
 
-            if is_manual_alert_symbol(sym) or not is_valid_crypto_perpetual_symbol(sym):
+            if is_manual_alert_symbol(sym):
+                # Crypto-only engine: ignore legacy FX/manual-alert symbols.
                 continue
-            if not is_pair_owner_eligible(sym):
-                runtime['last_reason']=f'{sym}: outside Owner pair filter'
-                continue
-            perf_key=normalize_crypto_symbol(sym)
-            if perf_key in pair_perf:
-                tot_trades=pair_perf[perf_key]['w']+pair_perf[perf_key]['l']
-                if tot_trades >= CONFIG['MIN_TRADES']:
-                    wr=(pair_perf[perf_key]['w']/tot_trades)*100
-                    if wr < CONFIG['MIN_WR']: continue
 
             try:
                 if ex_id == 'bingx':
@@ -1481,7 +1383,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
 
             lev = CONFIG['LEVERAGE'].get(ex_id, 50) if user_is_owner else user_cfg['leverage']
             margin = CONFIG['MARGIN_PER_TRADE'] if user_is_owner else user_cfg['margin']
-            dry_run = CONFIG['DRY_RUN'] if user_is_owner else False
+            dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
             qty = (margin * lev) / en
             mode = "[DRY RUN]" if dry_run else "[REAL TRADE]"
             ord_id = f"sim_{int(time.time()*1000)}"
@@ -1570,8 +1472,8 @@ def scan_markets():
     try:
         pair_perf = {}
         rows = db_read(
-            "SELECT symbol, status FROM trades "
-            "WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')"
+            "SELECT symbol, status FROM trades WHERE user_id='OWNER' "
+            "AND status IN ('CLOSED (TP)', 'CLOSED (SL)')"
         )
         for sym, stat in rows:
             pair_perf.setdefault(sym, {'w': 0, 'l': 0})
@@ -1661,9 +1563,36 @@ def is_allowed_chat(message_or_callback):
 def require_owner(obj):
     return is_owner(obj)
 
+
+def get_owner_eligible_pairs():
+    return sorted(set(OWNER_PAIR_FILTER.get('eligible_pairs') or DEFAULT_OWNER_ELIGIBLE_PAIRS))
+def is_pair_owner_eligible(symbol):
+    return (not OWNER_PAIR_FILTER.get('enabled',True)) or str(symbol).upper() in {p.upper() for p in get_owner_eligible_pairs()}
+def get_owner_dry_run(ex_id):
+    return bool(CONFIG.get('DRY_RUN_CEX',{}).get(ex_id,CONFIG.get('DRY_RUN',True)))
+def set_owner_dry_run(ex_id,value):
+    CONFIG.setdefault('DRY_RUN_CEX',{})[ex_id]=bool(value); update_db_setting(f'dry_run_{ex_id}',1.0 if value else 0.0)
+
+def owner_pair_filter_text():
+    pairs = get_owner_eligible_pairs()
+    return (
+        "📊 <b>OWNER PAIR PERFORMANCE FILTER</b>\n\n"
+        f"Status: {'🟢 ON' if OWNER_PAIR_FILTER.get('enabled', True) else '🔴 OFF'}\n"
+        f"Pair eligible: <b>{len(pairs)}</b>\n\n"
+        + "\n".join(f"• {p}" for p in pairs)
+        + "\n\n⚠️ Filter ini global. Semua VIP mengikuti daftar pair Owner."
+    )
+
+def owner_pair_filter_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 FILTER ON/OFF", callback_data="owner_pair_toggle")],
+        [InlineKeyboardButton(text="🔄 DEFAULT PAIRS", callback_data="owner_pair_default")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="owner_menu")]
+    ])
+
 def owner_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏆 PAIR FILTER OWNER", callback_data="owner_pair_filter")],
+        [InlineKeyboardButton(text="📊 PAIR PERFORMANCE", callback_data="owner_pair_filter")],
         [InlineKeyboardButton(text="👥 MANAGE VIP", callback_data="owner_vip")],
         [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"),
          InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
@@ -1686,6 +1615,7 @@ def vip_settings_keyboard():
         [InlineKeyboardButton(text="📊 MAX POSISI", callback_data="vip_set_maxpos")],
         [InlineKeyboardButton(text="📅 MAX TRADE / HARI", callback_data="vip_set_maxtrades")],
         [InlineKeyboardButton(text="🤖 AUTO TRADE", callback_data="vip_auto_trade")],
+        [InlineKeyboardButton(text="♻️ KEMBALIKAN DEFAULT", callback_data="vip_reset_settings")],
         [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
 
@@ -1717,24 +1647,36 @@ def vip_management_keyboard():
     ])
 
 PENDING_VIP_ACTION = {}
+PENDING_VIP_SETTING = {}
+
+DEFAULT_OWNER_ELIGIBLE_PAIRS = list(CORE_PAIRS)
+OWNER_PAIR_FILTER = {'enabled': True, 'eligible_pairs': list(DEFAULT_OWNER_ELIGIBLE_PAIRS), 'updated_at': None}
+def _refresh_owner_pair_state_from_db():
+    enabled,pairs=_load_owner_pair_filter_state(); OWNER_PAIR_FILTER.update(enabled=enabled,eligible_pairs=pairs,updated_at=datetime.now(WIB).isoformat(timespec='seconds'))
+def _pair_performance_snapshot():
+    out={}
+    for sym,stat in db_read("SELECT symbol,status FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)','CLOSED (SL)')"):
+        out.setdefault(sym,{'w':0,'l':0}); out[sym]['w' if 'TP' in stat else 'l']+=1
+    return out
+def refresh_owner_eligible_pairs():
+    perf=_pair_performance_snapshot(); enabled=OWNER_PAIR_FILTER.get('enabled',True); eligible=set(CORE_PAIRS)
+    if enabled:
+        for sym,data in perf.items():
+            if sym in CORE_PAIRS: continue
+            total=data['w']+data['l']
+            if total>=CONFIG['MIN_TRADES'] and (data['w']/total*100)>=CONFIG['MIN_WR']: eligible.add(sym)
+    else: eligible.update(perf.keys())
+    _save_owner_pair_filter(enabled,eligible); OWNER_PAIR_FILTER['eligible_pairs']=sorted(eligible); return eligible
 
 def main_keyboard(obj=None):
     return role_keyboard(obj) if obj is not None else owner_keyboard()
 
 
 def bot_control_keyboard():
-    dry = "🟢 DRY RUN: ON" if CONFIG['DRY_RUN'] else "🔴 DRY RUN: OFF / REAL"
-    pause = "▶️ RESUME TRADING" if IS_BOT_PAUSED else "⏸️ PAUSE TRADING"
-    loss = "🟢 DAILY LOSS: ON" if CONFIG.get('DAILY_LOSS_LIMIT', True) else "🔴 DAILY LOSS: OFF"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=dry, callback_data="dryrun_toggle")],
-        [InlineKeyboardButton(text=loss, callback_data="daily_loss_toggle")],
-        [InlineKeyboardButton(text=pause, callback_data="resume" if IS_BOT_PAUSED else "pause")],
-        [InlineKeyboardButton(text="🧹 CANCEL ALL PENDING", callback_data="cancelall")],
-        [InlineKeyboardButton(text="🚨 CLOSE ALL OPEN", callback_data="closeallopen")],
-        [InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
-        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
-    ])
+    pause="▶️ RESUME TRADING" if IS_BOT_PAUSED else "⏸️ PAUSE TRADING"; loss="🟢 DAILY LOSS: ON" if CONFIG.get('DAILY_LOSS_LIMIT',True) else "🔴 DAILY LOSS: OFF"
+    rows=[[InlineKeyboardButton(text=f"{x.upper()}: {'🧪 DRY RUN' if get_owner_dry_run(x) else '⚠️ REAL'}",callback_data=f"dryrun_cex:{x}")] for x in DEFAULT_CEX]
+    rows += [[InlineKeyboardButton(text=loss,callback_data="daily_loss_toggle")],[InlineKeyboardButton(text=pause,callback_data="resume" if IS_BOT_PAUSED else "pause")],[InlineKeyboardButton(text="🧹 CANCEL ALL PENDING",callback_data="cancelall")],[InlineKeyboardButton(text="🚨 CLOSE ALL OPEN",callback_data="closeallopen")],[InlineKeyboardButton(text="🛰️ RUNTIME STATUS",callback_data="runtime_status")],[InlineKeyboardButton(text="⬅️ KEMBALI",callback_data="menu")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def settings_keyboard():
@@ -1840,7 +1782,7 @@ def db_read(query, params=()):
 def build_settings_text(user_id='OWNER'):
     user_id = _account_user_id(user_id)
     cex_db = db_read("SELECT ex_id, api_key, enabled, account_label, account_info FROM user_cex_settings WHERE user_id=?", (str(user_id),))
-    mode_text = "🟢 DRY RUN" if CONFIG['DRY_RUN'] else "⚠️ REAL MONEY"
+    mode_text = ' | '.join(f"{x.upper()}: {'DRY' if get_owner_dry_run(x) else 'REAL'}" for x in DEFAULT_CEX)
     lines = []
     for ex_id, api, en, account_label, account_info in cex_db:
         loaded = _exchange_key(str(user_id), ex_id) in exchanges
@@ -1961,16 +1903,36 @@ def build_stats_text(user_id='OWNER'):
 
 
 def build_pairperf_text():
-    pair_perf=_owner_pair_performance(); active=[]; wait=[]; black=[]
-    core_names={normalize_crypto_symbol(x) for x in CORE_PAIRS}
-    for sym,data in sorted(pair_perf.items()):
-        total=data['w']+data['l']; wr=data['w']/total*100 if total else 0
-        line=f"• {sym}{' [CORE]' if sym in core_names else ''}: {data['w']}W/{data['l']}L (WR: {wr:.1f}%)"
-        if total<CONFIG['MIN_TRADES']: wait.append(line)
-        elif sym in core_names or wr>=CONFIG['MIN_WR']: active.append(line)
-        else: black.append(line)
-    eligible=sorted(get_owner_eligible_pairs())
-    return ('🏆 <b>PERFORMA KOIN — OWNER</b>\n\n🔥 <b>AKTIF</b>\n'+('\n'.join(active) or 'Belum ada')+'\n\n⏳ <b>EVALUASI</b>\n'+('\n'.join(wait) or 'Belum ada')+'\n\n🗑️ <b>BLACKLIST</b>\n'+('\n'.join(black) or 'Belum ada')+'\n\n🎯 <b>GLOBAL ELIGIBLE</b>\n'+('\n'.join(f'• {x}' for x in eligible) or 'Belum ada'))
+    rows = db_read(
+        "SELECT symbol, status FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')"
+    )
+    pair_perf = {}
+    for sym, stat in rows:
+        pair_perf.setdefault(sym, {'w': 0, 'l': 0})
+        if 'TP' in stat:
+            pair_perf[sym]['w'] += 1
+        else:
+            pair_perf[sym]['l'] += 1
+
+    active, wait, black = [], [], []
+    for sym, data in pair_perf.items():
+        total = data['w'] + data['l']
+        wr = data['w'] / total * 100 if total else 0
+        core = sym in CORE_PAIRS
+        line = f"• {sym}{' [CORE]' if core else ''}: {data['w']}W/{data['l']}L (WR: {wr:.1f}%)"
+        if total < CONFIG['MIN_TRADES']:
+            wait.append(line)
+        elif core or wr >= CONFIG['MIN_WR']:
+            active.append(line)
+        else:
+            black.append(line)
+
+    return (
+        "🏆 <b>PERFORMA KOIN</b>\n\n"
+        "🔥 <b>AKTIF</b>\n" + ("\n".join(active) or "Belum ada") + "\n\n"
+        "⏳ <b>EVALUASI</b>\n" + ("\n".join(wait) or "Belum ada") + "\n\n"
+        "🗑️ <b>BLACKLIST</b>\n" + ("\n".join(black) or "Belum ada")
+    )
 
 
 def build_cex_status_text(user_id='OWNER'):
@@ -1982,7 +1944,7 @@ def build_cex_status_text(user_id='OWNER'):
     for ex_id, api, enabled, account_label, account_info in rows:
         if not enabled:
             state = "🔴 OFF"
-        elif _exchange_key(str(user_id), ex_id) in exchanges:
+        elif ex_id in exchanges:
             state = "🟢 LOADED"
         else:
             state = "🟡 CONFIGURED / NOT LOADED"
@@ -2474,10 +2436,6 @@ async def cmd_menu(message: Message):
 @dp.message(Command("start"))
 @dp.message(Command("help"))
 async def cmd_start(message: Message):
-    # Resolve the role directly on every /start and /help call.
-    # This prevents a stale Owner keyboard from being shown to a VIP user.
-    if not is_allowed_chat(message):
-        return
     await send_main_menu(message, delete_trigger=False)
 
 
@@ -2719,7 +2677,6 @@ async def cb_api_setup(callback: CallbackQuery):
     PENDING_API_SETUP[str(callback.message.chat.id)] = {
         'stage': 'api_key',
         'ex_id': ex_id,
-        'user_id': str(_account_user_id(callback.message.chat.id)),
         'prompt_message_id': None,
         'ack_message_id': None
     }
@@ -2809,30 +2766,6 @@ async def cb_cex_toggle(callback: CallbackQuery):
 
 
 
-@dp.callback_query(F.data == 'owner_pair_filter')
-async def cb_owner_pair_filter(callback: CallbackQuery):
-    if not require_owner(callback):
-        await safe_answer(callback,'Akses Owner saja.',True); return
-    await safe_answer(callback)
-    await callback.message.edit_text(owner_pair_filter_text(),reply_markup=owner_pair_filter_keyboard())
-
-
-@dp.callback_query(F.data == 'owner_pair_toggle')
-async def cb_owner_pair_toggle(callback: CallbackQuery):
-    global OWNER_PAIR_FILTER_ENABLED
-    if not require_owner(callback):
-        await safe_answer(callback,'Akses Owner saja.',True); return
-    row=db_read('SELECT enabled FROM owner_pair_filter WHERE id=1')
-    new_value=not bool(row[0][0]) if row else not OWNER_PAIR_FILTER_ENABLED
-    OWNER_PAIR_FILTER_ENABLED=new_value
-    conn=sqlite3.connect(DB_FILE,timeout=10)
-    try:
-        conn.execute('UPDATE owner_pair_filter SET enabled=?,updated_at=? WHERE id=1',(1 if new_value else 0,datetime.now(WIB).isoformat(timespec='seconds'))); conn.commit()
-    finally: conn.close()
-    await safe_answer(callback,'Pair filter ON' if new_value else 'Pair filter OFF')
-    await callback.message.edit_text(owner_pair_filter_text(),reply_markup=owner_pair_filter_keyboard())
-
-
 @dp.callback_query(F.data == "owner_vip")
 async def cb_owner_vip(callback: CallbackQuery):
     if not require_owner(callback):
@@ -2915,7 +2848,14 @@ async def cb_vip_set_margin(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text(
         "💵 <b>MARGIN / TRADE VIP</b>",
-        reply_markup=preset_keyboard("", [(1,'$1'),(2,'$2'),(5,'$5'),(10,'$10')], 'vip_margin', 'vip_settings')
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="$1", callback_data="vip_margin:1"),
+             InlineKeyboardButton(text="⭐ $2 DEFAULT", callback_data="vip_margin:2")],
+            [InlineKeyboardButton(text="$5", callback_data="vip_margin:5"),
+             InlineKeyboardButton(text="$10", callback_data="vip_margin:10")],
+            [InlineKeyboardButton(text="✏️ CUSTOM", callback_data="vip_custom_setting:margin")],
+            [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="vip_settings")]
+        ])
     )
 
 @dp.callback_query(F.data.startswith("vip_margin:"))
@@ -2934,7 +2874,14 @@ async def cb_vip_set_lev(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text(
         "⚡ <b>LEVERAGE VIP</b>",
-        reply_markup=preset_keyboard("", [(10,'10x'),(20,'20x'),(25,'25x'),(50,'50x')], 'vip_lev', 'vip_settings')
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="10x", callback_data="vip_lev:10"),
+             InlineKeyboardButton(text="⭐ 20x DEFAULT", callback_data="vip_lev:20")],
+            [InlineKeyboardButton(text="25x", callback_data="vip_lev:25"),
+             InlineKeyboardButton(text="50x", callback_data="vip_lev:50")],
+            [InlineKeyboardButton(text="✏️ CUSTOM", callback_data="vip_custom_setting:leverage")],
+            [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="vip_settings")]
+        ])
     )
 
 @dp.callback_query(F.data.startswith("vip_lev:"))
@@ -2953,7 +2900,14 @@ async def cb_vip_set_maxpos(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text(
         "📊 <b>MAX POSISI VIP</b>",
-        reply_markup=preset_keyboard("", [(1,'1'),(2,'2'),(3,'3'),(5,'5')], 'vip_maxpos', 'vip_settings')
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="1", callback_data="vip_maxpos:1"),
+             InlineKeyboardButton(text="2", callback_data="vip_maxpos:2")],
+            [InlineKeyboardButton(text="⭐ 3 DEFAULT", callback_data="vip_maxpos:3"),
+             InlineKeyboardButton(text="5", callback_data="vip_maxpos:5")],
+            [InlineKeyboardButton(text="✏️ CUSTOM", callback_data="vip_custom_setting:max_pos")],
+            [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="vip_settings")]
+        ])
     )
 
 @dp.callback_query(F.data.startswith("vip_maxpos:"))
@@ -2972,7 +2926,14 @@ async def cb_vip_set_maxtrades(callback: CallbackQuery):
     await safe_answer(callback)
     await callback.message.edit_text(
         "📅 <b>MAX TRADE / HARI VIP</b>",
-        reply_markup=preset_keyboard("", [(3,'3'),(5,'5'),(10,'10'),(20,'20')], 'vip_maxtrades', 'vip_settings')
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="3", callback_data="vip_maxtrades:3"),
+             InlineKeyboardButton(text="5", callback_data="vip_maxtrades:5")],
+            [InlineKeyboardButton(text="⭐ 10 DEFAULT", callback_data="vip_maxtrades:10"),
+             InlineKeyboardButton(text="20", callback_data="vip_maxtrades:20")],
+            [InlineKeyboardButton(text="✏️ CUSTOM", callback_data="vip_custom_setting:max_trades_day")],
+            [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="vip_settings")]
+        ])
     )
 
 @dp.callback_query(F.data.startswith("vip_maxtrades:"))
@@ -2983,6 +2944,127 @@ async def cb_vip_maxtrades(callback: CallbackQuery):
     set_user_setting(_chat_id(callback), 'max_trades_day', value)
     await safe_answer(callback, f"Max trade/hari {value}")
     await callback.message.edit_text(vip_recommended_settings_text(_chat_id(callback)), reply_markup=vip_settings_keyboard())
+
+
+@dp.callback_query(F.data == "owner_pair_filter")
+async def cb_owner_pair_filter(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        owner_pair_filter_text(),
+        reply_markup=owner_pair_filter_keyboard()
+    )
+
+@dp.callback_query(F.data == "owner_pair_toggle")
+async def cb_owner_pair_toggle(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    OWNER_PAIR_FILTER["enabled"] = not OWNER_PAIR_FILTER.get("enabled", True)
+    _save_owner_pair_filter(OWNER_PAIR_FILTER["enabled"], get_owner_eligible_pairs())
+    await safe_answer(callback, "Filter diperbarui.")
+    await callback.message.edit_text(
+        owner_pair_filter_text(),
+        reply_markup=owner_pair_filter_keyboard()
+    )
+
+@dp.callback_query(F.data == "owner_pair_default")
+async def cb_owner_pair_default(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    OWNER_PAIR_FILTER["eligible_pairs"] = list(DEFAULT_OWNER_ELIGIBLE_PAIRS)
+    OWNER_PAIR_FILTER["updated_at"] = datetime.now(WIB).isoformat(timespec="seconds")
+    await safe_answer(callback, "Default pair dipulihkan.")
+    await callback.message.edit_text(
+        owner_pair_filter_text(),
+        reply_markup=owner_pair_filter_keyboard()
+    )
+
+@dp.callback_query(F.data == "owner_pair_set")
+async def cb_owner_pair_set(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    PENDING_VIP_ACTION[str(callback.message.chat.id)] = {"action": "owner_pair_set"}
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "✏️ <b>SET PAIR OWNER</b>\n\n"
+        "Kirim pair crypto, contoh:\n"
+        "<code>BTC/USDT</code>\n\n"
+        "Untuk beberapa pair, pisahkan dengan koma."
+    )
+
+@dp.callback_query(F.data == "owner_pair_remove")
+async def cb_owner_pair_remove(callback: CallbackQuery):
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    PENDING_VIP_ACTION[str(callback.message.chat.id)] = {"action": "owner_pair_remove"}
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        "➖ <b>REMOVE PAIR OWNER</b>\n\n"
+        "Kirim pair yang ingin dikeluarkan.\n"
+        "Contoh: <code>DOGE/USDT</code>"
+    )
+
+@dp.callback_query(F.data.startswith("vip_custom_setting:"))
+async def cb_vip_custom_setting(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True)
+        return
+
+    field = callback.data.split(":", 1)[1]
+    labels = {
+        'margin': ('💵 MARGIN', 'USD', '2.5'),
+        'leverage': ('⚡ LEVERAGE', 'x', '20'),
+        'max_pos': ('📊 MAX POSISI', 'posisi', '4'),
+        'max_trades_day': ('📅 MAX TRADE / HARI', 'trade', '15'),
+    }
+    if field not in labels:
+        await safe_answer(callback, "Setting tidak valid.", True)
+        return
+
+    title, unit, example = labels[field]
+    PENDING_VIP_SETTING[str(callback.message.chat.id)] = field
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        f"✏️ <b>CUSTOM {title}</b>\n\n"
+        f"Kirim nilai yang kamu inginkan ({unit}).\n"
+        f"Contoh: <code>{example}</code>\n\n"
+        "⚠️ Nilai ini hanya berlaku untuk akun VIP kamu."
+    )
+
+
+@dp.callback_query(F.data == "vip_reset_settings")
+async def cb_vip_reset_settings(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True)
+        return
+
+    uid = _chat_id(callback)
+    ensure_user_settings(uid)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    try:
+        conn.execute(
+            """UPDATE user_settings
+               SET margin=2.0, max_pos=3, max_trades_day=10, leverage=20, auto_trade=1
+               WHERE user_id=?""",
+            (uid,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    PENDING_VIP_SETTING.pop(str(uid), None)
+    await safe_answer(callback, "Default dikembalikan.")
+    await callback.message.edit_text(
+        vip_recommended_settings_text(uid),
+        reply_markup=vip_settings_keyboard()
+    )
+
 
 @dp.callback_query(F.data == "vip_settings")
 async def cb_vip_settings(callback: CallbackQuery):
@@ -3080,6 +3162,79 @@ async def handle_text(message: Message):
         return
 
     chat_id = str(message.chat.id)
+
+    vip_action = PENDING_VIP_ACTION.get(chat_id)
+
+    if is_owner(message) and vip_action and vip_action.get("action") in ("owner_pair_set", "owner_pair_remove"):
+        raw = (message.text or "").strip().upper()
+        pairs = [x.strip().replace("-", "/") for x in raw.split(",") if x.strip()]
+        valid = [x for x in pairs if "/" in x and x.endswith("/USDT") and len(x) >= 7]
+
+        if not valid:
+            await message.answer("❌ Format pair tidak valid. Gunakan contoh <code>BTC/USDT</code>.")
+            return
+
+        current = set(get_owner_eligible_pairs())
+        if vip_action["action"] == "owner_pair_set":
+            current.update(valid)
+            action_text = "ditambahkan"
+        else:
+            current.difference_update(valid)
+            action_text = "dihapus"
+
+        OWNER_PAIR_FILTER["eligible_pairs"] = sorted(current)
+        OWNER_PAIR_FILTER["updated_at"] = datetime.now(WIB).isoformat(timespec="seconds")
+        PENDING_VIP_ACTION.pop(chat_id, None)
+
+        await message.answer(
+            f"✅ Pair berhasil {action_text}.\n\n" + owner_pair_filter_text(),
+            reply_markup=owner_pair_filter_keyboard()
+        )
+        return
+
+    custom_field = PENDING_VIP_SETTING.get(chat_id)
+    if custom_field and is_vip(message):
+        text = (message.text or '').strip().replace(',', '.')
+        try:
+            if custom_field == 'margin':
+                value = float(text)
+                if not (0.1 <= value <= 1000):
+                    raise ValueError("Margin harus antara $0.10 sampai $1000.")
+            elif custom_field == 'leverage':
+                if not text.isdigit():
+                    raise ValueError("Leverage harus 1-125x.")
+                value = int(text)
+                if not (1 <= value <= 125):
+                    raise ValueError("Leverage harus 1x sampai 125x.")
+            elif custom_field == 'max_pos':
+                if not text.isdigit():
+                    raise ValueError("Max posisi harus berupa angka.")
+                value = int(text)
+                if not (1 <= value <= 20):
+                    raise ValueError("Max posisi harus 1-20.")
+            elif custom_field == 'max_trades_day':
+                if not text.isdigit():
+                    raise ValueError("Max trade/hari harus berupa angka.")
+                value = int(text)
+                if not (1 <= value <= 100):
+                    raise ValueError("Max trade/hari harus 1-100.")
+            else:
+                raise ValueError("Setting VIP tidak valid.")
+
+            set_user_setting(chat_id, custom_field, value)
+            PENDING_VIP_SETTING.pop(chat_id, None)
+            await message.answer(
+                "✅ <b>SETTING VIP DIPERBARUI</b>\n\n"
+                + vip_recommended_settings_text(chat_id),
+                reply_markup=vip_settings_keyboard()
+            )
+        except Exception as e:
+            await message.answer(
+                f"❌ {html.escape(str(e))}\n\n"
+                "Kirim nilai yang valid atau tekan tombol kembali."
+            )
+        return
+
     vip_action = PENDING_VIP_ACTION.get(chat_id)
 
     if vip_action and is_owner(message):
@@ -3213,10 +3368,7 @@ async def handle_text(message: Message):
         return
 
     chat_id = message.chat.id
-    # PENDING_API_SETUP uses string chat IDs everywhere (callbacks also use str()).
-    # Keep the same key type here so VIP/Owner API setup sessions are found.
-    chat_key = str(chat_id)
-    state = PENDING_API_SETUP.get(chat_key)
+    state = PENDING_API_SETUP.get(chat_id)
     if not state:
         return
 
@@ -3225,11 +3377,6 @@ async def handle_text(message: Message):
         return
 
     ex_id = state['ex_id']
-
-    # Never allow a pending API session to be consumed by another account.
-    if str(state.get('user_id', _account_user_id(chat_id))) != str(_account_user_id(chat_id)):
-        PENDING_API_SETUP.pop(chat_key, None)
-        return
 
     # Delete the user's credential message immediately.
     try:
@@ -3276,7 +3423,7 @@ async def handle_text(message: Message):
     api = state.get('api', '')
     secret = state.get('secret', '')
     password = text if ex_id == 'bitget' else ''
-    PENDING_API_SETUP.pop(chat_key, None)
+    PENDING_API_SETUP.pop(chat_id, None)
 
     for mid in (state.get('ack_message_id'), state.get('prompt_message_id')):
         if mid:
@@ -3466,11 +3613,7 @@ async def cb_runtime_status(callback: CallbackQuery):
     if not is_allowed_chat(callback):
         return
     await safe_answer(callback)
-    user_id = _account_user_id(callback.message.chat.id)
-    await callback.message.edit_text(
-        build_runtime_status_text(user_id),
-        reply_markup=runtime_status_keyboard(callback)
-    )
+    await callback.message.edit_text(build_runtime_status_text(_account_user_id(callback.message.chat.id)), reply_markup=runtime_status_keyboard(callback))
 
 
 @dp.callback_query(F.data == "bot_control")
@@ -3488,21 +3631,22 @@ async def cb_bot_control(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data.startswith("dryrun_cex:"))
+async def cb_dryrun_cex(callback: CallbackQuery):
+    if not require_owner(callback): await safe_answer(callback,"Akses Owner saja.",True); return
+    ex_id=callback.data.split(':',1)[1]
+    if ex_id not in DEFAULT_CEX: await safe_answer(callback,"CEX tidak valid.",True); return
+    value=not get_owner_dry_run(ex_id); set_owner_dry_run(ex_id,value)
+    await safe_answer(callback,f"{ex_id.upper()}: {'DRY RUN' if value else 'REAL'}")
+    await callback.message.edit_text("🎛️ <b>BOT CONTROL</b>\n\n"+"\n".join(f"• {x.upper()}: {'🧪 DRY RUN' if get_owner_dry_run(x) else '⚠️ REAL MONEY'}" for x in DEFAULT_CEX),reply_markup=bot_control_keyboard())
+
 @dp.callback_query(F.data == "dryrun_toggle")
 async def cb_dryrun_toggle(callback: CallbackQuery):
-    if not require_owner(callback):
-        await safe_answer(callback, "Akses Owner saja.", True)
-        return
-    value = not CONFIG['DRY_RUN']
-    CONFIG['DRY_RUN'] = value
-    update_db_setting('dry_run', 1.0 if value else 0.0)
-    await safe_answer(callback, "DRY RUN ON" if value else "REAL MONEY ON")
-    await callback.message.edit_text(
-        f"{'🧪 <b>DRY RUN AKTIF</b>' if value else '⚠️ <b>REAL MONEY AKTIF</b>'}\n\n"
-        "Mode berhasil diubah.",
-        reply_markup=bot_control_keyboard()
-    )
-    send_telegram("🧪 <b>MODE BERUBAH</b> — " + ("DRY RUN aktif. Tidak ada order real." if value else "⚠️ REAL MONEY aktif. Order real diizinkan."))
+    if not require_owner(callback): await safe_answer(callback,"Akses Owner saja.",True); return
+    value=not CONFIG['DRY_RUN']; CONFIG['DRY_RUN']=value
+    for ex_id in DEFAULT_CEX: set_owner_dry_run(ex_id,value)
+    update_db_setting('dry_run',1.0 if value else 0.0); await safe_answer(callback,"Semua CEX: DRY RUN" if value else "Semua CEX: REAL")
+    await callback.message.edit_text("🎛️ <b>BOT CONTROL</b>\n\n"+"\n".join(f"• {x.upper()}: {'🧪 DRY RUN' if get_owner_dry_run(x) else '⚠️ REAL MONEY'}" for x in DEFAULT_CEX),reply_markup=bot_control_keyboard())
 
 
 @dp.callback_query(F.data == "daily_loss_toggle")
@@ -3559,14 +3703,10 @@ async def cb_cancelall(callback: CallbackQuery):
         else "Semua pending order diproses."
     )
 
-    try:
-        await callback.message.edit_text(
-            build_positions_text(str(callback.message.chat.id)),
-            reply_markup=positions_keyboard(str(callback.message.chat.id))
-        )
-    except TelegramBadRequest as e:
-        if "message is not modified" not in str(e).lower():
-            raise
+    await callback.message.edit_text(
+        build_positions_text(str(callback.message.chat.id)),
+        reply_markup=positions_keyboard(str(callback.message.chat.id))
+    )
 
 
 @dp.callback_query(F.data.startswith("closepos:"))
@@ -3788,7 +3928,7 @@ def api_cex_monitor():
     try:
         rows = db_read(
             "SELECT ex_id, api_key, enabled, account_label, account_info "
-            "FROM user_cex_settings WHERE user_id='OWNER' ORDER BY ex_id"
+            "FROM cex_settings ORDER BY ex_id"
         )
 
         items = []
@@ -3801,7 +3941,7 @@ def api_cex_monitor():
                     info = {}
 
             configured = bool(api_key)
-            loaded = _exchange_key('OWNER', ex_id) in exchanges
+            loaded = ex_id in exchanges
             enabled = bool(enabled)
 
             if not enabled:
@@ -4076,8 +4216,8 @@ async def app_main():
     MAIN_ASYNC_LOOP = asyncio.get_running_loop()
     # Initialize shared state before any worker starts.
     init_db()
-    load_owner_pair_filter_state()
     load_settings()
+    _refresh_owner_pair_state_from_db()
     reload_exchanges()
 
     # Trading engine runs in a worker thread.
