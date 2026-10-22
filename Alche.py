@@ -190,7 +190,7 @@ def init_db():
             c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
             c.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id TEXT PRIMARY KEY, margin REAL NOT NULL DEFAULT 2.0, max_pos INTEGER NOT NULL DEFAULT 3, max_trades_day INTEGER NOT NULL DEFAULT 10, leverage INTEGER NOT NULL DEFAULT 20, auto_trade INTEGER NOT NULL DEFAULT 1)")
             c.execute("CREATE TABLE IF NOT EXISTS user_cex_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, api_key TEXT DEFAULT '', secret TEXT DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, password TEXT DEFAULT '', account_label TEXT DEFAULT '', account_info TEXT DEFAULT '', PRIMARY KEY (user_id, ex_id))")
-            c.execute("CREATE TABLE IF NOT EXISTS cex_risk_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, margin REAL NOT NULL DEFAULT 2.0, leverage INTEGER NOT NULL DEFAULT 20, max_pos INTEGER NOT NULL DEFAULT 2, max_trades_day INTEGER NOT NULL DEFAULT 10, max_loss INTEGER NOT NULL DEFAULT 5, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, ex_id))")
+            c.execute("CREATE TABLE IF NOT EXISTS cex_risk_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, margin REAL NOT NULL DEFAULT 2.0, leverage INTEGER NOT NULL DEFAULT 20, max_pos INTEGER NOT NULL DEFAULT 2, max_trades_day INTEGER NOT NULL DEFAULT 10, max_loss REAL NOT NULL DEFAULT 5.0, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, ex_id))")
             c.execute("CREATE TABLE IF NOT EXISTS vip_members (telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', status TEXT DEFAULT 'ACTIVE', expires_at TEXT, added_at TEXT DEFAULT CURRENT_TIMESTAMP)")
             c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'OWNER', exchange_id TEXT NOT NULL, symbol TEXT NOT NULL, order_type TEXT DEFAULT 'LIMIT', side TEXT NOT NULL, entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL, order_id TEXT DEFAULT '', bars_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
             c.execute("CREATE TABLE IF NOT EXISTS owner_pair_eligible (symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
@@ -202,7 +202,7 @@ def init_db():
             for k,v in {'margin':'2.0','max_pos':'3','dry_run':'1','min_trades':'20','min_wr':'50','daily_loss_limit':'1'}.items(): c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(k,v))
             for ex_id in DEFAULT_CEX:
                 c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'lev_{ex_id}','20'))
-                c.execute("INSERT OR IGNORE INTO cex_risk_settings(user_id,ex_id,margin,leverage,max_pos,max_trades_day,max_loss) VALUES (?,?,?,?,?,?,?)", ('OWNER',ex_id,2.0,20,2,10,5))
+                c.execute("INSERT OR IGNORE INTO cex_risk_settings(user_id,ex_id,margin,leverage,max_pos,max_trades_day,max_loss) VALUES (?,?,?,?,?,?,?)", ('OWNER',ex_id,2.0,20,2,10,5.0))
                 c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'dry_run_{ex_id}','1'))
             c.execute('INSERT OR IGNORE INTO owner_pair_filter(id,enabled) VALUES (1,1)')
             for pair in CORE_PAIRS: c.execute('INSERT OR IGNORE INTO owner_pair_eligible(symbol,enabled,updated_at) VALUES (?,?,?)',(pair,1,datetime.now(WIB).isoformat(timespec='seconds')))
@@ -303,7 +303,7 @@ def set_user_setting(user_id, field, value):
     finally:
         conn.close()
 
-DEFAULT_CEX_RISK = {'margin': 2.0, 'leverage': 20, 'max_pos': 2, 'max_trades_day': 10, 'max_loss': 5}
+DEFAULT_CEX_RISK = {'margin': 2.0, 'leverage': 20, 'max_pos': 2, 'max_trades_day': 10, 'max_loss': 5.0}
 CUSTOMIZE_WARNING_TEXT = (
     "⚠️ <b>PERINGATAN CUSTOMIZE TRADING</b>\n\n"
     "⚡ <b>Leverage</b> — ✅ Daya beli lebih besar. ❌ Pergerakan harga berdampak lebih besar pada margin/likuidasi.\n"
@@ -312,8 +312,8 @@ CUSTOMIZE_WARNING_TEXT = (
     "📌 Perhatikan total exposure akun.\n\n"
     "📅 <b>Max Entry/Trade</b> — ✅ Lebih banyak setup dapat diambil. ❌ Frekuensi trade, fee, dan losing streak bisa meningkat.\n"
     "📌 Limit tinggi dapat memperbesar akumulasi loss.\n\n"
-    "🛑 <b>Max Loss</b> — ✅ Membatasi jumlah trade loss sebelum CEX berhenti membuka trade baru. ❌ Terlalu rendah dapat menghentikan trading lebih cepat.\n"
-    "📌 Max Loss dihitung sebagai <b>jumlah trade loss</b>, bukan persen saldo.\n\n"
+    "🛑 <b>Daily Realized Loss</b> — batas total kerugian realized harian sebelum CEX berhenti membuka trade baru. ❌ Terlalu rendah dapat menghentikan trading lebih cepat.\n"
+    "📌 Dihitung dari <b>total realized loss</b> trade CLOSED, bukan floating loss dan bukan jumlah SL.\n\n"
     "💡 Setting hanya berlaku pada CEX yang dipilih. Pastikan modal, exposure, dan batas risiko sesuai toleransi Anda."
 )
 
@@ -331,7 +331,7 @@ def get_cex_risk_settings(user_id, ex_id):
     rows=db_read("SELECT margin,leverage,max_pos,max_trades_day,max_loss FROM cex_risk_settings WHERE user_id=? AND ex_id=?",(str(user_id),str(ex_id).lower()))
     if not rows: return dict(DEFAULT_CEX_RISK)
     r=rows[0]
-    return {'margin':float(r[0]),'leverage':int(r[1]),'max_pos':int(r[2]),'max_trades_day':int(r[3]),'max_loss':int(r[4])}
+    return {'margin':float(r[0]),'leverage':int(r[1]),'max_pos':int(r[2]),'max_trades_day':int(r[3]),'max_loss':float(r[4])}
 
 def _count_today_trades(user_id, ex_id=None):
     """Count trades created today in WIB."""
@@ -381,13 +381,13 @@ def cex_risk_text(user_id, ex_id):
             f"💵 Margin: <b>${c['margin']:.2f}</b>\n⚡ Leverage: <b>{c['leverage']}x</b>\n"
             f"🌐 Mode: <b>CROSS</b> (auto-adjust per pair)\n"
             f"📊 Max Posisi: <b>{c['max_pos']}</b>\n📅 Max Entry/Trade: <b>{c['max_trades_day']}</b>\n"
-            f"🛑 Max Loss: <b>{c['max_loss']}</b>\n\n⚠️ Max Loss = jumlah trade loss per hari untuk CEX/akun ini.")
+            f"🛑 Daily Realized Loss: <b>${c['max_loss']:.2f}</b>\n\n⚠️ CEX berhenti membuka trade baru jika total realized loss hari ini mencapai batas ini.")
 
 def cex_risk_cex_keyboard(user_id):
     rows=[]
     for ex in DEFAULT_CEX:
         c=get_cex_risk_settings(user_id,ex)
-        rows.append([InlineKeyboardButton(text=f"{ex.upper()} • {c['leverage']}x / {c['max_pos']}P / {c['max_trades_day']}E / {c['max_loss']}L / CROSS",callback_data=f"risk_cex:{ex}")])
+        rows.append([InlineKeyboardButton(text=f"{ex.upper()} • {c['leverage']}x / {c['max_pos']}P / {c['max_trades_day']}E / ${c['max_loss']:.0f} RL / CROSS",callback_data=f"risk_cex:{ex}")])
     rows.append([InlineKeyboardButton(text="⬅️ KEMBALI",callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -397,7 +397,7 @@ def cex_risk_field_keyboard(ex_id):
         [InlineKeyboardButton(text="⚡ LEVERAGE",callback_data=f"risk_field:{ex_id}:leverage")],
         [InlineKeyboardButton(text="📊 MAX POSISI",callback_data=f"risk_field:{ex_id}:max_pos")],
         [InlineKeyboardButton(text="📅 MAX ENTRY/TRADE",callback_data=f"risk_field:{ex_id}:max_trades_day")],
-        [InlineKeyboardButton(text="🛑 MAX LOSS",callback_data=f"risk_field:{ex_id}:max_loss")],
+        [InlineKeyboardButton(text="🛑 DAILY REALIZED LOSS",callback_data=f"risk_field:{ex_id}:max_loss")],
         [InlineKeyboardButton(text="🔄 DEFAULT",callback_data=f"risk_default:{ex_id}")],
         [InlineKeyboardButton(text="⬅️ KEMBALI",callback_data="risk_settings")]])
 
@@ -1636,9 +1636,9 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         elif today_trades_cex >= max_trades_cex:
             can_open_trade = False
             reason_cant_trade = f"Max trade CEX/hari ({today_trades_cex}/{max_trades_cex})"
-        elif today_losses >= int(risk_cfg['max_loss']):
+        elif CONFIG.get('DAILY_LOSS_LIMIT', True) and today_realized_loss >= float(risk_cfg['max_loss']):
             can_open_trade = False
-            reason_cant_trade = f"Max loss ({today_losses}/{risk_cfg['max_loss']})"
+            reason_cant_trade = f"Daily realized loss (${today_realized_loss:.2f}/${float(risk_cfg['max_loss']):.2f})"
         elif not user_is_owner:
             user_max_trades = int(get_user_settings(user_id)['max_trades_day'])
             if today_trades_user >= user_max_trades:
@@ -1998,7 +1998,7 @@ def owner_keyboard():
         [InlineKeyboardButton(text="📊 VIP FILTER", callback_data="owner_pair_filter")], # FIX: Nama diganti agar tidak bingung
         [InlineKeyboardButton(text="👥 MANAGE VIP", callback_data="owner_vip")],
         [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"), InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
-        [InlineKeyboardButton(text="⚙️ SETTINGS", callback_data="settings"), InlineKeyboardButton(text="🏆 PAIR PERFORMANCE", callback_data="pairperf")],
+        [InlineKeyboardButton(text="🏆 PAIR PERFORMANCE", callback_data="pairperf")],
         [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status"), InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
         [InlineKeyboardButton(text="💾 BACKUP / RESTORE", callback_data="backup_menu")],
         [InlineKeyboardButton(text="⚙️ CUSTOM TRADING PER CEX", callback_data="risk_settings")],
@@ -2211,7 +2211,7 @@ def leverage_keyboard():
     for ex_id in DEFAULT_CEX:
         rows.append([InlineKeyboardButton(text=f"⚡ {ex_id.upper()} — {CONFIG['LEVERAGE'].get(ex_id, 50)}x", callback_data=f"lev_ex:{ex_id}")])
     rows.append([InlineKeyboardButton(text="⚡ SEMUA CEX", callback_data="lev_all")])
-    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="settings")])
+    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="risk_settings")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def leverage_value_keyboard(target):
@@ -2331,20 +2331,24 @@ def build_pairperf_text():
             if 'TP' in stat: pair_perf[pair]['w'] += 1
             else: pair_perf[pair]['l'] += 1
         active, wait, black = [], [], []
-        for sym, data in pair_perf.items():
-            total = data['w'] + data['l']
-            wr = data['w'] / total * 100 if total else 0
+        for sym, data in sorted(pair_perf.items()):
+            total = data['w'] + data['l']; wr = data['w'] / total * 100 if total else 0
             core = sym in CORE_PAIRS
             line = f"• {sym}{' [CORE]' if core else ''}: {data['w']}W/{data['l']}L (WR: {wr:.1f}%)"
             if total < CONFIG['MIN_TRADES']: wait.append(line)
             elif core or wr >= CONFIG['MIN_WR']: active.append(line)
             else: black.append(line)
-        return (
-            "🏆 <b>PERFORMA KOIN</b>\n\n"
-            "🔥 <b>AKTIF</b>\n" + ("\n".join(active) or "Belum ada") + "\n\n"
-            "⏳ <b>EVALUASI</b>\n" + ("\n".join(wait) or "Belum ada") + "\n\n"
-            "🗑️ <b>BLACKLIST</b>\n" + ("\n".join(black) or "Belum ada")
-        )
+        text = "\n".join([
+            "🏆 <b>PERFORMA KOIN</b>", "", "🔥 <b>AKTIF</b>", "\n".join(active) or "Belum ada",
+            "", "⏳ <b>EVALUASI</b>", "\n".join(wait) or "Belum ada",
+            "", "🗑️ <b>BLACKLIST</b>", "\n".join(black) or "Belum ada"
+        ])
+        LIMIT=3800
+        if len(text)>LIMIT:
+            cut=text[:LIMIT].rfind("\n")
+            text=text[:cut if cut>0 else LIMIT]
+            text += "\n\n⚠️ <i>Daftar dipotong karena batas Telegram. Statistik pair tetap tersimpan.</i>"
+        return text
     except Exception as e:
         return f"Error: {html.escape(str(e))}"
 
@@ -3049,7 +3053,7 @@ async def cb_risk_settings(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     uid=_account_user_id(callback.message.chat.id)
     await safe_answer(callback)
-    await callback.message.edit_text("⚙️ <b>CUSTOM TRADING PER CEX</b>\n\nPilih CEX. Setting setiap CEX berdiri sendiri.\n\nDefault: <b>20x • 2 posisi • 10 entry • 5 max loss • CROSS mode</b>\n\n"+CUSTOMIZE_WARNING_TEXT,reply_markup=cex_risk_cex_keyboard(uid))
+    await callback.message.edit_text("⚙️ <b>CUSTOM TRADING PER CEX</b>\n\nPilih CEX. Setting setiap CEX berdiri sendiri.\n\nDefault: <b>20x • 2 posisi • 10 entry • $5 realized loss • CROSS mode</b>\n\n"+CUSTOMIZE_WARNING_TEXT,reply_markup=cex_risk_cex_keyboard(uid))
 
 @dp.callback_query(F.data.startswith("risk_cex:"))
 async def cb_risk_cex(callback: CallbackQuery):
@@ -3065,7 +3069,7 @@ async def cb_risk_field(callback: CallbackQuery):
     if not is_allowed_chat(callback): return
     _,ex,field=callback.data.split(":",2)
     if ex not in DEFAULT_CEX or field not in DEFAULT_CEX_RISK: await safe_answer(callback,"Setting tidak valid.",True); return
-    labels={'margin':('💵 MARGIN','$','2'),'leverage':('⚡ LEVERAGE','x','20'),'max_pos':('📊 MAX POSISI','posisi','2'),'max_trades_day':('📅 MAX ENTRY/TRADE','entry','10'),'max_loss':('🛑 MAX LOSS','loss','5')}
+    labels={'margin':('💵 MARGIN','$','2'),'leverage':('⚡ LEVERAGE','x','20'),'max_pos':('📊 MAX POSISI','posisi','2'),'max_trades_day':('📅 MAX ENTRY/TRADE','entry','10'),'max_loss':('🛑 DAILY REALIZED LOSS','USD','5')}
     title,unit,example=labels[field]
     PENDING_RISK_SETTING[str(callback.message.chat.id)]={'ex_id':ex,'field':field}
     await safe_answer(callback)
@@ -3199,9 +3203,12 @@ async def handle_text(message: Message):
             if field=='margin':
                 value=float(text)
                 if not (0.1<=value<=1000): raise ValueError('Margin harus $0.10–$1000.')
+            elif field == 'max_loss':
+                value=float(text)
+                if not (0.10 <= value <= 10000): raise ValueError('Daily Realized Loss harus $0.10–$10000.')
             else:
                 if not text.isdigit(): raise ValueError('Nilai harus angka bulat.')
-                value=int(text); limits={'leverage':(1,125),'max_pos':(1,20),'max_trades_day':(1,100),'max_loss':(1,100)}
+                value=int(text); limits={'leverage':(1,125),'max_pos':(1,20),'max_trades_day':(1,100)}
                 lo,hi=limits[field]
                 if not (lo<=value<=hi): raise ValueError(f'Nilai harus {lo}–{hi}.')
             risk_pending['value']=value; PENDING_RISK_SETTING[chat_id]=risk_pending
@@ -3385,8 +3392,12 @@ async def cb_positions(callback: CallbackQuery):
 @dp.callback_query(F.data == "settings")
 async def cb_settings(callback: CallbackQuery):
     if not require_owner(callback): await safe_answer(callback, "Akses Owner saja.", True); return
-    await safe_answer(callback)
-    await callback.message.edit_text(build_settings_text(str(callback.message.chat.id)), reply_markup=settings_keyboard())
+    uid = _account_user_id(callback.message.chat.id)
+    await safe_answer(callback, "Global settings sudah dipindahkan ke Custom Trading Per CEX.")
+    await callback.message.edit_text(
+        "⚙️ <b>CUSTOM TRADING PER CEX</b>\n\nSemua risk setting sekarang diatur terpisah untuk setiap CEX.",
+        reply_markup=cex_risk_cex_keyboard(uid)
+    )
 
 @dp.callback_query(F.data == "stats")
 async def cb_stats(callback: CallbackQuery):
@@ -3496,7 +3507,7 @@ async def cb_daily_loss_toggle(callback: CallbackQuery):
     await callback.message.edit_text(
         "🛑 <b>DAILY LOSS LIMIT</b>\n\n"
         f"Status: {'🟢 ON' if value else '🔴 OFF'}\nBatas: {MAX_DAILY_SL} SL/hari\n\n"
-        + ("Jika ON, bot pause setelah batas SL harian tercapai." if value else "Jika OFF, SL tetap dicatat tetapi tidak mem-pause bot."),
+        + ("Jika ON, batas Daily Realized Loss per CEX aktif." if value else "Jika OFF, realized-loss limit tidak menghentikan entry baru."),
         reply_markup=bot_control_keyboard()
     )
 
