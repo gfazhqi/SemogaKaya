@@ -68,6 +68,8 @@ ERROR_COOLDOWN = 60
 MANUAL_ALERT_PAIRS = set()
 CORE_PAIRS = ('BTC/USDT', 'ETH/USDT')
 DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
+DRY_RUN_ALWAYS_ON = True  # Persistent 24/7 simulation mode; never expires.
+
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
 # ===== FIX CONSTANTS =====
@@ -104,6 +106,11 @@ def get_today_realized_loss(user_id, exchange_id=None):
 
 def _utc_now_sql():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def is_dry_run_mode():
+    """This build intentionally keeps simulation mode ON 24/7 until disabled in code."""
+    return bool(DRY_RUN_ALWAYS_ON)
 
 def _trade_is_active(status):
     return str(status) in ('PENDING', 'OPEN')
