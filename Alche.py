@@ -1,4 +1,6 @@
 import os
+import subprocess
+import tempfile
 import sys
 import time
 import sqlite3
@@ -68,7 +70,15 @@ ERROR_COOLDOWN = 60
 MANUAL_ALERT_PAIRS = set()
 CORE_PAIRS = ('BTC/USDT', 'ETH/USDT')
 DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
-DRY_RUN_ALWAYS_ON = True  # Persistent 24/7 simulation mode; never expires.
+
+AUTO_UPDATE_ENABLED = True
+AUTO_UPDATE_BRANCH = "main"
+AUTO_UPDATE_INTERVAL_MINUTES = 5
+AUTO_UPDATE_REQUIRE_CLEAN_GIT = True
+AUTO_UPDATE_BACKUP_DIR = ".update_backups"
+
+DRY_RUN_ALWAYS_ON = True
+DRY_RUN_BYPASS_SESSION = False  # DRY RUN uses the exact same session gate as REAL mode.  # Persistent 24/7 simulation mode; never expires.
 
 CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 50.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
@@ -107,6 +117,124 @@ def get_today_realized_loss(user_id, exchange_id=None):
 def _utc_now_sql():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
+
+
+def session_filter_allowed(*args, **kwargs):
+    """Session gate is identical for DRY RUN and REAL unless explicitly changed."""
+    # DRY_RUN_BYPASS_SESSION is intentionally False in this build.
+    return not DRY_RUN_BYPASS_SESSION
+
+
+def _run_git(*args):
+    return subprocess.run(
+        ["git", *args],
+        cwd=Path(__file__).resolve().parent,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=60,
+        check=False,
+    )
+
+def _validate_python_tree(root):
+    root = Path(root)
+    for path in root.rglob("*.py"):
+        if any(part in {".git", ".venv", "venv", "__pycache__"} for part in path.parts):
+            continue
+        try:
+            ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except Exception as exc:
+            return False, f"{path}: {exc}"
+    return True, "OK"
+
+def _git_clean():
+    r = _run_git("status", "--porcelain")
+    return r.returncode == 0 and not r.stdout.strip()
+
+def _git_head():
+    r = _run_git("rev-parse", "HEAD")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+def _git_remote_head():
+    r = _run_git("rev-parse", f"origin/{AUTO_UPDATE_BRANCH}")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+def _backup_current_revision():
+    root = Path(__file__).resolve().parent
+    backup_dir = root / AUTO_UPDATE_BACKUP_DIR
+    backup_dir.mkdir(exist_ok=True)
+    head = _git_head() or "unknown"
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup = backup_dir / f"preupdate_{stamp}_{head[:12]}"
+    backup.mkdir(exist_ok=True)
+    for name in ("*.py", "*.json", "*.yaml", "*.yml"):
+        for src_file in root.glob(name):
+            if src_file.is_file():
+                (backup / src_file.name).write_bytes(src_file.read_bytes())
+    return backup
+
+def _safe_restart():
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+def auto_update_once():
+    """Check GitHub, validate, backup, fast-forward update, then restart."""
+    if not AUTO_UPDATE_ENABLED:
+        return False
+
+    root = Path(__file__).resolve().parent
+    if AUTO_UPDATE_REQUIRE_CLEAN_GIT and not _git_clean():
+        print("[AUTO-UPDATE] skipped: working tree is not clean")
+        return False
+
+    fetch = _run_git("fetch", "origin", AUTO_UPDATE_BRANCH, "--prune")
+    if fetch.returncode != 0:
+        print(f"[AUTO-UPDATE] fetch failed: {fetch.stderr.strip()}")
+        return False
+
+    current = _git_head()
+    remote = _git_remote_head()
+    if not current or not remote or current == remote:
+        return False
+
+    backup = _backup_current_revision()
+    print(f"[AUTO-UPDATE] new revision detected: {remote[:12]}")
+
+    # Validate the remote commit before changing the live tree.
+    worktree = root / ".auto_update_validate"
+    if worktree.exists():
+        shutil.rmtree(worktree, ignore_errors=True)
+
+    add = _run_git("worktree", "add", "--detach", str(worktree), remote)
+    if add.returncode != 0:
+        print(f"[AUTO-UPDATE] validation worktree failed: {add.stderr.strip()}")
+        return False
+
+    try:
+        ok, detail = _validate_python_tree(worktree)
+    finally:
+        _run_git("worktree", "remove", "--force", str(worktree))
+        shutil.rmtree(worktree, ignore_errors=True)
+
+    if not ok:
+        print(f"[AUTO-UPDATE] validation failed: {detail}")
+        return False
+
+    pull = _run_git("merge", "--ff-only", remote)
+    if pull.returncode != 0:
+        print(f"[AUTO-UPDATE] fast-forward failed: {pull.stderr.strip()}")
+        return False
+
+    print(f"[AUTO-UPDATE] updated successfully. Backup: {backup}")
+    _safe_restart()
+    return True
+
+def auto_update_loop():
+    while True:
+        try:
+            auto_update_once()
+        except Exception as exc:
+            print(f"[AUTO-UPDATE] {exc}")
+        time.sleep(max(60, int(AUTO_UPDATE_INTERVAL_MINUTES * 60)))
 
 def is_dry_run_mode():
     """This build intentionally keeps simulation mode ON 24/7 until disabled in code."""
@@ -3978,6 +4106,12 @@ async def app_main():
         await bot.session.close()
 
 if __name__ == '__main__':
+
+    threading.Thread(
+        target=auto_update_loop,
+        name="auto-update",
+        daemon=True
+    ).start()
     try:
         asyncio.run(app_main())
     except (KeyboardInterrupt, SystemExit):
