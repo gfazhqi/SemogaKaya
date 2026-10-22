@@ -79,6 +79,29 @@ TRADE_TERMINAL_STATUSES = {
     'CLOSED (TP)', 'CLOSED (SL)', 'CLOSED (UNKNOWN)', 'CANCELLED', 'ERROR'
 }
 
+
+def get_today_realized_loss(user_id, exchange_id=None):
+    """Return actual realized loss for the current WIB day."""
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            if 'realized_pnl' not in cols:
+                return 0.0
+            sql = (
+                "SELECT COALESCE(SUM(realized_pnl),0) FROM trades "
+                "WHERE user_id=? AND status LIKE 'CLOSED%' "
+                "AND DATE(created_at,'+7 hours')=DATE('now','+7 hours')"
+            )
+            params = [str(user_id)]
+            if exchange_id is not None:
+                sql += " AND exchange_id=?"
+                params.append(str(exchange_id))
+            value = conn.execute(sql, tuple(params)).fetchone()[0]
+            return max(0.0, -float(value or 0.0))
+        finally:
+            conn.close()
+
 def _utc_now_sql():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -884,6 +907,36 @@ def _real_exchange_order_state(ex_instance, symbol, order_id):
         return "UNKNOWN"
 
 
+
+def publish_trade_signal_after_entry(trade_id, signal_text):
+    """Publish only after the trade row exists and is active/open."""
+    try:
+        row = db_read(
+            "SELECT status FROM trades WHERE id=?",
+            (int(trade_id),)
+        )
+        if not row or row[0][0] not in ('PENDING', 'OPEN'):
+            return False
+        send_public_signal(signal_text)
+        return True
+    except Exception:
+        return False
+
+
+def verify_protection_orders(ex, symbol, expected_order_ids):
+    """Verify SL/TP order ids are still present/open when possible."""
+    expected = {str(x) for x in (expected_order_ids or []) if x}
+    if not expected:
+        return False
+    try:
+        if not hasattr(ex, 'fetch_open_orders'):
+            return False
+        orders = ex.fetch_open_orders(symbol)
+        live = {str(o.get('id')) for o in (orders or []) if o.get('id')}
+        return bool(expected & live)
+    except Exception:
+        return False
+
 def fetch_realized_pnl_from_exchange(ex, symbol, order_id, side=None):
     """Best-effort realized PnL from exchange fills; never invents PnL."""
     try:
@@ -900,6 +953,7 @@ def fetch_realized_pnl_from_exchange(ex, symbol, order_id, side=None):
             return None, None
 
         pnl = 0.0
+        fees = 0.0
         exit_price = None
         found_pnl = False
         for tr in matched:
@@ -915,15 +969,47 @@ def fetch_realized_pnl_from_exchange(ex, symbol, order_id, side=None):
                     found_pnl = True
                 except Exception:
                     pass
+            fee = tr.get('fee') or {}
+            if isinstance(fee, dict):
+                try:
+                    fees += abs(float(fee.get('cost') or 0.0))
+                except Exception:
+                    pass
             price = tr.get('price')
             if price is not None:
                 try:
                     exit_price = float(price)
                 except Exception:
                     pass
-        return (pnl if found_pnl else None), exit_price
+        if found_pnl:
+            return pnl - fees, exit_price
+        return None, exit_price
     except Exception:
         return None, None
+
+
+def enforce_full_fill(ex, order, symbol):
+    """Return (state, filled, requested). Partial fills are never OPEN."""
+    try:
+        requested = float(order.get('amount') or 0)
+        filled = float(order.get('filled') or 0)
+    except Exception:
+        return 'UNKNOWN', 0.0, 0.0
+
+    if requested <= 0:
+        return 'UNKNOWN', filled, requested
+    if filled + 1e-12 >= requested:
+        return 'FILLED', filled, requested
+    if filled > 0:
+        # Cancel remaining quantity; caller must protect/close any actual fill.
+        try:
+            oid = order.get('id')
+            if oid:
+                ex.cancel_order(oid, symbol)
+        except Exception:
+            pass
+        return 'PARTIAL_REJECTED', filled, requested
+    return 'OPEN', 0.0, requested
 
 def update_orders_and_positions():
     with DB_LOCK:
@@ -1051,6 +1137,29 @@ def update_orders_and_positions():
 # =================================================================
 # FAST MONITORING THREAD
 # =================================================================
+
+
+def make_client_order_id(user_id, exchange_id, symbol, side):
+    stamp = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    safe_symbol = re.sub(r"[^A-Za-z0-9]", "", str(symbol))[:12]
+    return f"ALCHE-{str(user_id)[:8]}-{str(exchange_id)[:6]}-{safe_symbol}-{str(side)[:1]}-{stamp}"
+
+def reconcile_real_positions_on_startup():
+    """Refresh exchange positions/orders before allowing normal scanning."""
+    try:
+        for ex_id, ex in list(exchanges.items()):
+            if ex is None:
+                continue
+            try:
+                if hasattr(ex, 'fetch_open_orders'):
+                    ex.fetch_open_orders()
+                if hasattr(ex, 'fetch_positions'):
+                    ex.fetch_positions()
+            except Exception as e:
+                print(f"[RECONCILE] {ex_id}: {e}")
+    except Exception as e:
+        print(f"[RECONCILE] fatal: {e}")
+
 def fast_trade_monitor():
     while True:
         try:
@@ -1509,12 +1618,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         user_max_pos = int(risk_cfg['max_pos'])
         global_max = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', 2))
         
-        today_losses = db_read(
-            "SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? "
-            "AND status='CLOSED (SL)' "
-            "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
-            (user_id, ex_id)
-        )[0][0]
+        today_realized_loss = get_today_realized_loss(user_id, ex_id)
         today_trades_cex = _count_today_trades(user_id, ex_id)
         today_trades_user = _count_today_trades(user_id)
         max_trades_cex = int(risk_cfg['max_trades_day'])
