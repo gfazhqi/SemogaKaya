@@ -243,6 +243,21 @@ def set_cex_risk_setting(user_id, ex_id, field, value):
             conn.commit()
         finally: conn.close()
 
+# ===== FIX: SINKRONISASI GLOBAL MAX POS KE CEX SETTINGS =====
+def _sync_global_max_pos_to_cex(value):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            for ex_id in DEFAULT_CEX:
+                conn.execute(
+                    "INSERT INTO cex_risk_settings (user_id, ex_id, max_pos) VALUES ('OWNER', ?, ?) "
+                    "ON CONFLICT(user_id, ex_id) DO UPDATE SET max_pos=excluded.max_pos",
+                    (ex_id, value)
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
 def cex_risk_text(user_id, ex_id):
     c=get_cex_risk_settings(user_id,ex_id)
     return (f"⚙️ <b>CUSTOM TRADING — {str(ex_id).upper()}</b>\n\n"
@@ -1294,9 +1309,17 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         if not user_is_owner and not user_cfg['auto_trade']:
             runtime['last_reason'] = 'VIP Auto Trade OFF'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
+        
+        # ===== FIX: CEK MAX POSISI GLOBAL DAN PER-CEX =====
         active_count = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')", (user_id, ex_id))[0][0]
+        global_active = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND status IN ('PENDING','OPEN')", (user_id,))[0][0]
         user_max_pos = int(risk_cfg['max_pos'])
+        global_max = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', 2))
+        
         slots = max(0, user_max_pos - active_count)
+        global_slots = max(0, global_max - global_active)
+        final_slots = min(slots, global_slots)
+        
         today_trades = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')", (user_id, ex_id))[0][0]
         if today_trades >= int(risk_cfg['max_trades_day']):
             runtime['last_reason'] = f"Max entry/trade tercapai ({today_trades}/{risk_cfg['max_trades_day']})"
@@ -1305,17 +1328,23 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         if today_losses >= int(risk_cfg['max_loss']):
             runtime['last_reason'] = f"Max loss tercapai ({today_losses}/{risk_cfg['max_loss']})"
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
-        if slots <= 0:
-            runtime['last_reason'] = 'Max posisi CEX tercapai'
+        
+        if final_slots <= 0:
+            if slots <= 0 and global_slots <= 0:
+                runtime['last_reason'] = f'Max Posisi Global ({global_active}/{global_max}) & CEX tercapai'
+            elif global_slots <= 0:
+                runtime['last_reason'] = f'Max Posisi Global tercapai ({global_active}/{global_max})'
+            else:
+                runtime['last_reason'] = f'Max Posisi CEX tercapai ({active_count}/{user_max_pos})'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
 
         created = 0
         rate_limited = 0
         cycle_created_symbols = set() # ANTI-DUPLIKAT DI SATU SIKLUS
         for sym in scan_symbols:
-            if created >= slots: break
+            if created >= final_slots: break # Batasi sesuai slot yang tersedia
             if is_manual_alert_symbol(sym): continue
-            if sym in cycle_created_symbols: continue # Skip jika sudah dibuat di siklus ini
+            if sym in cycle_created_symbols: continue 
             
             try:
                 if ex_id == 'bingx':
@@ -2328,7 +2357,8 @@ async def cmd_setmaxpos(message: Message):
         value = int((message.text or '').split()[1])
         CONFIG['MAX_CONCURRENT_POSITIONS'] = value
         update_db_setting('max_pos', value)
-        await message.answer(f"✅ Max Posisi: {value}", reply_markup=role_keyboard(message))
+        _sync_global_max_pos_to_cex(value)
+        await message.answer(f"✅ Max Posisi: {value} (Global & CEX)", reply_markup=role_keyboard(message))
     except Exception: await message.answer("⚠️ Format: /setmaxpos 2")
 
 @dp.message(Command("setminwr"))
@@ -3125,6 +3155,7 @@ async def cb_set_maxpos(callback: CallbackQuery):
     value=int(callback.data.split(':')[1])
     CONFIG['MAX_CONCURRENT_POSITIONS']=value
     update_db_setting('max_pos', value)
+    _sync_global_max_pos_to_cex(value)
     await safe_answer(callback, f"Max posisi {value}")
     await callback.message.edit_text(f"✅ <b>Max posisi:</b> {value}", reply_markup=settings_keyboard())
 
