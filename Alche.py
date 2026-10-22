@@ -1949,6 +1949,7 @@ dp = Dispatcher()
 PENDING_API_SETUP = {}
 PENDING_RESTORE = set()
 PENDING_RISK_SETTING = {}
+PENDING_PAIR_FILTER = {}
 BACKUP_DIR = Path("backups")
 BACKUP_DIR.mkdir(exist_ok=True)
 
@@ -2138,9 +2139,30 @@ def owner_pair_filter_text():
 
 def owner_pair_filter_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ ATUR KRITERIA FILTER", callback_data="pair_filter_settings")],
         [InlineKeyboardButton(text="🟢 FILTER ON/OFF", callback_data="owner_pair_toggle")],
         [InlineKeyboardButton(text="🔄 REFRESH ELIGIBLE", callback_data="owner_pair_refresh")],
         [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
+    ])
+
+def pair_filter_settings_text():
+    min_wr = float(CONFIG.get('MIN_WR', 50.0))
+    min_trades = int(CONFIG.get('MIN_TRADES', 20))
+    return (
+        "⚙️ <b>PAIR PERFORMANCE FILTER</b>\n\n"
+        f"🎯 Minimum Win Rate: <b>{min_wr:.1f}%</b>\n"
+        f"📊 Minimum Trades: <b>{min_trades}</b>\n\n"
+        "Non-core masuk <b>AKTIF / eligible VIP</b> jika kedua syarat terpenuhi.\n"
+        "BTC/USDT + ETH/USDT tetap CORE.\n\n"
+        "Ubah salah satu nilai lalu refresh eligible."
+    )
+
+def pair_filter_settings_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 MIN WR", callback_data="pair_filter_set:min_wr")],
+        [InlineKeyboardButton(text="📊 MIN TRADES", callback_data="pair_filter_set:min_trades")],
+        [InlineKeyboardButton(text="🔄 REFRESH ELIGIBLE", callback_data="owner_pair_refresh")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="pairperf")]
     ])
 
 def main_keyboard(obj=None):
@@ -2773,6 +2795,7 @@ async def cmd_setminwr(message: Message):
         value = float((message.text or '').split()[1])
         CONFIG['MIN_WR'] = value
         update_db_setting('min_wr', value)
+        refresh_owner_eligible_pairs()
         await message.answer(f"✅ Min WinRate: {value}%", reply_markup=role_keyboard(message))
     except Exception: await message.answer("⚠️ Format: /setminwr 40")
 
@@ -2783,6 +2806,7 @@ async def cmd_setmintrades(message: Message):
         value = int((message.text or '').split()[1])
         CONFIG['MIN_TRADES'] = value
         update_db_setting('min_trades', value)
+        refresh_owner_eligible_pairs()
         await message.answer(f"✅ Min Trade: {value}x", reply_markup=role_keyboard(message))
     except Exception: await message.answer("⚠️ Format: /setmintrades 5")
 
@@ -3028,6 +3052,63 @@ async def cb_owner_pair_default(callback: CallbackQuery):
     await safe_answer(callback, "Default/core pair dipulihkan dan eligible dihitung ulang.")
     await callback.message.edit_text(owner_pair_filter_text(), reply_markup=owner_pair_filter_keyboard())
 
+
+@dp.callback_query(F.data == "pair_filter_settings")
+async def cb_pair_filter_settings(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        pair_filter_settings_text(),
+        reply_markup=pair_filter_settings_keyboard()
+    )
+
+@dp.callback_query(F.data.startswith("pair_filter_set:"))
+async def cb_pair_filter_set(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+    field = callback.data.split(":", 1)[1]
+    if field not in ("min_wr", "min_trades"):
+        await safe_answer(callback, "Setting tidak valid.", True)
+        return
+
+    PENDING_PAIR_FILTER[str(callback.message.chat.id)] = field
+    if field == "min_wr":
+        prompt = (
+            "🎯 <b>MINIMUM WIN RATE</b>\n\n"
+            "Kirim nilai persen.\n"
+            "Contoh: <code>60</code> = 60%\n"
+            "Range: <b>0–100%</b>"
+        )
+    else:
+        prompt = (
+            "📊 <b>MINIMUM TRADES</b>\n\n"
+            "Kirim jumlah closed trade minimum.\n"
+            "Contoh: <code>20</code>\n"
+            "Range: <b>1–10000 trade</b>"
+        )
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        prompt,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ BATAL", callback_data="pair_filter_cancel")]
+        ])
+    )
+
+@dp.callback_query(F.data == "pair_filter_cancel")
+async def cb_pair_filter_cancel(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+    PENDING_PAIR_FILTER.pop(str(callback.message.chat.id), None)
+    await safe_answer(callback, "Dibatalkan.")
+    await callback.message.edit_text(
+        pair_filter_settings_text(),
+        reply_markup=pair_filter_settings_keyboard()
+    )
+
 @dp.callback_query(F.data == "owner_pair_refresh")
 async def cb_owner_pair_refresh(callback: CallbackQuery):
     if not is_owner(callback): await safe_answer(callback, "Owner saja.", True); return
@@ -3193,6 +3274,40 @@ async def handle_text(message: Message):
         PENDING_VIP_ACTION.pop(chat_id, None)
         refresh_owner_eligible_pairs()
         await message.answer("ℹ️ Pair eligibility non-core dihitung otomatis dari histori Owner. Tidak ada manual whitelist/blacklist.\n\n" + owner_pair_filter_text(), reply_markup=owner_pair_filter_keyboard())
+        return
+
+    pair_filter_pending = PENDING_PAIR_FILTER.get(chat_id)
+    if pair_filter_pending and is_owner(message):
+        raw = (message.text or '').strip().replace(',', '.')
+        try:
+            field = pair_filter_pending
+            if field == 'min_wr':
+                value = float(raw)
+                if not (0.0 <= value <= 100.0):
+                    raise ValueError('Minimum WR harus 0–100%.')
+                CONFIG['MIN_WR'] = value
+                update_db_setting('min_wr', value)
+                label = f"{value:.1f}%"
+            else:
+                if not raw.isdigit():
+                    raise ValueError('Minimum Trades harus bilangan bulat.')
+                value = int(raw)
+                if not (1 <= value <= 10000):
+                    raise ValueError('Minimum Trades harus 1–10000.')
+                CONFIG['MIN_TRADES'] = value
+                update_db_setting('min_trades', value)
+                label = str(value)
+
+            PENDING_PAIR_FILTER.pop(chat_id, None)
+            refresh_owner_eligible_pairs()
+            await message.answer(
+                f"✅ <b>Filter disimpan</b>\n\n"
+                f"{'🎯 Minimum WR' if field == 'min_wr' else '📊 Minimum Trades'}: <b>{label}</b>\n\n"
+                "Eligible pair sudah direfresh otomatis.",
+                reply_markup=pair_filter_settings_keyboard()
+            )
+        except Exception as e:
+            await message.answer(f"❌ {html.escape(str(e))}")
         return
 
     risk_pending = PENDING_RISK_SETTING.get(chat_id)
@@ -3599,6 +3714,7 @@ async def cb_set_minwr(callback: CallbackQuery):
     value=float(callback.data.split(':')[1])
     CONFIG['MIN_WR']=value
     update_db_setting('min_wr', value)
+    refresh_owner_eligible_pairs()
     await safe_answer(callback, f"Min WR {value}%")
     await callback.message.edit_text(f"✅ <b>Min Win Rate:</b> {value}%", reply_markup=settings_keyboard())
 
@@ -3614,6 +3730,7 @@ async def cb_set_mintrades(callback: CallbackQuery):
     value=int(callback.data.split(':')[1])
     CONFIG['MIN_TRADES']=value
     update_db_setting('min_trades', value)
+    refresh_owner_eligible_pairs()
     await safe_answer(callback, f"Min trades {value}")
     await callback.message.edit_text(f"✅ <b>Min Trades:</b> {value}", reply_markup=settings_keyboard())
 
