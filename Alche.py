@@ -69,7 +69,7 @@ ERROR_COOLDOWN = 60
 MANUAL_ALERT_PAIRS = set()
 CORE_PAIRS = ('BTC/USDT', 'ETH/USDT')
 DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
-CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 3, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 20, 'MIN_WR': 60.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
+CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 3, 'DRY_RUN': True, 'DRY_RUN_CEX': {k: True for k in DEFAULT_CEX}, 'MIN_TRADES': 5, 'MIN_WR': 60.0, 'DAILY_LOSS_LIMIT': True, 'LEVERAGE': {k: 20 for k in DEFAULT_CEX}}
 
 def _table_columns(conn, table):
     return {row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()}
@@ -91,7 +91,7 @@ def init_db():
                 if col not in _table_columns(conn, 'trades'): c.execute(f'ALTER TABLE trades ADD COLUMN {col} {definition}')
             for col, definition in {'secret': "TEXT DEFAULT ''", 'password': "TEXT DEFAULT ''", 'account_label': "TEXT DEFAULT ''", 'account_info': "TEXT DEFAULT ''"}.items():
                 if col not in _table_columns(conn, 'user_cex_settings'): c.execute(f'ALTER TABLE user_cex_settings ADD COLUMN {col} {definition}')
-            for k,v in {'margin':'2.0','max_pos':'3','dry_run':'1','min_trades':'20','min_wr':'60','daily_loss_limit':'1'}.items(): c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(k,v))
+            for k,v in {'margin':'2.0','max_pos':'3','dry_run':'1','min_trades':'5','min_wr':'60','daily_loss_limit':'1'}.items(): c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(k,v))
             for ex_id in DEFAULT_CEX:
                 c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'lev_{ex_id}','20'))
                 c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'dry_run_{ex_id}','1'))
@@ -1608,7 +1608,7 @@ def owner_pair_filter_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🟢 FILTER ON/OFF", callback_data="owner_pair_toggle")],
         [InlineKeyboardButton(text="🔄 DEFAULT PAIRS", callback_data="owner_pair_default")],
-        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="owner_menu")]
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
 
 def owner_keyboard():
@@ -1761,7 +1761,7 @@ def owner_pair_filter_text():
         f"Status: {'🟢 ON' if OWNER_PAIR_FILTER.get('enabled', True) else '🔴 OFF'}\n"
         f"Pair eligible: <b>{len(pairs)}</b>\n"
         "Core: <b>BTC/USDT + ETH/USDT</b>\n"
-        f"Kriteria non-core: <b>≥ {int(CONFIG.get('MIN_TRADES',20))} trade & ≥ {float(CONFIG.get('MIN_WR',60.0)):.1f}% WR</b>\n\n"
+        f"Kriteria non-core: <b>≥ {int(CONFIG.get('MIN_TRADES',5))} trade & ≥ {float(CONFIG.get('MIN_WR',60.0)):.1f}% WR</b>\n\n"
         + ("\n".join(lines) if lines else "• Belum ada pair non-core yang lolos.")
         + "\n\n⚠️ Owner boleh scan semua pair. Daftar ini hanya menentukan pair yang disupply ke VIP."
     )
@@ -1770,7 +1770,7 @@ def owner_pair_filter_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🟢 FILTER ON/OFF", callback_data="owner_pair_toggle")],
         [InlineKeyboardButton(text="🔄 REFRESH ELIGIBLE", callback_data="owner_pair_refresh")],
-        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="owner_menu")]
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
 
 def main_keyboard(obj=None):
@@ -4315,7 +4315,17 @@ async def app_main():
     # Initialize shared state before any worker starts.
     init_db()
     load_settings()
+    # The previous working build used 5 trades as the minimum. If the prior
+    # buggy build persisted 20, migrate that accidental value back to 5 so
+    # the previously tested pairs are eligible again. Other custom values are
+    # preserved.
+    if int(CONFIG.get('MIN_TRADES', 5)) == 20:
+        CONFIG['MIN_TRADES'] = 5
+        update_db_setting('min_trades', 5)
     _refresh_owner_pair_state_from_db()
+    # Rebuild eligible pairs immediately from existing Owner history.
+    # This preserves prior test/performance results instead of showing only CORE pairs until the next scan.
+    refresh_owner_eligible_pairs()
     reload_exchanges()
 
     # Trading engine runs in a worker thread.
