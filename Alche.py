@@ -511,6 +511,8 @@ def cancel_all_pending_orders_on_pause(user_id='OWNER'):
                     if ex_key in exchanges and not str(ord_id).startswith('sim_'):
                         try:
                             exchanges[ex_key].cancel_order(ord_id, sym)
+                        except ccxt.OrderNotFound:
+                            pass # Order sudah tidak ada, cancel sukses
                         except Exception as e:
                             try:
                                 ord_state = exchanges[ex_key].fetch_order(str(ord_id), sym)
@@ -523,6 +525,8 @@ def cancel_all_pending_orders_on_pause(user_id='OWNER'):
                                 else:
                                     real_cancel_ok = False
                                     failed_cancels.append(f"{sym} ({ex_id}): cancel gagal ({e})")
+                            except ccxt.OrderNotFound:
+                                pass # Order sudah tidak ada
                             except Exception:
                                 real_cancel_ok = False
                                 failed_cancels.append(f"{sym} ({ex_id}): cancel gagal & verifikasi gagal ({e})")
@@ -579,7 +583,6 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
             sig = 'SELL'
     return sig, en, sl, tp
 
-# ===== FIX 110025 (One-Way Mode Not Modified) =====
 def ensure_one_way_mode(ex, ex_id, symbol):
     cache_key = f"{ex_id}::{id(ex)}"
     now = time.time()
@@ -618,7 +621,6 @@ def ensure_one_way_mode(ex, ex_id, symbol):
             return True, 'one-way mode already active'
         return False, msg[:500]
 
-# ===== FIX 110026 (Margin Mode Not Modified) =====
 def _ensure_cross_margin(ex, ex_id, sym):
     key = f"{ex_id}::{id(ex)}::{sym}"
     if key in MARGIN_MODE_SET:
@@ -717,6 +719,8 @@ def _real_exchange_order_state(ex_instance, symbol, order_id):
         if status in ("canceled", "cancelled", "expired", "rejected"):
             ORDER_UNKNOWN_COUNT.pop(str(order_id), None); return "CANCELLED"
         return "UNKNOWN"
+    except ccxt.OrderNotFound:
+        ORDER_UNKNOWN_COUNT.pop(str(order_id), None); return "FILLED_OR_CANCELLED"
     except Exception:
         cnt = ORDER_UNKNOWN_COUNT.get(str(order_id), 0) + 1
         ORDER_UNKNOWN_COUNT[str(order_id)] = cnt
@@ -757,6 +761,7 @@ def update_orders_and_positions():
                             cancel_ok = True
                             if not is_sim:
                                 try: ex.cancel_order(str(ord_id), sym)
+                                except ccxt.OrderNotFound: pass
                                 except Exception as e:
                                     cancel_ok = False
                                     send_error_alert(f"Timeout cancel {ex_id}/{sym} order={ord_id}: {e}")
@@ -774,6 +779,17 @@ def update_orders_and_positions():
                             elif real_state == 'CANCELLED':
                                 n_stat = 'CANCELLED'
                                 send_user_telegram(user_id, f"⚪ <b>ORDER CANCELLED</b> {sym} di {ex_id.upper()}")
+                            elif real_state == 'FILLED_OR_CANCELLED':
+                                try:
+                                    live_positions = ex.fetch_positions([sym])
+                                    has_pos = any(p.get('symbol') == sym and abs(float(p.get('contracts') or p.get('amount') or 0)) > 0 for p in (live_positions or []))
+                                except Exception: has_pos = False
+                                if has_pos:
+                                    n_stat = 'OPEN'
+                                    send_user_telegram(user_id, f"🔔 <b>ORDER FILLED (confirmed via position){tag}</b> {sym} di {ex_id.upper()}!")
+                                else:
+                                    n_stat = 'CANCELLED'
+                                    send_user_telegram(user_id, f"⚪ <b>ORDER CANCELLED (not found){tag}</b> {sym} di {ex_id.upper()}")
                             else:
                                 n_stat = 'PENDING'
                         else:
@@ -1338,7 +1354,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             if sig == 'SELL' and float(en) <= live_price:
                 runtime['last_reason'] = f'{sym}: SELL retracement already crossed; skip stale limit'; continue
 
-            # AUTO-ADJUST LEVERAGE
             lev_to_set = lev
             if not dry_run:
                 max_lev, lev_src = _get_max_leverage_for_pair(ex, ex_id, sym)
@@ -1354,7 +1369,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                             f"(Sumber: {lev_src})"
                         )
 
-            # qty pakai lev_to_set
             qty = (margin * lev_to_set) / float(en)
             try: qty = float(ex.amount_to_precision(sym, qty))
             except Exception: pass
@@ -1374,7 +1388,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             ord_id = f"sim_{int(time.time()*1000)}"
 
             if not dry_run:
-                # set_leverage (harmless error suppression)
                 _lev_ok = False; _lev_err = None
                 try:
                     ex.set_leverage(lev_to_set, sym); _lev_ok = True
@@ -1397,13 +1410,11 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                         send_error_alert(f"set_leverage gagal {ex_id}/{sym} (lev={lev_to_set}x, max_pair={max_lev}): {_lev_err}")
                         continue
 
-                # CROSS margin mode
                 ok_mm, mm_err = _ensure_cross_margin(ex, ex_id, sym)
                 if not ok_mm:
                     send_error_alert(f"set_margin_mode (cross) gagal {ex_id}/{sym}: {mm_err}")
                     continue
 
-                # one-way mode
                 ok_mode, mode_msg = ensure_one_way_mode(ex, ex_id, sym)
                 if not ok_mode:
                     send_error_alert(f"Order Fails {ex_id}/{sym}: One-Way Mode wajib aktif: {mode_msg}")
