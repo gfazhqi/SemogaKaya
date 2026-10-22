@@ -619,6 +619,10 @@ def check_and_update_daily_sl():
 # SMC STRATEGY
 # =================================================================
 def analyze_smc_retrace(df_m15, df_h1, daily_open):
+    # GUARD: Pastikan data cukup (minimal 7 baris untuk M15, 2 baris untuk H1)
+    if len(df_m15) < 7 or len(df_h1) < 2:
+        return None, 0.0, 0.0, 0.0
+
     ema50 = df_h1['close'].ewm(span=50, adjust=False).mean().iloc[-2]
     h1_c, c_prev = df_h1['close'].iloc[-2], df_m15.iloc[-2]
     sig, en, sl, tp = None, 0.0, 0.0, 0.0
@@ -908,6 +912,17 @@ def update_orders_and_positions():
                     send_error_alert(f"Position monitor [{ex_id}:{sym}]: {e}")
             conn.commit()
         finally: conn.close()
+
+# =================================================================
+# FAST MONITORING THREAD
+# =================================================================
+def fast_trade_monitor():
+    while True:
+        try:
+            update_orders_and_positions()
+        except Exception as e:
+            pass
+        time.sleep(3)
 
 # =================================================================
 # RUNTIME MONITORING
@@ -1350,7 +1365,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             runtime['last_reason'] = 'VIP Auto Trade OFF'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
         
-        # CEK MAX POSISI GLOBAL DAN PER-CEX
         active_count = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')", (user_id, ex_id))[0][0]
         global_active = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND status IN ('PENDING','OPEN')", (user_id,))[0][0]
         user_max_pos = int(risk_cfg['max_pos'])
@@ -1375,7 +1389,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             can_open_trade = False
             reason_cant_trade = f"Max loss ({today_losses}/{risk_cfg['max_loss']})"
         
-        # NEWS FILTER CHECK
         news_paused, news_time = is_news_time()
         if news_paused:
             can_open_trade = False
@@ -1384,7 +1397,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         if not can_open_trade:
             runtime['last_reason'] = f'Scan Only. {reason_cant_trade}'
 
-        # OPTIMASI: BATCH FETCH TICKERS
         all_tickers = {}
         try:
             all_tickers = ex.fetch_tickers()
@@ -1413,12 +1425,19 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     runtime['last_reason'] = f'{sym}: market cooldown, skip symbol'
                     continue
                 continue
-            if not m15 or not h1 or not d1: continue
-            sig, en, sl, tp = analyze_smc_retrace(
-                pd.DataFrame(m15, columns=['time','open','high','low','close','vol']),
-                pd.DataFrame(h1, columns=['time','open','high','low','close','vol']),
-                d1[-1][1]
-            )
+            
+            # GUARD: Pastikan data candle cukup untuk perhitungan
+            if not m15 or len(m15) < 7 or not h1 or len(h1) < 2 or not d1 or len(d1) < 1: continue
+            
+            try:
+                sig, en, sl, tp = analyze_smc_retrace(
+                    pd.DataFrame(m15, columns=['time','open','high','low','close','vol']),
+                    pd.DataFrame(h1, columns=['time','open','high','low','close','vol']),
+                    d1[-1][1]
+                )
+            except Exception:
+                continue
+                
             if not sig or en <= 0:
                 continue
             if sig == 'BUY':
@@ -1428,7 +1447,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 if not (tp < en < sl):
                     continue
             
-            # ANTI-DUPLIKAT DI DATABASE
             exists = db_read(
                 "SELECT 1 FROM trades WHERE user_id=? AND exchange_id=? AND symbol=? AND status IN ('PENDING','OPEN') LIMIT 1", 
                 (user_id, ex_id, sym)
@@ -1456,7 +1474,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             if sig == 'SELL' and float(en) <= live_price:
                 continue
 
-            # === KIRIM SINYAL ===
             try:
                 if user_is_owner:
                     _submit_async(publish_public_signal(sym, sig, ex_id, en, sl))
@@ -1589,7 +1606,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             runtime['last_reason'] = f'{sym}: {sig} setup created'
             set_runtime_event(f'{ex_id.upper()} {sym} {sig} setup created')
             
-            # Update can_open_trade
             active_count_after = active_count + created
             global_active_after = global_active + created
             if active_count_after >= user_max_pos or global_active_after >= global_max:
@@ -3457,7 +3473,6 @@ def main_loop():
                 )
                 last_hb = time.time()
             check_and_update_daily_sl()
-            update_orders_and_positions()
             _submit_async(_public_cycle())
             if now.hour == 7 and now.minute == 0 and now.second < 15:
                 if now.weekday() == 6:
@@ -3481,8 +3496,14 @@ async def app_main():
     global MAIN_ASYNC_LOOP
     MAIN_ASYNC_LOOP = asyncio.get_running_loop()
     init_db(); load_settings(); _refresh_owner_pair_state_from_db(); refresh_owner_eligible_pairs(); reload_exchanges()
+    
+    # Start Fast Monitor Thread (3 detik)
+    threading.Thread(target=fast_trade_monitor, name='fast-monitor', daemon=True).start()
+    # Start Scanner Thread (10 detik loop)
     threading.Thread(target=main_loop, name='trading-engine', daemon=True).start()
+    # Start Flask Web Dashboard
     threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, use_reloader=False), name='flask-dashboard', daemon=True).start()
+    
     try:
         await aiogram_polling()
     finally:
