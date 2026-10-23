@@ -93,7 +93,7 @@ AUTO_UPDATE_INTERVAL_MINUTES = 5
 AUTO_UPDATE_CHECK_SECONDS = 300
 AUTO_UPDATE_LAST_REMOTE = None
 AUTO_UPDATE_NOTIFICATION_SENT = False
-AUTO_UPDATE_REQUIRE_CLEAN_GIT = True
+AUTO_UPDATE_REQUIRE_CLEAN_GIT = False  # File-only updater never uses git clean/reset.
 AUTO_UPDATE_BACKUP_DIR = ".update_backups"
 
 DRY_RUN_ALWAYS_ON = True
@@ -173,28 +173,39 @@ def _git_head():
     r = _run_git("rev-parse", "HEAD")
     return r.stdout.strip() if r.returncode == 0 else None
 
-def _git_remote_head():
-    r = _run_git("rev-parse", f"origin/{AUTO_UPDATE_BRANCH}")
+def _git_file_blob(ref, filename="Alche.py"):
+    """Return the blob SHA for one tracked source file at a Git ref."""
+    r = _run_git("rev-parse", f"{ref}:{filename}")
     return r.stdout.strip() if r.returncode == 0 else None
 
-def _backup_current_revision():
+def _git_file_bytes(ref, filename="Alche.py"):
+    """Read exactly one source file from Git without changing the worktree."""
+    r = _run_git("show", f"{ref}:{filename}")
+    if r.returncode != 0:
+        return None, r.stderr.strip()
+    return r.stdout.encode("utf-8"), ""
+
+def _file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _backup_alche():
+    """Back up only Alche.py. Config, secrets, DB and runtime files are untouched."""
     root = Path(__file__).resolve().parent
     backup_dir = root / AUTO_UPDATE_BACKUP_DIR
     backup_dir.mkdir(exist_ok=True)
-    head = _git_head() or "unknown"
     stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    backup = backup_dir / f"preupdate_{stamp}_{head[:12]}"
-    backup.mkdir(exist_ok=True)
-    for name in ("*.py", "*.json", "*.yaml", "*.yml"):
-        for src_file in root.glob(name):
-            if src_file.is_file():
-                (backup / src_file.name).write_bytes(src_file.read_bytes())
+    backup = backup_dir / f"Alche_preupdate_{stamp}.py"
+    src = root / "Alche.py"
+    shutil.copy2(src, backup)
     return backup
 
 def _safe_restart():
     os.execv(sys.executable, [sys.executable, *sys.argv])
-
-
 
 def _write_update_state(data):
     try:
@@ -220,45 +231,66 @@ def _clear_update_state():
     except Exception:
         pass
 
-def _rollback_to_revision(revision):
-    if not revision:
-        return False, "No previous revision available."
-    r = _run_git("reset", "--hard", revision)
-    if r.returncode != 0:
-        return False, r.stderr.strip()
-    return True, "Rollback completed."
+def _rollback_alche_from_backup(backup_path):
+    """Restore only Alche.py from the pre-update backup."""
+    try:
+        root = Path(__file__).resolve().parent
+        backup = Path(backup_path)
+        target = root / "Alche.py"
+        if not backup.is_file():
+            return False, "Backup Alche.py tidak ditemukan."
+        tmp = root / ".Alche.rollback.tmp"
+        shutil.copy2(backup, tmp)
+        os.replace(tmp, target)
+        return True, "Alche.py berhasil di-rollback."
+    except Exception as exc:
+        return False, str(exc)
 
-def _mark_update_pending_restart(previous_revision, new_revision, backup_name):
+def _mark_update_pending_restart(previous_blob, new_blob, backup_name):
     _write_update_state({
         "pending_restart": True,
-        "previous_revision": previous_revision,
-        "new_revision": new_revision,
+        "file": "Alche.py",
+        "previous_blob": previous_blob,
+        "new_blob": new_blob,
         "backup": backup_name,
         "started_at": datetime.utcnow().isoformat(),
     })
 
 def _startup_update_recovery():
-    """If the previous approved update left a restart marker, verify startup."""
+    """Verify the file-only update after restart without touching Git/config."""
     state = _read_update_state()
     if not state.get("pending_restart"):
         return
 
-    previous = state.get("previous_revision")
-    new = state.get("new_revision")
-    if _git_head() != new:
+    root = Path(__file__).resolve().parent
+    target = root / "Alche.py"
+    new_blob = state.get("new_blob")
+    backup_name = state.get("backup")
+    expected_sha = state.get("expected_sha256")
+
+    # Reaching this function means Python successfully imported/started the
+    # updated source. Verify the local file still matches what was applied.
+    if target.exists() and expected_sha and _file_sha256(target) == expected_sha:
         _clear_update_state()
+        print(
+            f"[AUTO-UPDATE] startup verified: Alche.py "
+            f"{new_blob[:12] if new_blob else 'unknown'}"
+        )
         return
 
-    # Successful import/startup reaches this function. Clear the marker.
+    # If startup validation somehow reached here with a mismatched file,
+    # restore only Alche.py. Never reset Git and never touch config.py.
+    if backup_name:
+        ok, detail = _rollback_alche_from_backup(root / AUTO_UPDATE_BACKUP_DIR / backup_name)
+        if ok:
+            print("[AUTO-UPDATE] startup verification failed; Alche.py restored.")
+        else:
+            print(f"[AUTO-UPDATE] startup rollback failed: {detail}")
     _clear_update_state()
-    print(f"[AUTO-UPDATE] startup verified for {new[:12] if new else 'unknown'}")
 
 def _auto_update_has_active_execution():
     """Conservative pre-update guard: do not restart during active execution."""
     try:
-        # DB is authoritative for bot lifecycle. OPEN positions are allowed to
-        # remain protected at the exchange, but no restart is initiated while
-        # an entry/order transition is in progress.
         rows = db_read(
             "SELECT COUNT(*) FROM trades "
             "WHERE status IN ('PENDING','ENTRY_PENDING','EXIT_PENDING','PROTECTING')"
@@ -274,9 +306,11 @@ def _auto_update_status_text():
     current = pending.get("current", "?")[:12]
     remote = pending.get("remote", "?")[:12]
     return (
-        "🔔 <b>UPDATE TERSEDIA</b>\n\n"
+        "🔔 <b>UPDATE ALCHE.PY TERSEDIA</b>\n\n"
         f"Versi aktif: <code>{current}</code>\n"
         f"Versi baru: <code>{remote}</code>\n\n"
+        "Hanya <code>Alche.py</code> yang akan diperbarui.\n"
+        "Config, API key, token, database dan state lokal tidak disentuh.\n\n"
         "Update tidak diterapkan otomatis. Pilih aksi di bawah."
     )
 
@@ -322,7 +356,7 @@ def clear_auto_update_pending():
     AUTO_UPDATE_PENDING.pop("global", None)
 
 def _apply_approved_update():
-    """Apply only the already-approved remote revision."""
+    """Apply ONLY Alche.py from the already-approved GitHub revision."""
     pending = AUTO_UPDATE_PENDING.get("global")
     if not pending:
         return False, "Tidak ada update yang menunggu persetujuan."
@@ -331,574 +365,105 @@ def _apply_approved_update():
         return False, "Masih ada execution transition aktif. Update ditunda agar aman."
 
     root = Path(__file__).resolve().parent
-
-    # Owner already explicitly approved the update. A dirty worktree must not
-    # block deployment because this bot can create runtime/state files locally.
-    # The current tracked source/config is backed up before replacement.
+    target = root / "Alche.py"
     remote = pending["remote"]
-    backup = _backup_current_revision()
 
-    worktree = root / ".auto_update_validate"
-    if worktree.exists():
-        shutil.rmtree(worktree, ignore_errors=True)
+    # Ensure the approved remote file still exists and fetch its exact bytes.
+    remote_bytes, err = _git_file_bytes(f"origin/{AUTO_UPDATE_BRANCH}", "Alche.py")
+    if remote_bytes is None:
+        return False, f"Alche.py dari GitHub tidak dapat diambil: {err}"
 
-    add = _run_git("worktree", "add", "--detach", str(worktree), remote)
-    if add.returncode != 0:
-        return False, f"Validasi update gagal: {add.stderr.strip()}"
+    remote_blob = _git_file_blob(f"origin/{AUTO_UPDATE_BRANCH}", "Alche.py")
+    if not remote_blob:
+        return False, "Blob Alche.py dari GitHub tidak ditemukan."
 
+    # Validate ONLY the file that will actually be installed.
     try:
-        ok, detail = _validate_python_tree(worktree)
-    finally:
-        _run_git("worktree", "remove", "--force", str(worktree))
-        shutil.rmtree(worktree, ignore_errors=True)
+        ast.parse(remote_bytes.decode("utf-8"), filename="Alche.py")
+    except Exception as exc:
+        return False, f"Validasi Alche.py gagal: {exc}"
 
-    if not ok:
-        return False, f"Validasi Python gagal: {detail}"
+    # Backup ONLY Alche.py. config.py, .env, DB, state and other local files
+    # are deliberately excluded from the update transaction.
+    backup = _backup_alche()
 
-    # GitHub is the approved source of truth. Use a hard reset to the exact
-    # already-validated remote revision instead of requiring local HEAD to be
-    # an ancestor. This also handles a locally uploaded V12.x file.
-    reset = _run_git("reset", "--hard", remote)
-    if reset.returncode != 0:
-        return False, f"Update gagal saat menerapkan revision: {reset.stderr.strip()}"
+    # Atomic replacement. No git reset, merge, checkout or pull is performed.
+    tmp = root / ".Alche.update.tmp"
+    try:
+        tmp.write_bytes(remote_bytes)
+        os.replace(tmp, target)
+    except Exception as exc:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except Exception:
+            pass
+        return False, f"Gagal mengganti Alche.py: {exc}"
 
+    expected_sha = _file_sha256(target)
     _mark_update_pending_restart(
-        previous_revision=pending.get("current"),
-        new_revision=remote,
+        previous_blob=_git_file_blob("HEAD", "Alche.py"),
+        new_blob=remote_blob,
         backup_name=backup.name
     )
+    state = _read_update_state()
+    state["expected_sha256"] = expected_sha
+    _write_update_state(state)
     clear_auto_update_pending()
-    return True, f"Update berhasil dari GitHub ({remote[:12]}). Backup: {backup.name}"
+
+    return True, (
+        f"Alche.py berhasil diperbarui dari GitHub ({remote_blob[:12]}). "
+        f"Backup: {backup.name}"
+    )
 
 
 async def auto_update_monitor():
-    """Reliable async GitHub monitor. Detects once, then notifies Owner."""
+    """Monitor ONLY the Alche.py blob on GitHub. No git pull/merge/reset."""
     global AUTO_UPDATE_LAST_REMOTE, AUTO_UPDATE_NOTIFICATION_SENT
 
     first_check = True
     while True:
         try:
             if AUTO_UPDATE_ENABLED:
-                root = Path(__file__).resolve().parent
-
-                # Detection is allowed even when runtime files make the worktree
-                # dirty. The clean-tree guard is enforced only at APPLY time.
-                fetch = _run_git("fetch", "origin", AUTO_UPDATE_BRANCH, "--prune")
+                fetch = _run_git(
+                    "fetch", "origin", AUTO_UPDATE_BRANCH, "--prune"
+                )
                 if fetch.returncode == 0:
-                    current = _git_head()
-                    remote = _git_remote_head()
+                    current_blob = _git_file_blob("HEAD", "Alche.py")
+                    remote_blob = _git_file_blob(
+                        f"origin/{AUTO_UPDATE_BRANCH}", "Alche.py"
+                    )
 
-                    if current and remote and current != remote:
-                        if AUTO_UPDATE_LAST_REMOTE != remote:
-                            AUTO_UPDATE_LAST_REMOTE = remote
+                    if current_blob and remote_blob and current_blob != remote_blob:
+                        if AUTO_UPDATE_LAST_REMOTE != remote_blob:
+                            AUTO_UPDATE_LAST_REMOTE = remote_blob
                             AUTO_UPDATE_NOTIFICATION_SENT = False
 
                         if not AUTO_UPDATE_NOTIFICATION_SENT:
-                            request_auto_update_approval(current, remote)
+                            request_auto_update_approval(
+                                current_blob, remote_blob
+                            )
                             sent = await notify_owner_update_available()
                             if sent:
                                 AUTO_UPDATE_NOTIFICATION_SENT = True
                                 print(
-                                    f"[AUTO-UPDATE] notification sent: "
-                                    f"{current[:12]} -> {remote[:12]}"
+                                    "[AUTO-UPDATE] Alche.py notification sent: "
+                                    f"{current_blob[:12]} -> {remote_blob[:12]}"
                                 )
                             else:
                                 print(
-                                    "[AUTO-UPDATE] update detected but Owner notification "
-                                    "could not be sent"
+                                    "[AUTO-UPDATE] Alche.py detected but "
+                                    "Owner notification could not be sent"
                                 )
         except Exception as exc:
             print(f"[AUTO-UPDATE] monitor error: {exc}")
 
-        # Check immediately on startup, then every 5 minutes.
         if first_check:
             first_check = False
             await asyncio.sleep(1)
         else:
             await asyncio.sleep(AUTO_UPDATE_CHECK_SECONDS)
 
-def auto_update_once():
-    """Detect a new revision and request owner approval; never auto-restart."""
-    if not AUTO_UPDATE_ENABLED:
-        return False
-
-    root = Path(__file__).resolve().parent
-    if AUTO_UPDATE_REQUIRE_CLEAN_GIT and not _git_clean():
-        print("[AUTO-UPDATE] skipped: working tree is not clean")
-        return False
-
-    fetch = _run_git("fetch", "origin", AUTO_UPDATE_BRANCH, "--prune")
-    if fetch.returncode != 0:
-        print(f"[AUTO-UPDATE] fetch failed: {fetch.stderr.strip()}")
-        return False
-
-    current = _git_head()
-    remote = _git_remote_head()
-    if not current or not remote or current == remote:
-        return False
-
-    existing = AUTO_UPDATE_PENDING.get("global")
-    if existing and existing.get("remote") == remote:
-        return False
-
-    msg = request_auto_update_approval(current, remote)
-    print(f"[AUTO-UPDATE] approval required: {current[:12]} -> {remote[:12]}")
-    try:
-        loop = globals().get("MAIN_ASYNC_LOOP")
-        if loop and loop.is_running():
-            asyncio.run_coroutine_threadsafe(
-                notify_owner_update_available(),
-                loop
-            )
-    except Exception as exc:
-        print(f"[AUTO-UPDATE] notification scheduling failed: {exc}")
-    return True
-
-
-def auto_update_loop():
-    """Deprecated compatibility wrapper. Use auto_update_monitor() on the bot loop."""
-    return None
-
-
-def is_dry_run_mode():
-    """This build intentionally keeps simulation mode ON 24/7 until disabled in code."""
-    return bool(DRY_RUN_ALWAYS_ON)
-
-def _trade_is_active(status):
-    return str(status) in ('PENDING', 'OPEN')
-
-def atomic_reserve_trade_slot(user_id, exchange_id, symbol):
-    """Atomically reserve a PENDING slot before any REAL order is submitted."""
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            active_cex = conn.execute(
-                "SELECT COUNT(*) FROM trades "
-                "WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')",
-                (str(user_id), str(exchange_id))
-            ).fetchone()[0]
-            active_global = conn.execute(
-                "SELECT COUNT(*) FROM trades "
-                "WHERE user_id=? AND status IN ('PENDING','OPEN')",
-                (str(user_id),)
-            ).fetchone()[0]
-            max_cex = int(get_cex_max_positions(user_id, exchange_id))
-            max_global = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', max_cex))
-
-            if active_cex >= max_cex or active_global >= max_global:
-                conn.rollback()
-                return False, "MAX_POSITION"
-
-            duplicate = conn.execute(
-                "SELECT 1 FROM trades WHERE user_id=? AND exchange_id=? AND symbol=? "
-                "AND status IN ('PENDING','OPEN') LIMIT 1",
-                (str(user_id), str(exchange_id), str(symbol))
-            ).fetchone()
-            if duplicate:
-                conn.rollback()
-                return False, "DUPLICATE_ACTIVE"
-
-            # Reservation is represented by a short-lived DB row. The caller
-            # must immediately convert this row into the actual trade row.
-            conn.commit()
-            return True, "RESERVED"
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
-
-def record_realized_pnl(trade_id, realized_pnl, exit_price=None, close_reason=None):
-    """Persist exchange-realized PnL instead of estimating from margin."""
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        try:
-            cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
-            if 'realized_pnl' not in cols:
-                conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl REAL DEFAULT 0")
-            if 'exit_price' not in cols:
-                conn.execute("ALTER TABLE trades ADD COLUMN exit_price REAL")
-            if 'close_reason' not in cols:
-                conn.execute("ALTER TABLE trades ADD COLUMN close_reason TEXT")
-            conn.execute(
-                "UPDATE trades SET realized_pnl=?, exit_price=COALESCE(?, exit_price), "
-                "close_reason=COALESCE(?, close_reason) WHERE id=?",
-                (float(realized_pnl or 0), exit_price, close_reason, int(trade_id))
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-ORDER_UNKNOWN_COUNT = {}
-MARGIN_MODE_SET = set()
-PUBLIC_SIGNAL_MAX_AGE = 7 * 86400
-LEVERAGE_TIERS_CACHE = {}       # {ex_id::symbol: (max_lev, timestamp)}
-LEVERAGE_TIERS_CACHE_TTL = 3600  # 1 jam
-NEWS_CACHE = {'last_fetch': 0, 'events': []}
-
-def _table_columns(conn, table):
-    return {row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()}
-
-def init_db():
-    Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_FILE, timeout=15)
-        try:
-            c = conn.cursor()
-            c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-            c.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id TEXT PRIMARY KEY, margin REAL NOT NULL DEFAULT 2.0, max_pos INTEGER NOT NULL DEFAULT 3, max_trades_day INTEGER NOT NULL DEFAULT 10, leverage INTEGER NOT NULL DEFAULT 20, auto_trade INTEGER NOT NULL DEFAULT 1)")
-            c.execute("CREATE TABLE IF NOT EXISTS user_cex_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, api_key TEXT DEFAULT '', secret TEXT DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, password TEXT DEFAULT '', account_label TEXT DEFAULT '', account_info TEXT DEFAULT '', PRIMARY KEY (user_id, ex_id))")
-            c.execute("CREATE TABLE IF NOT EXISTS cex_risk_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, margin REAL NOT NULL DEFAULT 2.0, leverage INTEGER NOT NULL DEFAULT 20, max_pos INTEGER NOT NULL DEFAULT 2, max_trades_day INTEGER NOT NULL DEFAULT 10, max_loss REAL NOT NULL DEFAULT 5.0, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, ex_id))")
-            c.execute("CREATE TABLE IF NOT EXISTS vip_members (telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', status TEXT DEFAULT 'ACTIVE', expires_at TEXT, added_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'OWNER', exchange_id TEXT NOT NULL, symbol TEXT NOT NULL, order_type TEXT DEFAULT 'LIMIT', side TEXT NOT NULL, entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL, order_id TEXT DEFAULT '', bars_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_eligible (symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_filter (id INTEGER PRIMARY KEY CHECK (id=1), enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            for col, definition in {'user_id': "TEXT NOT NULL DEFAULT 'OWNER'", 'bars_count': 'INTEGER NOT NULL DEFAULT 0', 'created_at': 'TEXT DEFAULT CURRENT_TIMESTAMP'}.items():
-                if col not in _table_columns(conn, 'trades'): c.execute(f'ALTER TABLE trades ADD COLUMN {col} {definition}')
-            for col, definition in {'secret': "TEXT DEFAULT ''", 'password': "TEXT DEFAULT ''", 'account_label': "TEXT DEFAULT ''", 'account_info': "TEXT DEFAULT ''"}.items():
-                if col not in _table_columns(conn, 'user_cex_settings'): c.execute(f'ALTER TABLE user_cex_settings ADD COLUMN {col} {definition}')
-            for k,v in {'margin':'2.0','max_pos':'3','dry_run':'1','min_trades':'20','min_wr':'50','daily_loss_limit':'1'}.items(): c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(k,v))
-            for ex_id in DEFAULT_CEX:
-                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'lev_{ex_id}','20'))
-                c.execute("INSERT OR IGNORE INTO cex_risk_settings(user_id,ex_id,margin,leverage,max_pos,max_trades_day,max_loss) VALUES (?,?,?,?,?,?,?)", ('OWNER',ex_id,2.0,20,2,10,5.0))
-                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'dry_run_{ex_id}','1'))
-            c.execute('INSERT OR IGNORE INTO owner_pair_filter(id,enabled) VALUES (1,1)')
-            for pair in CORE_PAIRS: c.execute('INSERT OR IGNORE INTO owner_pair_eligible(symbol,enabled,updated_at) VALUES (?,?,?)',(pair,1,datetime.now(WIB).isoformat(timespec='seconds')))
-            conn.commit()
-        finally: conn.close()
-
-def _load_owner_pair_filter_state():
-    rows=db_read('SELECT enabled FROM owner_pair_filter WHERE id=1'); enabled=bool(rows[0][0]) if rows else True
-    pairs=[r[0] for r in db_read('SELECT symbol FROM owner_pair_eligible WHERE enabled=1 ORDER BY symbol')]
-    return enabled, pairs or list(CORE_PAIRS)
-
-def _save_owner_pair_filter(enabled,pairs):
-    now=datetime.now(WIB).isoformat(timespec='seconds')
-    with DB_LOCK:
-        conn=sqlite3.connect(DB_FILE,timeout=10)
-        try:
-            conn.execute('UPDATE owner_pair_filter SET enabled=?, updated_at=? WHERE id=1',(1 if enabled else 0,now))
-            conn.execute('UPDATE owner_pair_eligible SET enabled=0, updated_at=?',(now,))
-            for pair in sorted(set(pairs)):
-                conn.execute('INSERT INTO owner_pair_eligible(symbol,enabled,updated_at) VALUES (?,?,?) ON CONFLICT(symbol) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at',(pair,1,now))
-            conn.commit()
-        finally: conn.close()
-
-# =================================================================
-# VIP USER SETTINGS
-# =================================================================
-VIP_RECOMMENDED_MARGIN_USD = 2.0
-VIP_RECOMMENDED_LEVERAGE = 20
-VIP_RECOMMENDED_MAX_OPEN_POSITIONS = 3
-VIP_RECOMMENDED_MAX_TRADES_PER_DAY = 10
-
-def vip_recommended_settings_text(user_id=None):
-    uid = str(user_id or '')
-    cfg = get_user_settings(uid) if uid and uid != 'OWNER' else {
-        'margin': 2.0, 'max_pos': 3, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1
-    }
-    return (
-        "💎 <b>VIP SETTINGS</b>\n\n"
-        f"💵 Margin / Trade: <b>${cfg['margin']:.2f}</b>\n"
-        f"⚡ Leverage: <b>{cfg['leverage']}x</b>\n"
-        f"📊 Max Posisi: <b>{cfg['max_pos']}</b>\n"
-        f"📅 Max Trade / Hari: <b>{cfg['max_trades_day']}</b>\n"
-        f"🤖 Auto Trade: <b>{'🟢 ON' if cfg['auto_trade'] else '🔴 OFF'}</b>\n\n"
-        "ℹ️ Default rekomendasi: <b>$2 / 20x / 3 posisi / 10 trade per hari</b>.\n\n"
-        + VIP_WARNING_TEXT
-    )
-
-def ensure_user_settings(user_id):
-    uid = str(user_id)
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    try:
-        conn.execute(
-            "INSERT OR IGNORE INTO user_settings "
-            "(user_id, margin, max_pos, max_trades_day, leverage, auto_trade) "
-            "VALUES (?, 2.0, 3, 10, 20, 1)",
-            (uid,)
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-def get_user_settings(user_id):
-    uid = str(user_id)
-    ensure_user_settings(uid)
-    rows = db_read(
-        "SELECT margin, max_pos, max_trades_day, leverage, auto_trade "
-        "FROM user_settings WHERE user_id=?",
-        (uid,)
-    )
-    if not rows:
-        return {'margin': 2.0, 'max_pos': 3, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1}
-    r = rows[0]
-    return {
-        'margin': float(r[0]),
-        'max_pos': int(r[1]),
-        'max_trades_day': int(r[2]),
-        'leverage': int(r[3]),
-        'auto_trade': int(r[4]),
-    }
-
-def set_user_setting(user_id, field, value):
-    allowed = {'margin', 'max_pos', 'max_trades_day', 'leverage', 'auto_trade'}
-    if field not in allowed:
-        raise ValueError('Setting tidak valid')
-    ensure_user_settings(user_id)
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    try:
-        conn.execute(f"UPDATE user_settings SET {field}=? WHERE user_id=?", (value, str(user_id)))
-        if field in ('margin', 'leverage', 'max_pos', 'max_trades_day'):
-            for ex_id in DEFAULT_CEX:
-                conn.execute(
-                    f"INSERT INTO cex_risk_settings (user_id, ex_id, {field}) VALUES (?, ?, ?) "
-                    f"ON CONFLICT(user_id, ex_id) DO UPDATE SET {field}=excluded.{field}, "
-                    f"updated_at=datetime('now')",
-                    (str(user_id), ex_id, value)
-                )
-        conn.commit()
-    finally:
-        conn.close()
-
-DEFAULT_CEX_RISK = {'margin': 2.0, 'leverage': 20, 'max_pos': 2, 'max_trades_day': 10, 'max_loss': 5.0}
-CUSTOMIZE_WARNING_TEXT = (
-    "⚠️ <b>PERINGATAN CUSTOMIZE TRADING</b>\n\n"
-    "⚡ <b>Leverage</b> — ✅ Daya beli lebih besar. ❌ Pergerakan harga berdampak lebih besar pada margin/likuidasi.\n"
-    "📌 Perhatikan: leverage tinggi tidak membuat strategi lebih akurat.\n\n"
-    "📊 <b>Max Posisi</b> — ✅ Lebih banyak setup berjalan bersamaan. ❌ Total exposure dan risiko loss bersamaan meningkat.\n"
-    "📌 Perhatikan total exposure akun.\n\n"
-    "📅 <b>Max Entry/Trade</b> — ✅ Lebih banyak setup dapat diambil. ❌ Frekuensi trade, fee, dan losing streak bisa meningkat.\n"
-    "📌 Limit tinggi dapat memperbesar akumulasi loss.\n\n"
-    "🛑 <b>Daily Realized Loss</b> — batas total kerugian realized harian sebelum CEX berhenti membuka trade baru. ❌ Terlalu rendah dapat menghentikan trading lebih cepat.\n"
-    "📌 Dihitung dari <b>total realized loss</b> trade CLOSED, bukan floating loss dan bukan jumlah SL.\n\n"
-    "💡 Setting hanya berlaku pada CEX yang dipilih. Pastikan modal, exposure, dan batas risiko sesuai toleransi Anda."
-)
-
-def ensure_cex_risk_settings(user_id, ex_id):
-    with DB_LOCK:
-        conn=sqlite3.connect(DB_FILE,timeout=10)
-        try:
-            conn.execute("INSERT OR IGNORE INTO cex_risk_settings(user_id,ex_id,margin,leverage,max_pos,max_trades_day,max_loss) VALUES (?,?,?,?,?,?,?)",
-                         (str(user_id),str(ex_id).lower(),2.0,20,2,10,5))
-            conn.commit()
-        finally: conn.close()
-
-def get_cex_risk_settings(user_id, ex_id):
-    ensure_cex_risk_settings(user_id,ex_id)
-    rows=db_read("SELECT margin,leverage,max_pos,max_trades_day,max_loss FROM cex_risk_settings WHERE user_id=? AND ex_id=?",(str(user_id),str(ex_id).lower()))
-    if not rows: return dict(DEFAULT_CEX_RISK)
-    r=rows[0]
-    return {'margin':float(r[0]),'leverage':int(r[1]),'max_pos':int(r[2]),'max_trades_day':int(r[3]),'max_loss':float(r[4])}
-
-def _count_today_trades(user_id, ex_id=None):
-    """Count trades created today in WIB."""
-    uid = str(user_id)
-    if ex_id is None:
-        rows = db_read(
-            "SELECT COUNT(*) FROM trades WHERE user_id=? "
-            "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
-            (uid,)
-        )
-    else:
-        rows = db_read(
-            "SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? "
-            "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
-            (uid, str(ex_id).lower())
-        )
-    return int(rows[0][0]) if rows else 0
-
-
-def set_cex_risk_setting(user_id, ex_id, field, value):
-    if field not in DEFAULT_CEX_RISK: raise ValueError('Setting risiko tidak valid.')
-    ensure_cex_risk_settings(user_id,ex_id)
-    with DB_LOCK:
-        conn=sqlite3.connect(DB_FILE,timeout=10)
-        try:
-            conn.execute(f"UPDATE cex_risk_settings SET {field}=?,updated_at=? WHERE user_id=? AND ex_id=?",(value,datetime.now(WIB).isoformat(timespec='seconds'),str(user_id),str(ex_id).lower()))
-            conn.commit()
-        finally: conn.close()
-
-def _sync_global_max_pos_to_cex(value):
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_FILE, timeout=10)
-        try:
-            for ex_id in DEFAULT_CEX:
-                conn.execute(
-                    "INSERT INTO cex_risk_settings (user_id, ex_id, max_pos) VALUES ('OWNER', ?, ?) "
-                    "ON CONFLICT(user_id, ex_id) DO UPDATE SET max_pos=excluded.max_pos",
-                    (ex_id, value)
-                )
-            conn.commit()
-        finally:
-            conn.close()
-
-def cex_risk_text(user_id, ex_id):
-    c=get_cex_risk_settings(user_id,ex_id)
-    return (f"⚙️ <b>CUSTOM TRADING — {str(ex_id).upper()}</b>\n\n"
-            f"💵 Margin: <b>${c['margin']:.2f}</b>\n⚡ Leverage: <b>{c['leverage']}x</b>\n"
-            f"🌐 Mode: <b>CROSS</b> (auto-adjust per pair)\n"
-            f"📊 Max Posisi: <b>{c['max_pos']}</b>\n📅 Max Entry/Trade: <b>{c['max_trades_day']}</b>\n"
-            f"🛑 Daily Realized Loss: <b>${c['max_loss']:.2f}</b>\n\n⚠️ CEX berhenti membuka trade baru jika total realized loss hari ini mencapai batas ini.")
-
-def cex_risk_cex_keyboard(user_id):
-    rows=[]
-    for ex in DEFAULT_CEX:
-        c=get_cex_risk_settings(user_id,ex)
-        rows.append([InlineKeyboardButton(text=f"{ex.upper()} • {c['leverage']}x / {c['max_pos']}P / {c['max_trades_day']}E / ${c['max_loss']:.0f} RL / CROSS",callback_data=f"risk_cex:{ex}")])
-    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI",callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def cex_risk_field_keyboard(ex_id):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💵 MARGIN",callback_data=f"risk_field:{ex_id}:margin")],
-        [InlineKeyboardButton(text="⚡ LEVERAGE",callback_data=f"risk_field:{ex_id}:leverage")],
-        [InlineKeyboardButton(text="📊 MAX POSISI",callback_data=f"risk_field:{ex_id}:max_pos")],
-        [InlineKeyboardButton(text="📅 MAX ENTRY/TRADE",callback_data=f"risk_field:{ex_id}:max_trades_day")],
-        [InlineKeyboardButton(text="🛑 DAILY REALIZED LOSS",callback_data=f"risk_field:{ex_id}:max_loss")],
-        [InlineKeyboardButton(text="🔄 DEFAULT",callback_data=f"risk_default:{ex_id}")],
-        [InlineKeyboardButton(text="⬅️ KEMBALI",callback_data="risk_settings")]])
-
-def load_settings():
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    c = conn.cursor()
-    for row in c.execute("SELECT key, value FROM settings").fetchall():
-        if row[0] == 'margin': CONFIG['MARGIN_PER_TRADE'] = float(row[1])
-        elif row[0] == 'max_pos': CONFIG['MAX_CONCURRENT_POSITIONS'] = int(row[1])
-        elif row[0] == 'dry_run': CONFIG['DRY_RUN'] = bool(float(row[1]))
-        elif row[0] == 'min_trades': CONFIG['MIN_TRADES'] = int(row[1])
-        elif row[0] == 'min_wr': CONFIG['MIN_WR'] = float(row[1])
-        elif row[0] == 'daily_loss_limit': CONFIG['DAILY_LOSS_LIMIT'] = bool(float(row[1]))
-        elif row[0].startswith('lev_'): CONFIG['LEVERAGE'][row[0].split('_', 1)[1]] = int(row[1])
-        elif row[0].startswith('dry_run_'): CONFIG.setdefault('DRY_RUN_CEX', {})[row[0].split('_', 2)[2]] = bool(float(row[1]))
-    conn.close()
-
-def _exchange_key(user_id, ex_id):
-    return f"{str(user_id)}::{ex_id}"
-
-def _split_exchange_key(key):
-    return str(key).split("::", 1)
-
-def reload_exchanges():
-    global exchanges, EXCHANGE_MARKETS, EXCHANGE_SCAN_NEXT, EXCHANGE_LAST_CANDLE, EXCHANGE_SCAN_CURSOR, EXCHANGE_REQUEST_NEXT
-    rows = db_read(
-        "SELECT user_id, ex_id, api_key, secret, enabled, password "
-        "FROM user_cex_settings"
-    )
-    EXCHANGE_SCAN_CURSOR = {}
-    EXCHANGE_REQUEST_NEXT = {}
-    exchanges.clear()
-    EXCHANGE_MARKETS.clear()
-    EXCHANGE_SCAN_NEXT.clear()
-    EXCHANGE_LAST_CANDLE.clear()
-
-    for user_id, ex_id, api, sec, en, password in rows:
-        if ex_id not in DEFAULT_CEX or en != 1:
-            continue
-
-        user_is_owner = str(user_id) == 'OWNER'
-        if not user_is_owner:
-            if get_vip_member(user_id) is None:
-                continue
-            try:
-                ucfg = get_user_settings(user_id)
-                if not ucfg['auto_trade']:
-                    continue
-            except Exception:
-                continue
-
-        dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
-        base_params = {
-            'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
-            'enableRateLimit': True,
-            'timeout': 8000
-        }
-        if ex_id == 'bingx':
-            base_params['rateLimit'] = 350
-        if ex_id == 'bitget':
-            base_params['password'] = password or ''
-
-        try:
-            params = dict(base_params)
-            params.update({'apiKey': api or '', 'secret': sec or ''})
-            ex = getattr(ccxt, ex_id)(params)
-            ex.load_markets()
-        except Exception as auth_exc:
-            if not (user_is_owner and dry_run):
-                send_error_alert(f"Load Ex [{ex_id}] user={user_id}: {auth_exc}")
-                continue
-            try:
-                public_params = dict(base_params)
-                public_params.pop('password', None)
-                public_params['apiKey'] = ''
-                public_params['secret'] = ''
-                ex = getattr(ccxt, ex_id)(public_params)
-                ex.load_markets()
-                send_telegram(
-                    f"🧪 <b>DRY RUN PUBLIC SCANNER</b>\n"
-                    f"{ex_id.upper()}: private API gagal, scanner memakai market data publik."
-                )
-            except Exception as public_exc:
-                send_error_alert(f"Load Public Ex [{ex_id}] user={user_id}: {public_exc}")
-                continue
-
-        key = _exchange_key(user_id, ex_id)
-        exchanges[key] = ex
-        EXCHANGE_MARKETS[key] = ex.markets
-
-    for stale in [k for k in list(EXCHANGE_RUNTIME) if k not in exchanges]:
-        EXCHANGE_RUNTIME.pop(stale, None)
-
-
-def update_db_setting(key, value):
-    conn = sqlite3.connect(DB_FILE, timeout=10)
-    conn.cursor().execute(
-        "INSERT INTO settings(key,value) VALUES (?,?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (key, str(value))
-    )
-    conn.commit()
-    conn.close()
-
-# =================================================================
-# NEWS FILTER (FOREXFACTORY)
-# =================================================================
-def _fetch_news_calendar():
-    now = time.time()
-    if now - NEWS_CACHE['last_fetch'] < 3600 and NEWS_CACHE['events']: return
-    try:
-        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            events = []
-            for item in data:
-                if item.get('impact') == 'High' and item.get('country') == 'USD':
-                    dt_str = item.get('date')
-                    if dt_str:
-                        dt_str = dt_str.replace('Z', '+00:00')
-                        try:
-                            dt = datetime.fromisoformat(dt_str)
-                            events.append(dt)
-                        except: pass
-            NEWS_CACHE['events'] = events
-            NEWS_CACHE['last_fetch'] = now
-    except Exception: pass
-
-def is_news_time():
-    _fetch_news_calendar()
-    now = datetime.now(timezone.utc)
-    for event_dt in NEWS_CACHE['events']:
-        diff = abs((now - event_dt).total_seconds())
-        if diff <= 1800: # 30 minutes before/after
-            return True, event_dt.astimezone(WIB).strftime('%H:%M')
-    return False, None
-
-# =================================================================
-# BACKUP / TEMP
-# =================================================================
-BACKUP_MESSAGE_TTL_SECONDS = 300
 
 async def create_temp_db_backup():
     fd, temp_path = tempfile.mkstemp(prefix="alche_backup_", suffix=".db")
