@@ -15,6 +15,7 @@ import json
 import zipfile
 import shutil
 import re
+import random
 import tempfile
 from pathlib import Path
 
@@ -602,7 +603,7 @@ def vip_recommended_settings_text(user_id=None):
     )
 
 
-ALCHE_BUILD_VERSION = 'V18-TRADE-NOTIFY-PNL-FIXED'
+ALCHE_BUILD_VERSION = 'V8-MNSR-RANDOM-PUBLIC-TRADE-REPLIES'
 PUBLIC_CHANNEL_ID = getattr(__import__('config'), 'PUBLIC_CHANNEL_ID', '')
 VIP_JOIN_URL = getattr(__import__('config'), 'VIP_JOIN_URL', '')
 
@@ -1135,18 +1136,43 @@ def send_telegram(message):
         if r.status_code != 200:
             payload.pop("parse_mode", None)
             requests.post(url, json=payload, timeout=5)
-    except Exception: pass
+            return None
+        try:
+            data = r.json()
+            return (data.get("result") or {}).get("message_id")
+        except Exception:
+            return None
+    except Exception:
+        return None
 
-def send_user_telegram(user_id, message):
+def send_user_telegram(user_id, message, reply_to_message_id=None):
     target = TELEGRAM_CHAT_ID if str(user_id) == 'OWNER' else str(user_id)
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
         payload = {"chat_id": target, "text": message, "parse_mode": "HTML"}
+        if reply_to_message_id:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+            payload["allow_sending_without_reply"] = True
         r = requests.post(url, json=payload, timeout=5)
         if r.status_code != 200:
             payload.pop("parse_mode", None)
-            requests.post(url, json=payload, timeout=5)
-    except Exception: pass
+            retry = requests.post(url, json=payload, timeout=5)
+            if retry.status_code != 200:
+                return None
+        try:
+            data = r.json()
+            return (data.get("result") or {}).get("message_id")
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+def _trade_message_id(trade_id):
+    try:
+        rows = db_read("SELECT user_message_id FROM trades WHERE id=?", (int(trade_id),))
+        return int(rows[0][0]) if rows and rows[0][0] else None
+    except Exception:
+        return None
 
 def _trade_qty_notional(trade_id, entry_price, fallback_margin=None, fallback_leverage=None):
     try:
@@ -1943,7 +1969,7 @@ def update_orders_and_positions():
                                         )
                                 n_stat = 'OPEN'
                                 qty_f, notional_f = _trade_qty_notional(t_id, en)
-                                send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN'))
+                                _reply_trade_update(user_id, _trade_message_id(t_id), format_trade_notification('ENTRY FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN'), symbol=sym, side=side)
                             elif real_state == 'CANCELLED':
                                 n_stat = 'CANCELLED'
                                 qty_f, notional_f = _trade_qty_notional(t_id, en)
@@ -1956,7 +1982,7 @@ def update_orders_and_positions():
                                 if has_pos:
                                     n_stat = 'OPEN'
                                     qty_f, notional_f = _trade_qty_notional(t_id, en)
-                                    send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN', reason='Confirmed via live position'))
+                                    _reply_trade_update(user_id, _trade_message_id(t_id), format_trade_notification('ENTRY FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN', reason='Confirmed via live position'), symbol=sym, side=side)
                                 else:
                                     n_stat = 'CANCELLED'
                                     qty_f, notional_f = _trade_qty_notional(t_id, en)
@@ -1967,7 +1993,7 @@ def update_orders_and_positions():
                             n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
                             if n_stat == 'OPEN':
                                 qty_f, notional_f = _trade_qty_notional(t_id, en)
-                                send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN', dry_run=True))
+                                _reply_trade_update(user_id, _trade_message_id(t_id), format_trade_notification('ENTRY FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN', dry_run=True), symbol=sym, side=side)
                             elif n_stat != 'PENDING':
                                 qty_f, notional_f = _trade_qty_notional(t_id, en)
                                 send_user_telegram(user_id, format_trade_notification('LIMIT CANCELLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='CANCELLED', dry_run=True, reason=n_stat))
@@ -2016,7 +2042,7 @@ def update_orders_and_positions():
                                 if c.rowcount:
                                     qty_f, notional_f = _trade_qty_notional(t_id, en)
                                     kind = 'TAKE PROFIT' if 'TP' in new_status else ('STOP LOSS' if 'SL' in new_status else 'POSITION CLOSED')
-                                    send_user_telegram(user_id, format_trade_notification(kind, ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=exit_price, pnl=float(realized or 0.0), status='CLOSED', reason='Exchange position closed'))
+                                    _reply_trade_update(user_id, _trade_message_id(t_id), format_trade_notification(kind, ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=exit_price, pnl=float(realized or 0.0), status='CLOSED', reason='Exchange position closed'), symbol=sym, side=side)
                         else:
                             ticker = tickers_by_ex.get(ex_key, {}).get(sym)
                             curr_price = float(ticker['last']) if ticker and ticker.get('last') else ex.fetch_ticker(sym)['last']
@@ -2025,13 +2051,13 @@ def update_orders_and_positions():
                                 pnl = _gross_trade_pnl(side, en, curr_price, qty_f)
                                 if qty_f > 0: c.execute("UPDATE trades SET qty=?, notional_usd=? WHERE id=? AND (qty IS NULL OR qty<=0)", (qty_f, notional_f, t_id))
                                 c.execute("UPDATE trades SET status='CLOSED (TP)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (TP)' WHERE id=? AND status='OPEN'", (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id))
-                                if c.rowcount: send_user_telegram(user_id, format_trade_notification('TAKE PROFIT', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=curr_price, pnl=pnl, status='CLOSED', dry_run=True)+'\n🚀')
+                                if c.rowcount: _reply_trade_update(user_id, _trade_message_id(t_id), format_trade_notification('TAKE PROFIT', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=curr_price, pnl=pnl, status='CLOSED', dry_run=True)+'\n🚀', symbol=sym, side=side)
                             elif (side == 'BUY' and curr_price <= sl) or (side == 'SELL' and curr_price >= sl):
                                 qty_f, notional_f = _trade_qty_notional(t_id, en)
                                 pnl = _gross_trade_pnl(side, en, curr_price, qty_f)
                                 if qty_f > 0: c.execute("UPDATE trades SET qty=?, notional_usd=? WHERE id=? AND (qty IS NULL OR qty<=0)", (qty_f, notional_f, t_id))
                                 c.execute("UPDATE trades SET status='CLOSED (SL)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (SL)' WHERE id=? AND status='OPEN'", (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id))
-                                if c.rowcount: send_user_telegram(user_id, format_trade_notification('STOP LOSS', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=curr_price, pnl=pnl, status='CLOSED', dry_run=True)+'\n🔻')
+                                if c.rowcount: _reply_trade_update(user_id, _trade_message_id(t_id), format_trade_notification('STOP LOSS', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=curr_price, pnl=pnl, status='CLOSED', dry_run=True)+'\n🔻', symbol=sym, side=side)
                 except Exception as e:
                     send_error_alert(f"Position monitor [{ex_id}:{sym}]: {e}")
             conn.commit()
@@ -2145,8 +2171,8 @@ def runtime_status_keyboard(obj=None):
 # =================================================================
 # PUBLIC CHANNEL
 # =================================================================
-PUBLIC_DAILY_MIN = 1
-PUBLIC_DAILY_MAX = 1000
+PUBLIC_DAILY_MIN = 3
+PUBLIC_DAILY_MAX = 6
 PUBLIC_STATE = {'date': None, 'target': None, 'published': 0, 'signals': []}
 
 def _public_target_path(): return Path("public_signal_target.json")
@@ -2157,9 +2183,9 @@ def _public_get_target(today):
         obj = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
         if obj.get('date') == today:
             target = int(obj.get('target', 0))
-            if target >= PUBLIC_DAILY_MIN: return target
+            if PUBLIC_DAILY_MIN <= target <= PUBLIC_DAILY_MAX: return target
     except Exception: pass
-    target = 1000
+    target = random.randint(PUBLIC_DAILY_MIN, PUBLIC_DAILY_MAX)
     try: path.write_text(json.dumps({'date': today, 'target': target}), encoding='utf-8')
     except Exception: pass
     return target
@@ -2198,6 +2224,19 @@ def _public_record_outcome(signal, status, r):
     signal['status'] = status
     signal['r'] = float(r)
     _public_save_history()
+    mid = signal.get('message_id')
+    if mid and PUBLIC_CHANNEL_ID and bot:
+        try:
+            label = '🟢 TP HIT' if status == 'WIN' else ('🔴 SL HIT' if status == 'LOSS' else '⏳ EXPIRED')
+            asyncio.create_task(bot.send_message(
+                chat_id=PUBLIC_CHANNEL_ID,
+                text=(f"↳ <b>{label}</b>\n"
+                     f"{html.escape(str(signal.get('symbol')))} | {signal.get('side')} | Result: {float(r):+.2f}R"),
+                reply_to_message_id=int(mid),
+                allow_sending_without_reply=True
+            ))
+        except Exception:
+            pass
 
 def _public_crypto_symbol(sym):
     s = str(sym).upper()
@@ -2237,8 +2276,11 @@ def _public_signal_text(n, total, sym, side, ex_id, entry, sl):
 async def publish_public_signal(sym, side, ex_id, entry, sl):
     if not PUBLIC_CHANNEL_ID or not _public_crypto_symbol(sym): return None
     state = _public_reset_if_new_day()
-    if state['published'] >= state['target']: return None
+    if state['published'] >= min(state['target'], PUBLIC_DAILY_MAX): return None
     if not side or float(entry) <= 0 or float(sl) <= 0: return None
+    # Prevent the same pair/direction from being published repeatedly in one day.
+    if any(x.get('symbol') == sym and x.get('side') == side and x.get('date') == state['date'] for x in state['signals']):
+        return None
     n = state['published'] + 1
     text_msg, tp = _public_signal_text(n, state['target'], sym, side, ex_id, entry, sl)
     kwargs = {'chat_id': PUBLIC_CHANNEL_ID, 'text': text_msg}
@@ -2660,21 +2702,23 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         can_open_trade = True
         reason_cant_trade = ""
 
-        # Apply risk limits consistently in DRY RUN and REAL mode.
-        if active_count >= user_max_pos:
-            can_open_trade = False
-            reason_cant_trade = f'Max Posisi CEX ({active_count}/{user_max_pos})'
-        elif today_trades_cex >= max_trades_cex:
-            can_open_trade = False
-            reason_cant_trade = f"Max trade CEX/hari ({today_trades_cex}/{max_trades_cex})"
-        elif CONFIG.get('DAILY_LOSS_LIMIT', True) and today_realized_loss >= float(risk_cfg['max_loss']):
-            can_open_trade = False
-            reason_cant_trade = f"Daily realized loss (${today_realized_loss:.2f}/${float(risk_cfg['max_loss']):.2f})"
-        elif not user_is_owner:
-            user_max_trades = int(get_user_settings(user_id)['max_trades_day'])
-            if today_trades_user >= user_max_trades:
+        # DRY RUN is an independent research simulator. CEX max-position,
+        # max-trade/day and realized-loss limits must NEVER block it.
+        if not dry_run:
+            if active_count >= user_max_pos:
                 can_open_trade = False
-                reason_cant_trade = f"Max trade akun/hari ({today_trades_user}/{user_max_trades})"
+                reason_cant_trade = f'Max Posisi CEX ({active_count}/{user_max_pos})'
+            elif today_trades_cex >= max_trades_cex:
+                can_open_trade = False
+                reason_cant_trade = f"Max trade CEX/hari ({today_trades_cex}/{max_trades_cex})"
+            elif CONFIG.get('DAILY_LOSS_LIMIT', True) and today_realized_loss >= float(risk_cfg['max_loss']):
+                can_open_trade = False
+                reason_cant_trade = f"Daily realized loss (${today_realized_loss:.2f}/${float(risk_cfg['max_loss']):.2f})"
+            elif not user_is_owner:
+                user_max_trades = int(get_user_settings(user_id)['max_trades_day'])
+                if today_trades_user >= user_max_trades:
+                    can_open_trade = False
+                    reason_cant_trade = f"Max trade akun/hari ({today_trades_user}/{user_max_trades})"
         
         news_paused, news_time = is_news_time()
         if news_paused:
@@ -2934,7 +2978,27 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 continue
 
             status_text = 'OPEN' if trade_status == 'OPEN' else 'PENDING LIMIT'
-            send_user_telegram(user_id, format_trade_notification('NEW TRADE', ex_id, sym, sig, entry=en, sl=sl, tp=tp, leverage=lev_to_set, qty=qty, notional=notional, status=status_text, dry_run=dry_run, auto_adjusted=(lev_to_set != lev)))
+            initial_message_id = send_user_telegram(user_id, format_trade_notification('NEW TRADE', ex_id, sym, sig, entry=en, sl=sl, tp=tp, leverage=lev_to_set, qty=qty, notional=notional, status=status_text, dry_run=dry_run, auto_adjusted=(lev_to_set != lev)))
+            if initial_message_id:
+                try:
+                    with DB_LOCK:
+                        conn = sqlite3.connect(DB_FILE, timeout=10)
+                        conn.execute('UPDATE trades SET user_message_id=? WHERE id=?', (int(initial_message_id), int(trade_id)))
+                        conn.commit(); conn.close()
+                except Exception:
+                    pass
+            # Save the public message id when today's public signal matches this trade.
+            try:
+                pub_state = _public_reset_if_new_day()
+                matches = [x for x in pub_state.get('signals', []) if x.get('symbol') == sym and x.get('side') == sig and x.get('message_id')]
+                if matches:
+                    pmid = matches[-1].get('message_id')
+                    with DB_LOCK:
+                        conn = sqlite3.connect(DB_FILE, timeout=10)
+                        conn.execute('UPDATE trades SET public_message_id=? WHERE id=?', (int(pmid), int(trade_id)))
+                        conn.commit(); conn.close()
+            except Exception:
+                pass
             created += 1
             cycle_created_symbols.add(sym)
             runtime['signals'] = runtime.get('signals', 0) + 1
@@ -3295,6 +3359,36 @@ def leverage_value_keyboard(target):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _reply_trade_update(user_id, message_id, text, symbol=None, side=None):
+    """Reply to the original private trade alert and, when available, the public signal."""
+    sent = None
+    if message_id:
+        sent = send_user_telegram(user_id, text, reply_to_message_id=message_id)
+    # Public channel gets the same lifecycle update when today's signal exists.
+    if PUBLIC_CHANNEL_ID and symbol and side:
+        try:
+            state = _public_reset_if_new_day()
+            matches = [x for x in state.get('signals', [])
+                       if x.get('symbol') == symbol and x.get('side') == side and x.get('message_id')]
+            if matches:
+                pmid = matches[-1].get('message_id')
+                bot_loop = MAIN_ASYNC_LOOP
+                if bot_loop and bot_loop.is_running():
+                    label = '🟢 ENTRY FILLED' if 'ENTRY FILLED' in text else ('🟢 TP HIT' if 'TAKE PROFIT' in text else ('🔴 SL HIT' if 'STOP LOSS' in text else 'ℹ️ TRADE UPDATE'))
+                    asyncio.run_coroutine_threadsafe(
+                        bot.send_message(
+                            chat_id=PUBLIC_CHANNEL_ID,
+                            text=f"↳ <b>{label}</b>\n{html.escape(str(symbol))} | {side}",
+                            reply_to_message_id=int(pmid),
+                            allow_sending_without_reply=True
+                        ),
+                        bot_loop
+                    )
+        except Exception:
+            pass
+    return sent
+
+
 def ensure_trade_accounting_columns():
     with DB_LOCK:
         conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -3307,6 +3401,8 @@ def ensure_trade_accounting_columns():
                 ('qty', 'REAL DEFAULT 0'),
                 ('notional_usd', 'REAL DEFAULT 0'),
                 ('closed_at', 'TEXT'),
+                ('user_message_id', 'INTEGER'),
+                ('public_message_id', 'INTEGER'),
             ]
             for name, decl in additions:
                 if name not in cols:
