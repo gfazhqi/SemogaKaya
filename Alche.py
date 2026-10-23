@@ -1499,30 +1499,93 @@ def _pending_price_state(ex_instance, symbol, side, entry, sl, tp):
     except Exception: return 'PENDING'
 
 def _real_exchange_order_state(ex_instance, symbol, order_id):
-    try:
-        if not order_id or str(order_id).startswith("sim_"): return "UNKNOWN"
-        result = ex_instance.fetch_order(str(order_id), symbol)
+    """Resolve real order state with Bybit-aware recovery before declaring UNKNOWN."""
+    oid = str(order_id or "")
+    if not oid or oid.startswith("sim_"):
+        return "UNKNOWN"
+
+    def _normalize(result):
+        if not isinstance(result, dict):
+            return None
         status = str(result.get("status") or "").lower()
         if status in ("closed", "filled"):
-            ORDER_UNKNOWN_COUNT.pop(str(order_id), None); return "FILLED"
+            # Binance: ensure protective SL/TP exists after a filled entry.
+            if str(getattr(ex_instance, 'id', '')).lower() == 'binance' and sl is not None and tp is not None:
+                try:
+                    _binance_attach_protection(ex_instance, symbol, side, sl, tp, amount)
+                except Exception as _protect_err:
+                    send_error_alert(f"Binance SL/TP attach failed for {symbol}: {_protect_err}")
+            return "FILLED"
         if status in ("open", "new", "partially_filled", "partially-filled", "pending"):
-            ORDER_UNKNOWN_COUNT.pop(str(order_id), None); return "PENDING"
+            return "PENDING"
         if status in ("canceled", "cancelled", "expired", "rejected"):
-            ORDER_UNKNOWN_COUNT.pop(str(order_id), None); return "CANCELLED"
-        return "UNKNOWN"
+            return "CANCELLED"
+        return None
+
+    # 1) Normal CCXT lookup.
+    try:
+        state = _normalize(ex_instance.fetch_order(oid, symbol))
+        if state:
+            ORDER_UNKNOWN_COUNT.pop(oid, None)
+            return state
     except ccxt.OrderNotFound:
-        ORDER_UNKNOWN_COUNT.pop(str(order_id), None); return "FILLED_OR_CANCELLED"
+        ORDER_UNKNOWN_COUNT.pop(oid, None)
+        return "FILLED_OR_CANCELLED"
     except Exception as e:
-        err_str = str(e).lower()
-        if "110001" in err_str or "not exists" in err_str or "not found" in err_str or "does not exist" in err_str:
-            ORDER_UNKNOWN_COUNT.pop(str(order_id), None)
+        first_err = str(e).lower()
+        if any(x in first_err for x in (
+            "110001", "not exists", "not found", "does not exist"
+        )):
+            ORDER_UNKNOWN_COUNT.pop(oid, None)
             return "FILLED_OR_CANCELLED"
 
-        cnt = ORDER_UNKNOWN_COUNT.get(str(order_id), 0) + 1
-        ORDER_UNKNOWN_COUNT[str(order_id)] = cnt
-        if cnt == 5:
-            send_error_alert(f"Order {order_id} ({symbol}) UNKNOWN 5x — cek manual di exchange!")
-        return "UNKNOWN"
+    # 2) Bybit recovery: search open orders by exact order ID.
+    ex_id = str(getattr(ex_instance, "id", "") or "").lower()
+    if ex_id == "bybit":
+        try:
+            open_orders = ex_instance.fetch_open_orders(symbol)
+            for row in open_orders or []:
+                if str(row.get("id") or "") == oid:
+                    state = _normalize(row)
+                    if state:
+                        ORDER_UNKNOWN_COUNT.pop(oid, None)
+                        return state
+        except Exception:
+            pass
+
+        # 3) Bybit recovery: inspect recent closed/cancelled orders.
+        try:
+            closed_orders = ex_instance.fetch_closed_orders(symbol)
+            for row in closed_orders or []:
+                if str(row.get("id") or "") == oid:
+                    state = _normalize(row)
+                    if state:
+                        ORDER_UNKNOWN_COUNT.pop(oid, None)
+                        return state
+        except Exception:
+            pass
+
+        # 4) Some CCXT/Bybit versions expose fetch_orders() more reliably.
+        try:
+            all_orders = ex_instance.fetch_orders(symbol, limit=100)
+            for row in all_orders or []:
+                if str(row.get("id") or "") == oid:
+                    state = _normalize(row)
+                    if state:
+                        ORDER_UNKNOWN_COUNT.pop(oid, None)
+                        return state
+        except Exception:
+            pass
+
+    # 5) Only after recovery attempts failed, count UNKNOWN.
+    cnt = ORDER_UNKNOWN_COUNT.get(oid, 0) + 1
+    ORDER_UNKNOWN_COUNT[oid] = cnt
+    if cnt == 5:
+        send_error_alert(
+            f"Order {oid} ({symbol}) UNKNOWN 5x — "
+            f"cek manual di exchange!"
+        )
+    return "UNKNOWN"
 
 
 
@@ -2230,6 +2293,91 @@ def _build_sl_tp_params(ex_id, sl, tp):
         params['oneWayMode'] = True
         params['hedged'] = False
     return params
+
+
+def _binance_attach_protection(ex_instance, symbol, side, sl, tp, amount=None):
+    """Attach and verify Binance futures SL/TP after an entry is filled."""
+    last_error = None
+    for attempt in range(3):
+        try:
+            # Prefer native CCXT unified params first.
+            params = _build_sl_tp_params('binance', sl, tp)
+            position_side = 'SELL' if str(side).lower() == 'buy' else 'BUY'
+            qty = float(amount or 0)
+
+            # Binance Futures supports separate STOP_MARKET / TAKE_PROFIT_MARKET
+            # protective orders. These are reduce-only/close-position orders.
+            if qty > 0:
+                ex_instance.create_order(
+                    symbol, 'STOP_MARKET', position_side, qty, None,
+                    {
+                        'stopPrice': float(sl),
+                        'reduceOnly': True,
+                        'workingType': 'MARK_PRICE',
+                    }
+                )
+                ex_instance.create_order(
+                    symbol, 'TAKE_PROFIT_MARKET', position_side, qty, None,
+                    {
+                        'stopPrice': float(tp),
+                        'reduceOnly': True,
+                        'workingType': 'MARK_PRICE',
+                    }
+                )
+            else:
+                ex_instance.create_order(
+                    symbol, 'STOP_MARKET', position_side, None, None,
+                    {
+                        'stopPrice': float(sl),
+                        'closePosition': True,
+                        'workingType': 'MARK_PRICE',
+                    }
+                )
+                ex_instance.create_order(
+                    symbol, 'TAKE_PROFIT_MARKET', position_side, None, None,
+                    {
+                        'stopPrice': float(tp),
+                        'closePosition': True,
+                        'workingType': 'MARK_PRICE',
+                    }
+                )
+
+            # Verification: protective orders must be visible on the exchange.
+            try:
+                open_orders = ex_instance.fetch_open_orders(symbol)
+                stop_ok = False
+                tp_ok = False
+                for o in open_orders or []:
+                    typ = str(o.get('type') or '').upper()
+                    info = o.get('info') or {}
+                    raw_type = str(info.get('type') or typ).upper()
+                    stop_price = info.get('stopPrice') or info.get('price')
+                    try:
+                        stop_price = float(stop_price) if stop_price is not None else None
+                    except Exception:
+                        stop_price = None
+
+                    if raw_type in ('STOP_MARKET', 'STOP', 'STOP_LOSS'):
+                        if stop_price is None or abs(stop_price - float(sl)) <= max(abs(float(sl))*0.0005, 1e-12):
+                            stop_ok = True
+                    if raw_type in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_LIMIT'):
+                        if stop_price is None or abs(stop_price - float(tp)) <= max(abs(float(tp))*0.0005, 1e-12):
+                            tp_ok = True
+
+                if stop_ok and tp_ok:
+                    return True
+                last_error = RuntimeError(
+                    f"Binance SL/TP verification failed: SL={stop_ok}, TP={tp_ok}"
+                )
+            except Exception as verify_err:
+                last_error = verify_err
+
+        except Exception as e:
+            last_error = e
+
+        time.sleep(1.5)
+
+    raise RuntimeError(f"Binance protective SL/TP failed after 3 attempts: {last_error}")
 
 def _reserve_active_trade(user_id, ex_id, symbol, side, entry, sl, tp, qty, notional):
     """Atomic DB reservation so concurrent scanner workers cannot double-submit."""
