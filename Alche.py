@@ -80,6 +80,9 @@ def _count_today_trades(user_id, ex_id=None):
 def _exchange_key(user_id, ex_id):
     return f"{str(user_id)}::{ex_id}"
 
+# Persistent in-memory news calendar cache. Must exist before scanner calls is_news_time().
+NEWS_CACHE = {'last_fetch': 0.0, 'events': []}
+
 def _fetch_news_calendar():
     now = time.time()
     if now - NEWS_CACHE['last_fetch'] < 3600 and NEWS_CACHE['events']: return
@@ -101,6 +104,17 @@ def _fetch_news_calendar():
             NEWS_CACHE['events'] = events
             NEWS_CACHE['last_fetch'] = now
     except Exception: pass
+
+def _git_worktree_blob(filename="Alche.py"):
+    """Return the Git blob SHA for the actual local working-tree file."""
+    try:
+        path = Path(__file__).resolve().parent / filename
+        if not path.is_file():
+            return None
+        r = _run_git("hash-object", str(path))
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
 
 def _git_remote_head():
     r = _run_git("rev-parse", f"origin/{AUTO_UPDATE_BRANCH}")
@@ -936,7 +950,7 @@ def _apply_approved_update():
 
     expected_sha = _file_sha256(target)
     _mark_update_pending_restart(
-        previous_blob=_git_file_blob("HEAD", "Alche.py"),
+        previous_blob=_git_worktree_blob("Alche.py"),
         new_blob=remote_blob,
         backup_name=backup.name
     )
@@ -965,7 +979,7 @@ def auto_update_once():
             print(f"[AUTO-UPDATE] manual check fetch failed: {fetch.stderr.strip()}")
             return False
 
-        current_blob = _git_file_blob("HEAD", "Alche.py")
+        current_blob = _git_worktree_blob("Alche.py")
         remote_blob = _git_file_blob(f"origin/{AUTO_UPDATE_BRANCH}", "Alche.py")
 
         if not current_blob or not remote_blob:
@@ -1001,7 +1015,7 @@ async def auto_update_monitor():
                         + (fetch.stderr.strip() or "git fetch failed")
                     )
                 else:
-                    current_blob = _git_file_blob("HEAD", "Alche.py")
+                    current_blob = _git_worktree_blob("Alche.py")
                     remote_blob = _git_file_blob(
                         f"origin/{AUTO_UPDATE_BRANCH}", "Alche.py"
                     )
