@@ -285,7 +285,9 @@ async def notify_owner_update_available():
         msg = _auto_update_status_text()
         if not msg:
             return False
-        owner_chat = globals().get("OWNER_CHAT_ID") or globals().get("OWNER_ID")
+        # Owner chat is the configured TELEGRAM_CHAT_ID used everywhere else
+        # in this bot. OWNER_CHAT_ID / OWNER_ID were never guaranteed to exist.
+        owner_chat = str(TELEGRAM_CHAT_ID)
         if owner_chat and "bot" in globals():
             await bot.send_message(
                 owner_chat,
@@ -293,6 +295,7 @@ async def notify_owner_update_available():
                 reply_markup=auto_update_keyboard()
             )
             return True
+        print("[AUTO-UPDATE] TELEGRAM_CHAT_ID is empty")
     except Exception as exc:
         print(f"[AUTO-UPDATE] owner notification failed: {exc}")
     return False
@@ -367,40 +370,47 @@ async def auto_update_monitor():
     """Reliable async GitHub monitor. Detects once, then notifies Owner."""
     global AUTO_UPDATE_LAST_REMOTE, AUTO_UPDATE_NOTIFICATION_SENT
 
+    first_check = True
     while True:
         try:
             if AUTO_UPDATE_ENABLED:
                 root = Path(__file__).resolve().parent
 
-                if not (AUTO_UPDATE_REQUIRE_CLEAN_GIT and not _git_clean()):
-                    fetch = _run_git("fetch", "origin", AUTO_UPDATE_BRANCH, "--prune")
-                    if fetch.returncode == 0:
-                        current = _git_head()
-                        remote = _git_remote_head()
+                # Detection is allowed even when runtime files make the worktree
+                # dirty. The clean-tree guard is enforced only at APPLY time.
+                fetch = _run_git("fetch", "origin", AUTO_UPDATE_BRANCH, "--prune")
+                if fetch.returncode == 0:
+                    current = _git_head()
+                    remote = _git_remote_head()
 
-                        if current and remote and current != remote:
-                            if AUTO_UPDATE_LAST_REMOTE != remote:
-                                AUTO_UPDATE_LAST_REMOTE = remote
-                                AUTO_UPDATE_NOTIFICATION_SENT = False
+                    if current and remote and current != remote:
+                        if AUTO_UPDATE_LAST_REMOTE != remote:
+                            AUTO_UPDATE_LAST_REMOTE = remote
+                            AUTO_UPDATE_NOTIFICATION_SENT = False
 
-                            if not AUTO_UPDATE_NOTIFICATION_SENT:
-                                request_auto_update_approval(current, remote)
-                                sent = await notify_owner_update_available()
-                                if sent:
-                                    AUTO_UPDATE_NOTIFICATION_SENT = True
-                                    print(
-                                        f"[AUTO-UPDATE] notification sent: "
-                                        f"{current[:12]} -> {remote[:12]}"
-                                    )
-                                else:
-                                    print(
-                                        "[AUTO-UPDATE] update detected but Owner notification "
-                                        "could not be sent"
-                                    )
+                        if not AUTO_UPDATE_NOTIFICATION_SENT:
+                            request_auto_update_approval(current, remote)
+                            sent = await notify_owner_update_available()
+                            if sent:
+                                AUTO_UPDATE_NOTIFICATION_SENT = True
+                                print(
+                                    f"[AUTO-UPDATE] notification sent: "
+                                    f"{current[:12]} -> {remote[:12]}"
+                                )
+                            else:
+                                print(
+                                    "[AUTO-UPDATE] update detected but Owner notification "
+                                    "could not be sent"
+                                )
         except Exception as exc:
             print(f"[AUTO-UPDATE] monitor error: {exc}")
 
-        await asyncio.sleep(AUTO_UPDATE_CHECK_SECONDS)
+        # Check immediately on startup, then every 5 minutes.
+        if first_check:
+            first_check = False
+            await asyncio.sleep(1)
+        else:
+            await asyncio.sleep(AUTO_UPDATE_CHECK_SECONDS)
 
 def auto_update_once():
     """Detect a new revision and request owner approval; never auto-restart."""
@@ -429,7 +439,7 @@ def auto_update_once():
     msg = request_auto_update_approval(current, remote)
     print(f"[AUTO-UPDATE] approval required: {current[:12]} -> {remote[:12]}")
     try:
-        loop = globals().get("BOT_LOOP")
+        loop = globals().get("MAIN_ASYNC_LOOP")
         if loop and loop.is_running():
             asyncio.run_coroutine_threadsafe(
                 notify_owner_update_available(),
@@ -767,12 +777,10 @@ def _split_exchange_key(key):
 
 def reload_exchanges():
     global exchanges, EXCHANGE_MARKETS, EXCHANGE_SCAN_NEXT, EXCHANGE_LAST_CANDLE, EXCHANGE_SCAN_CURSOR, EXCHANGE_REQUEST_NEXT
-
     rows = db_read(
         "SELECT user_id, ex_id, api_key, secret, enabled, password "
         "FROM user_cex_settings"
     )
-
     EXCHANGE_SCAN_CURSOR = {}
     EXCHANGE_REQUEST_NEXT = {}
     exchanges.clear()
@@ -780,13 +788,9 @@ def reload_exchanges():
     EXCHANGE_SCAN_NEXT.clear()
     EXCHANGE_LAST_CANDLE.clear()
 
-    configured_owner = set()
-
     for user_id, ex_id, api, sec, en, password in rows:
         if ex_id not in DEFAULT_CEX or en != 1:
-            # DRY RUN owner CEX does not require the private CEX toggle.
-            if not (str(user_id) == 'OWNER' and ex_id in DEFAULT_CEX and get_owner_dry_run(ex_id)):
-                continue
+            continue
 
         user_is_owner = str(user_id) == 'OWNER'
         if not user_is_owner:
@@ -800,15 +804,14 @@ def reload_exchanges():
                 continue
 
         dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
-
         base_params = {
             'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
             'enableRateLimit': True,
-            'timeout': 10000
+            'timeout': 8000
         }
         if ex_id == 'bingx':
             base_params['rateLimit'] = 350
-        if ex_id == 'bitget' and not dry_run:
+        if ex_id == 'bitget':
             base_params['password'] = password or ''
 
         try:
@@ -816,12 +819,10 @@ def reload_exchanges():
             params.update({'apiKey': api or '', 'secret': sec or ''})
             ex = getattr(ccxt, ex_id)(params)
             ex.load_markets()
-        except Exception as private_exc:
+        except Exception as auth_exc:
             if not (user_is_owner and dry_run):
-                send_error_alert(f"Load Ex [{ex_id}] user={user_id}: {private_exc}")
+                send_error_alert(f"Load Ex [{ex_id}] user={user_id}: {auth_exc}")
                 continue
-
-            # Research mode uses only public market endpoints.
             try:
                 public_params = dict(base_params)
                 public_params.pop('password', None)
@@ -829,62 +830,20 @@ def reload_exchanges():
                 public_params['secret'] = ''
                 ex = getattr(ccxt, ex_id)(public_params)
                 ex.load_markets()
-            except Exception as public_exc:
-                send_error_alert(
-                    f"Load Public Ex [{ex_id}] user={user_id}: {public_exc}"
+                send_telegram(
+                    f"🧪 <b>DRY RUN PUBLIC SCANNER</b>\n"
+                    f"{ex_id.upper()}: private API gagal, scanner memakai market data publik."
                 )
+            except Exception as public_exc:
+                send_error_alert(f"Load Public Ex [{ex_id}] user={user_id}: {public_exc}")
                 continue
 
         key = _exchange_key(user_id, ex_id)
         exchanges[key] = ex
         EXCHANGE_MARKETS[key] = ex.markets
 
-        if user_is_owner:
-            configured_owner.add(ex_id)
-
-    # HARD GUARANTEE:
-    # DRY RUN is a research engine and must have public market sources even
-    # when the user has never enabled private API trading for that CEX.
-    for ex_id in DEFAULT_CEX:
-        if not get_owner_dry_run(ex_id):
-            continue
-        key = _exchange_key('OWNER', ex_id)
-        if key in exchanges:
-            continue
-
-        try:
-            params = {
-                'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
-                'enableRateLimit': True,
-                'timeout': 10000,
-            }
-            if ex_id == 'bingx':
-                params['rateLimit'] = 350
-
-            ex = getattr(ccxt, ex_id)(params)
-            ex.load_markets()
-            exchanges[key] = ex
-            EXCHANGE_MARKETS[key] = ex.markets
-            configured_owner.add(ex_id)
-        except Exception as exc:
-            send_error_alert(
-                f"DRY RUN public CEX init gagal {ex_id.upper()}: {exc}"
-            )
-
     for stale in [k for k in list(EXCHANGE_RUNTIME) if k not in exchanges]:
         EXCHANGE_RUNTIME.pop(stale, None)
-
-    for key in exchanges:
-        EXCHANGE_RUNTIME.setdefault(
-            key,
-            {
-                'state': 'IDLE',
-                'last_scan': '-',
-                'last_reason': 'Menunggu scanner...',
-                'signals': 0,
-                'created': 0
-            }
-        )
 
 
 def update_db_setting(key, value):
@@ -1641,8 +1600,7 @@ def build_runtime_status_text(user_id='OWNER'):
             icon = '🟢' if state == 'SCANNING' else ('⚠️' if state == 'ERROR' else '⏸')
             last = st.get('last_scan', '-')
             reason = st.get('last_reason', '')
-            mode_label = '🧪 DRY 24/7' if str(user_id) == 'OWNER' and get_owner_dry_run(ex_id) else ('💰 REAL / KILL-ZONE' if str(user_id) == 'OWNER' else '')
-            line = f"• {ex_id.upper()}: {icon} {state} | {mode_label} | Last: {last}"
+            line = f"• {ex_id.upper()}: {icon} {state} | Last: {last}"
             if reason: line += f"\n  ↳ {html.escape(reason[:140])}"
             lines.append(line)
     else:
@@ -4485,20 +4443,11 @@ def main_loop():
     global daily_sl_count, IS_BOT_PAUSED
     last_hb = time.time()
     last_reset_day = None
-    last_scanner_notice = 0.0
-
-    send_telegram(
-        "🚀 <b>ALCHEMIST v2 INITIALIZED</b>\n"
-        "🟢 Trading engine siap.\n"
-        "🧪 DRY RUN research scanner: <b>24/7</b>\n"
-        "💰 REAL scanner: <b>kill zone only</b>."
-    )
-
+    send_telegram("🚀 <b>ALCHEMIST v2 INITIALIZED</b>\n🟢 Trading engine siap. Menunggu kondisi scan.")
     while True:
         try:
             now = datetime.now(WIB)
             today_str = now.date().isoformat()
-
             if last_reset_day != today_str:
                 was_new_day = last_reset_day is not None
                 last_reset_day = today_str
@@ -4506,77 +4455,39 @@ def main_loop():
                 if was_new_day and IS_BOT_PAUSED:
                     IS_BOT_PAUSED = False
                     send_telegram("🌅 <b>NEW DAY RESET (WIB)</b>\nBot otomatis kembali aktif.")
-
             if time.time() - last_hb >= 21600:
-                dry_count = sum(1 for ex_id in DEFAULT_CEX if get_owner_dry_run(ex_id))
                 send_telegram(
                     "💓 <b>SYSTEM PING</b>\n"
                     f"Bot: {'⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'}\n"
-                    f"DRY RUN CEX: {dry_count}/{len(DEFAULT_CEX)}\n"
-                    f"CEX runtime: {len(exchanges)}"
+                    f"Mode: {'🧪 DRY RUN' if CONFIG['DRY_RUN'] else '⚠️ REAL MONEY'}\n"
+                    f"CEX aktif: {len(exchanges)}"
                 )
                 last_hb = time.time()
-
             check_and_update_daily_sl()
             _submit_async(_public_cycle())
-
-            if now.hour == 7 and now.minute == 0 and now.second < 15 and now.weekday() == 6:
-                _submit_async(_public_weekly_report())
-
+            if now.hour == 7 and now.minute == 0 and now.second < 15:
+                if now.weekday() == 6:
+                    _submit_async(_public_weekly_report())
             if IS_BOT_PAUSED:
-                notify_runtime_status(
-                    'PAUSED',
-                    "⏸️ <b>TRADING PAUSED</b>\n"
-                    "Pembukaan trade baru dihentikan. Monitoring posisi tetap berjalan."
-                )
-            elif not exchanges:
-                # A dry-run runtime is expected to exist even outside kill zone.
-                notify_runtime_status(
-                    'NO_CEX',
-                    "⚠️ <b>DRY RUN SCANNER BELUM AKTIF</b>\n"
-                    "Tidak ada market-data CEX di runtime. "
-                    "Reload public CEX sedang diperlukan."
-                )
-                # Self-heal once per minute rather than every 5 seconds.
-                if time.time() - last_scanner_notice >= 60:
-                    try:
-                        reload_exchanges()
-                    except Exception as exc:
-                        send_error_alert(f"Dry-run CEX reload gagal: {exc}")
-                    last_scanner_notice = time.time()
+                notify_runtime_status('PAUSED', "⏸️ <b>TRADING PAUSED</b>\nPembukaan trade baru dihentikan. Monitoring posisi tetap berjalan.")
+            elif is_kill_zone():
+                if not exchanges:
+                    notify_runtime_status('NO_CEX', "⚠️ <b>SCAN TIDAK BERJALAN</b>\nTidak ada CEX yang sedang ON. Aktifkan CEX setelah API valid.")
+                else:
+                    notify_runtime_status('SCANNING', "🔎 <b>SCANNING MARKET</b>\nBot sedang mencari setup sesuai logic SMC yang ada.")
+                    scan_markets()
+                    set_runtime_event('Scanning selesai / menunggu candle berikutnya')
             else:
-                # IMPORTANT:
-                # Do NOT gate scan_markets() globally by kill-zone.
-                # _scan_one_exchange() decides per CEX:
-                #   DRY RUN -> 24/7
-                #   REAL    -> kill-zone only
-                if time.time() - last_scanner_notice >= 60:
-                    dry_names = [x.upper() for x in DEFAULT_CEX if get_owner_dry_run(x)]
-                    real_names = [x.upper() for x in DEFAULT_CEX if not get_owner_dry_run(x)]
-                    notify_runtime_status(
-                        'SCANNING',
-                        "🔎 <b>SCANNING MARKET</b>\n"
-                        f"🧪 DRY RUN 24/7: {', '.join(dry_names) or '-'}\n"
-                        f"💰 REAL kill-zone: {', '.join(real_names) or '-'}"
-                    )
-                    last_scanner_notice = time.time()
-
-                scan_markets()
-                set_runtime_event(
-                    "🧪 DRY RUN scanning 24/7 | "
-                    f"REAL kill zone={'ON' if is_kill_zone() else 'OFF'}"
-                )
-
+                notify_runtime_status('WAITING', "⏹️ <b>STOP TRADE / WAITING</b>\nDi luar kill zone. Bot tidak membuka trade baru dan menunggu sesi berikutnya.")
         except Exception as e:
             send_error_alert(str(e))
-
-        time.sleep(5)
+        time.sleep(5) # FIX: Sleep lebih cepat (5 detik)
 
 async def app_main():
     global MAIN_ASYNC_LOOP
     MAIN_ASYNC_LOOP = asyncio.get_running_loop()
     asyncio.create_task(auto_update_monitor(), name='github-update-monitor')
-    init_db(); load_settings(); _refresh_owner_pair_state_from_db(); refresh_owner_eligible_pairs(); reload_exchanges(); set_runtime_event(f'DRY RUN public scanners: {sum(1 for x in DEFAULT_CEX if get_owner_dry_run(x))}/{len(DEFAULT_CEX)} CEX initialized')
+    init_db(); load_settings(); _refresh_owner_pair_state_from_db(); refresh_owner_eligible_pairs(); reload_exchanges()
     
     # Start Fast Monitor Thread (3 detik)
     threading.Thread(target=fast_trade_monitor, name='fast-monitor', daemon=True).start()
