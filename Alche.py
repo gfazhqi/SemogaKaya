@@ -27,6 +27,12 @@ from aiogram.exceptions import TelegramBadRequest
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, jsonify
 
+# Custom CEX UI warning text
+CUSTOMIZE_WARNING_TEXT = (
+    "⚠️ <b>PER-CEX SETTING</b>: perubahan hanya berlaku untuk CEX yang dipilih. "
+    "Pastikan nilai sesuai akun dan risiko yang digunakan."
+)
+
 # =================================================================
 # CONFIGURATION & PARAMETERS
 # =================================================================
