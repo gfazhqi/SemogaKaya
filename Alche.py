@@ -403,6 +403,18 @@ def init_db():
                 if col not in _table_columns(conn, 'trades'): c.execute(f'ALTER TABLE trades ADD COLUMN {col} {definition}')
             for col, definition in {'secret': "TEXT DEFAULT ''", 'password': "TEXT DEFAULT ''", 'account_label': "TEXT DEFAULT ''", 'account_info': "TEXT DEFAULT ''"}.items():
                 if col not in _table_columns(conn, 'user_cex_settings'): c.execute(f'ALTER TABLE user_cex_settings ADD COLUMN {col} {definition}')
+            # Migrate legacy cex_risk_settings tables before any Custom CEX button is used.
+            # Older databases may have the table but miss one or more newer columns.
+            for col, definition in {
+                'margin': 'REAL NOT NULL DEFAULT 2.0',
+                'leverage': 'INTEGER NOT NULL DEFAULT 20',
+                'max_pos': 'INTEGER NOT NULL DEFAULT 2',
+                'max_trades_day': 'INTEGER NOT NULL DEFAULT 10',
+                'max_loss': 'REAL NOT NULL DEFAULT 5.0',
+                'updated_at': 'TEXT DEFAULT CURRENT_TIMESTAMP',
+            }.items():
+                if col not in _table_columns(conn, 'cex_risk_settings'):
+                    c.execute(f'ALTER TABLE cex_risk_settings ADD COLUMN {col} {definition}')
             for k,v in {'margin':'2.0','max_pos':'3','dry_run':'1','min_trades':'20','min_wr':'50','daily_loss_limit':'1'}.items(): c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(k,v))
             for ex_id in DEFAULT_CEX:
                 c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'lev_{ex_id}','20'))
@@ -3933,7 +3945,10 @@ async def cb_risk_settings(callback: CallbackQuery):
             await callback.message.answer(text, reply_markup=markup)
 
     except Exception as exc:
-        await safe_answer(callback, "Custom CEX gagal dibuka.", True)
+        # Show a short diagnostic so a DB/schema issue is actionable instead of
+        # looking like a dead Telegram button.
+        msg = str(exc).replace("\n", " ")[:180]
+        await safe_answer(callback, f"Custom CEX gagal dibuka: {msg}", True)
         print(f"[CUSTOM-CEX] open error uid={uid}: {exc}")
 
 @dp.callback_query(F.data.startswith("risk_cex:"))
@@ -3961,7 +3976,8 @@ async def cb_risk_cex(callback: CallbackQuery):
                 return
             await callback.message.answer(text, reply_markup=markup)
     except Exception as exc:
-        await safe_answer(callback, "Gagal membuka setting CEX.", True)
+        msg = str(exc).replace("\n", " ")[:180]
+        await safe_answer(callback, f"Setting CEX gagal: {msg}", True)
         print(f"[CUSTOM-CEX] detail error uid={uid} ex={ex}: {exc}")
 
 @dp.callback_query(F.data.startswith("risk_field:"))
