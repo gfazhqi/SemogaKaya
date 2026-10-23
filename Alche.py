@@ -418,6 +418,41 @@ def _apply_approved_update():
     )
 
 
+def auto_update_once():
+    """One-shot GitHub check. Only updates the pending approval state."""
+    global AUTO_UPDATE_LAST_REMOTE, AUTO_UPDATE_NOTIFICATION_SENT
+
+    if not AUTO_UPDATE_ENABLED:
+        clear_auto_update_pending()
+        return False
+
+    try:
+        fetch = _run_git("fetch", "origin", AUTO_UPDATE_BRANCH, "--prune")
+        if fetch.returncode != 0:
+            print(f"[AUTO-UPDATE] manual check fetch failed: {fetch.stderr.strip()}")
+            return False
+
+        current_blob = _git_file_blob("HEAD", "Alche.py")
+        remote_blob = _git_file_blob(f"origin/{AUTO_UPDATE_BRANCH}", "Alche.py")
+
+        if not current_blob or not remote_blob:
+            clear_auto_update_pending()
+            return False
+
+        if current_blob == remote_blob:
+            clear_auto_update_pending()
+            AUTO_UPDATE_LAST_REMOTE = remote_blob
+            AUTO_UPDATE_NOTIFICATION_SENT = False
+            return False
+
+        AUTO_UPDATE_LAST_REMOTE = remote_blob
+        AUTO_UPDATE_NOTIFICATION_SENT = False
+        request_auto_update_approval(current_blob, remote_blob)
+        return True
+    except Exception as exc:
+        print(f"[AUTO-UPDATE] manual check error: {exc}")
+        return False
+
 async def auto_update_monitor():
     """Monitor ONLY the Alche.py blob on GitHub. No git pull/merge/reset."""
     global AUTO_UPDATE_LAST_REMOTE, AUTO_UPDATE_NOTIFICATION_SENT
@@ -426,10 +461,13 @@ async def auto_update_monitor():
     while True:
         try:
             if AUTO_UPDATE_ENABLED:
-                fetch = _run_git(
-                    "fetch", "origin", AUTO_UPDATE_BRANCH, "--prune"
-                )
-                if fetch.returncode == 0:
+                fetch = _run_git("fetch", "origin", AUTO_UPDATE_BRANCH, "--prune")
+                if fetch.returncode != 0:
+                    print(
+                        "[AUTO-UPDATE] GitHub check failed: "
+                        + (fetch.stderr.strip() or "git fetch failed")
+                    )
+                else:
                     current_blob = _git_file_blob("HEAD", "Alche.py")
                     remote_blob = _git_file_blob(
                         f"origin/{AUTO_UPDATE_BRANCH}", "Alche.py"
@@ -441,9 +479,7 @@ async def auto_update_monitor():
                             AUTO_UPDATE_NOTIFICATION_SENT = False
 
                         if not AUTO_UPDATE_NOTIFICATION_SENT:
-                            request_auto_update_approval(
-                                current_blob, remote_blob
-                            )
+                            request_auto_update_approval(current_blob, remote_blob)
                             sent = await notify_owner_update_available()
                             if sent:
                                 AUTO_UPDATE_NOTIFICATION_SENT = True
@@ -3655,15 +3691,17 @@ async def cb_auto_update(callback: CallbackQuery):
         return
 
     if action == "check":
-        auto_update_once()
+        found = auto_update_once()
         msg = _auto_update_status_text()
-        await safe_answer(callback)
+        await safe_answer(callback, "Update ditemukan." if found else "Tidak ada update baru.")
         if msg:
             await callback.message.edit_text(msg, reply_markup=auto_update_keyboard())
         else:
             await callback.message.edit_text(
-                "✅ <b>TIDAK ADA UPDATE BARU</b>",
+                "✅ <b>TIDAK ADA UPDATE BARU</b>\n\n"
+                "Alche.py di GitHub sama dengan versi aktif.",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 CEK LAGI", callback_data="auto_update:check")],
                     [InlineKeyboardButton(text="⬅️ MENU", callback_data="menu")]
                 ])
             )
