@@ -2325,7 +2325,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         # CEK MAX POSISI UNTUK REAL MONEY SAJA
         dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
         
-        active_count = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')", (user_id, ex_id))[0][0]
+        active_count = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN','ENTRY_PENDING')", (user_id, ex_id))[0][0]
         user_max_pos = int(risk_cfg['max_pos'])
         
         today_realized_loss = get_today_realized_loss(user_id, ex_id)
