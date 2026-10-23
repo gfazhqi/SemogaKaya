@@ -643,6 +643,13 @@ ERROR_COOLDOWN = 60
 MANUAL_ALERT_PAIRS = set()
 CORE_PAIRS = ('BTC/USDT', 'ETH/USDT')
 DEFAULT_CEX = {'binance': {'type': 'future'}, 'bingx': {'type': 'swap'}, 'bitget': {'type': 'swap'}, 'bybit': {'type': 'swap'}}
+DEFAULT_CEX_RISK = {
+    'margin': 2.0,
+    'leverage': 20,
+    'max_pos': 2,
+    'max_trades_day': 10,
+    'max_loss': 5.0,
+}
 
 
 PAIR_TIER_MIN_TRADES = 20
