@@ -111,6 +111,14 @@ TRADE_TERMINAL_STATUSES = {
 }
 
 
+
+def _table_columns(conn, table_name):
+    """Return the existing column names for a SQLite table."""
+    if not table_name or not table_name.replace('_', '').isalnum():
+        raise ValueError("Invalid SQLite table name")
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
 def init_db():
     Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
     with DB_LOCK:
