@@ -1,5 +1,3 @@
-import hashlib
-import ast
 import os
 import sys
 import time
@@ -50,13 +48,6 @@ PUBLIC_LAST_WEEKLY_REPORT_DATE = None
 last_runtime_status = 'BOOTING'
 ERROR_HISTORY = []
 ERROR_HISTORY_MAX = 50
-FILE_ONLY_UPDATE_TARGET = "Alche.py"
-AUTO_UPDATE_ENABLED = True
-AUTO_UPDATE_CHECK_SECONDS = 300
-AUTO_UPDATE_BRANCH = "main"
-AUTO_UPDATE_PENDING = None
-AUTO_UPDATE_LAST_REMOTE_SHA = None
-
 LAST_MENU_MESSAGE = {}
 PENDING_API_SETUP = {}
 EXCHANGE_RUNTIME = {}
@@ -70,14 +61,6 @@ EXCHANGE_MARKETS = {}
 EXCHANGE_REQUEST_NEXT = {}
 IS_BOT_PAUSED = False
 daily_sl_count = 0
-# DRY RUN research mode scans 24/7; REAL remains session/kill-zone gated.
-DRY_RUN_BYPASS_SESSION = True
-PAIR_TIER_MIN_TRADES = 20
-PAIR_TIER_S_WR = 70.0
-PAIR_TIER_A_WR = 60.0
-PAIR_TIER_B_WR = 50.0
-PAIR_TIER_MIN_PF = 1.05
-
 SCANNER_MIN_INTERVAL = 15
 BINGX_REQUEST_SPACING = 0.35
 MAX_DAILY_SL = 3
@@ -91,25 +74,45 @@ CONFIG = {'MARGIN_PER_TRADE': 2.0, 'MAX_CONCURRENT_POSITIONS': 2, 'DRY_RUN': Tru
 def _table_columns(conn, table):
     return {row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()}
 
-def _github_raw_file():
-    """Download only Alche.py from GitHub. Never pulls the repository."""
-    repo = os.getenv("ALCHE_GITHUB_REPO", "").strip()
-    branch = os.getenv("ALCHE_GITHUB_BRANCH", AUTO_UPDATE_BRANCH).strip() or "main"
-    if not repo:
-        return None, "ALCHE_GITHUB_REPO is not configured"
-    repo = repo.removeprefix("https://github.com/").removesuffix("/")
-    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{FILE_ONLY_UPDATE_TARGET}"
+FILE_ONLY_UPDATE_TARGET = "Alche.py"
+AUTO_UPDATE_ENABLED = True
+AUTO_UPDATE_CHECK_SECONDS = 300
+AUTO_UPDATE_LAST_REMOTE_SHA = None
+AUTO_UPDATE_PENDING = None
+AUTO_UPDATE_BACKUP_KEEP = 5
+
+def _github_repo_from_git_remote():
     try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        return r.text, url
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True, text=True, timeout=5
+        )
+        remote = (result.stdout or "").strip()
+        if remote.startswith("git@github.com:"):
+            remote = remote.split(":", 1)[1]
+        elif "github.com/" in remote:
+            remote = remote.split("github.com/", 1)[1]
+        return remote.removesuffix(".git").strip("/")
+    except Exception:
+        return ""
+
+def _github_alche_source():
+    repo = _github_repo_from_git_remote()
+    if not repo:
+        return None, "GitHub remote tidak ditemukan"
+    url = f"https://raw.githubusercontent.com/{repo}/main/{FILE_ONLY_UPDATE_TARGET}"
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        return response.text, url
     except Exception as exc:
         return None, str(exc)
 
 def _source_sha(source):
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
-def validate_update_source(source):
+def _validate_alche_source(source):
     try:
         ast.parse(source, filename=FILE_ONLY_UPDATE_TARGET)
         compile(source, FILE_ONLY_UPDATE_TARGET, "exec")
@@ -117,21 +120,29 @@ def validate_update_source(source):
     except Exception as exc:
         return False, str(exc)
 
-def apply_file_only_update(source):
-    """Replace only this source file after syntax validation and backup."""
-    ok, detail = validate_update_source(source)
+def _prune_alche_backups():
+    root = Path(__file__).resolve().parent
+    backups = sorted(root.glob("Alche.py.backup_*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in backups[AUTO_UPDATE_BACKUP_KEEP:]:
+        try:
+            old.unlink()
+        except Exception:
+            pass
+
+def _apply_alche_only(source):
+    ok, detail = _validate_alche_source(source)
     if not ok:
-        return False, f"Validasi Python gagal: {detail}"
+        return False, detail
 
     current = Path(__file__).resolve()
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup = current.with_name(f"{current.name}.backup_{stamp}")
-    temp = current.with_name(f"{current.name}.update_tmp")
-
+    backup = current.with_name(f"Alche.py.backup_{stamp}")
+    temp = current.with_name("Alche.py.update_tmp")
     try:
         shutil.copy2(current, backup)
         temp.write_text(source, encoding="utf-8")
         os.replace(temp, current)
+        _prune_alche_backups()
         return True, str(backup)
     except Exception as exc:
         try:
@@ -140,48 +151,35 @@ def apply_file_only_update(source):
         except Exception:
             pass
         try:
-            if backup.exists():
-                shutil.copy2(backup, current)
+            shutil.copy2(backup, current)
         except Exception:
             pass
         return False, str(exc)
 
 async def file_only_update_monitor():
-    """Detect Alche.py changes immediately, then every 5 minutes."""
     global AUTO_UPDATE_LAST_REMOTE_SHA, AUTO_UPDATE_PENDING
     first = True
-
     while True:
         try:
-            if AUTO_UPDATE_ENABLED:
-                source, info = _github_raw_file()
-                if source:
-                    remote_sha = _source_sha(source)
-                    local_sha = _source_sha(
-                        Path(__file__).read_text(encoding="utf-8")
+            source, info = _github_alche_source()
+            if source:
+                remote_sha = _source_sha(source)
+                local_sha = _source_sha(Path(__file__).read_text(encoding="utf-8"))
+                if remote_sha != local_sha and remote_sha != AUTO_UPDATE_LAST_REMOTE_SHA:
+                    AUTO_UPDATE_LAST_REMOTE_SHA = remote_sha
+                    AUTO_UPDATE_PENDING = {"sha": remote_sha, "source": source}
+                    await bot.send_message(
+                        TELEGRAM_CHAT_ID,
+                        "🔔 <b>UPDATE TERSEDIA</b>\n\n"
+                        "Versi baru <code>Alche.py</code> ditemukan.\n"
+                        "Hanya Alche.py yang akan di-update. config.py + trades.db aman.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="🚀 UPDATE SEKARANG", callback_data="file_update_apply")],
+                            [InlineKeyboardButton(text="⏳ TUNDA", callback_data="file_update_dismiss")]
+                        ])
                     )
-                    if remote_sha != local_sha and remote_sha != AUTO_UPDATE_LAST_REMOTE_SHA:
-                        AUTO_UPDATE_LAST_REMOTE_SHA = remote_sha
-                        AUTO_UPDATE_PENDING = {"sha": remote_sha, "source": source}
-                        await bot.send_message(
-                            TELEGRAM_CHAT_ID,
-                            "🔔 <b>UPDATE TERSEDIA</b>\n\n"
-                            "Versi baru <code>Alche.py</code> ditemukan di GitHub.\n"
-                            "Config dan database lokal tidak disentuh.",
-                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                                [InlineKeyboardButton(
-                                    text="🚀 UPDATE SEKARANG",
-                                    callback_data="file_update_apply"
-                                )],
-                                [InlineKeyboardButton(
-                                    text="⏳ TUNDA",
-                                    callback_data="file_update_dismiss"
-                                )]
-                            ])
-                        )
         except Exception as exc:
-            print(f"[AUTO-UPDATE] monitor error: {exc}")
-
+            print(f"[AUTO-UPDATE] {exc}")
         await asyncio.sleep(1 if first else AUTO_UPDATE_CHECK_SECONDS)
         first = False
 
@@ -812,6 +810,33 @@ def analyze_smc_retrace(df_m15, df_h1, daily_open):
     return sig, en, sl, tp
 
 
+def ensure_one_way_mode(ex, ex_id, symbol):
+    """Ensure the derivatives account uses one-way mode before live orders.
+    Returns (ok, message). Never silently switches to hedge mode.
+    """
+    try:
+        if not getattr(ex, 'has', {}).get('setPositionMode', False):
+            return True, 'setPositionMode unsupported; using exchange default'
+        params = {}
+        if ex_id == 'bitget':
+            params['productType'] = 'USDT-FUTURES'
+        ex.set_position_mode(False, symbol, params)
+        return True, 'one-way mode confirmed/set'
+    except Exception as e:
+        msg = str(e)
+        # Exchanges commonly return a harmless "already in this mode" error.
+        low = msg.lower()
+        harmless = (
+            'no need to change' in low or
+            'already' in low and ('one-way' in low or 'one_way' in low or 'oneway' in low) or
+            'same position mode' in low or
+            '40774' not in low and 'position mode' in low and 'unchanged' in low
+        )
+        if harmless:
+            return True, 'one-way mode already active'
+        return False, msg[:500]
+
+
 def _fetch_last_closed_m15(ex_instance, symbol):
     """Return the latest CLOSED M15 candle."""
     try:
@@ -882,6 +907,29 @@ def _pending_price_state(ex_instance, symbol, side, entry, sl, tp):
         return 'PENDING'
 
 
+def _real_exchange_order_state(ex_instance, symbol, order_id):
+    """Return authoritative exchange order state for REAL orders.
+
+    Never infer a real order fill from candles/ticker price.
+    Returns one of: FILLED, PENDING, CANCELLED, UNKNOWN.
+    """
+    try:
+        if not order_id or str(order_id).startswith("sim_"):
+            return "UNKNOWN"
+        result = ex_instance.fetch_order(str(order_id), symbol)
+        status = str(result.get("status") or "").lower()
+        if status in ("closed", "filled"):
+            return "FILLED"
+        if status in ("open", "new", "partially_filled", "partially-filled", "pending"):
+            return "PENDING"
+        if status in ("canceled", "cancelled", "expired", "rejected"):
+            return "CANCELLED"
+        return "UNKNOWN"
+    except Exception:
+        # An exchange/API error must NEVER be interpreted as a fill.
+        return "UNKNOWN"
+
+
 def update_orders_and_positions():
     """Advance active trades without allowing stale rows to resurrect.
 
@@ -912,23 +960,39 @@ def update_orders_and_positions():
                     tag = " (DRY RUN)" if is_sim else ""
 
                     if status == 'PENDING':
-                        n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
-
-                        if n_stat == 'OPEN':
-                            send_user_telegram(user_id, 
-                                f"🔔 <b>ORDER FILLED{tag}</b> {sym} di {ex_id.upper()}!"
-                            )
-                        elif n_stat != 'PENDING':
-                            if ('CANCEL' in n_stat or 'MISS' in n_stat or 'INV' in n_stat) and not is_sim:
-                                try:
-                                    ex.cancel_order(ord_id, sym)
-                                except Exception:
-                                    pass
-
-                            send_user_telegram(user_id, 
-                                f"⚪ <b>AUTO-CANCEL{tag}</b> {sym}\n"
-                                f"Alasan: {n_stat}"
-                            )
+                        # REAL orders: exchange status is the ONLY authority.
+                        # DRY RUN: keep the existing candle-based simulation.
+                        if not is_sim:
+                            real_state = _real_exchange_order_state(ex, sym, ord_id)
+                            if real_state == 'FILLED':
+                                n_stat = 'OPEN'
+                                send_user_telegram(
+                                    user_id,
+                                    f"🔔 <b>ORDER FILLED — CONFIRMED{tag}</b> {sym} di {ex_id.upper()}!"
+                                )
+                            elif real_state == 'CANCELLED':
+                                n_stat = 'CANCELLED'
+                                send_user_telegram(
+                                    user_id,
+                                    f"⚪ <b>ORDER CANCELLED</b> {sym} di {ex_id.upper()}"
+                                )
+                            else:
+                                # PENDING or UNKNOWN/API error: keep PENDING.
+                                # Never fabricate a fill from price/candles.
+                                n_stat = 'PENDING'
+                        else:
+                            n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
+                            if n_stat == 'OPEN':
+                                send_user_telegram(
+                                    user_id,
+                                    f"🔔 <b>ORDER FILLED (DRY RUN)</b> {sym} di {ex_id.upper()}!"
+                                )
+                            elif n_stat != 'PENDING':
+                                send_user_telegram(
+                                    user_id,
+                                    f"⚪ <b>AUTO-CANCEL (DRY RUN)</b> {sym}\n"
+                                    f"Alasan: {n_stat}"
+                                )
 
                         if n_stat != 'PENDING':
                             # Do not overwrite a concurrent CANCEL ALL.
@@ -1399,13 +1463,103 @@ def _is_retryable_market_error(ex_id, exc):
     )
 
 
-def _valid_usdt_swap_symbols(ex_id, ex):
-    """Return active USDT-settled perpetual symbols only.
+NON_CRYPTO_MARKET_TYPES = {
+    'stock', 'stocks', 'equity', 'equities', 'etf', 'index', 'indices',
+    'forex', 'fiat', 'commodity', 'commodities', 'bond', 'bonds',
+    'tokenized_stock', 'tokenized_equity', 'security', 'securities',
+}
 
-    This intentionally avoids random/expired/non-contract instruments that
-    can appear in fetch_tickers(). The strategy itself remains M15/H1/D1.
+
+def _text_looks_non_crypto(value):
+    text = str(value or '').strip().lower()
+    if not text:
+        return False
+    return any(token in text for token in (
+        'stock', 'equity', 'etf', 'index', 'indices', 'forex', 'fiat',
+        'commodity', 'bond', 'security', 'tokenized stock', 'tokenized equity',
+    ))
+
+
+def _is_crypto_usdt_perpetual_market(ex, sym, market):
+    """Strictly reject non-crypto perpetuals such as tokenized stocks.
+
+    Some CEXs list equity/tokenized-stock perpetuals using the same
+    ``contract + swap + USDT settle`` shape as crypto futures. Therefore the
+    contract/settle check alone is not enough. Prefer CCXT currency metadata,
+    then exchange market metadata, and fail closed when a market is explicitly
+    identified as non-crypto.
     """
-    markets = EXCHANGE_MARKETS.get(ex_id) or getattr(ex, 'markets', {}) or {}
+    base = str(market.get('base', '')).upper()
+    if not base:
+        return False
+
+    # CCXT currency metadata is the strongest generic discriminator.
+    currencies = getattr(ex, 'currencies', None) or {}
+    cur = currencies.get(base) or currencies.get(str(market.get('baseId', '')).upper())
+    if isinstance(cur, dict):
+        ctype = str(cur.get('type', '')).strip().lower()
+        if ctype in NON_CRYPTO_MARKET_TYPES:
+            return False
+        if ctype == 'crypto':
+            return True
+        # Some exchanges expose a crypto flag instead of type.
+        if cur.get('crypto') is True:
+            return True
+        if cur.get('crypto') is False:
+            return False
+
+    info = market.get('info') if isinstance(market.get('info'), dict) else {}
+    metadata_values = [
+        market.get('type'), market.get('category'), market.get('assetType'),
+        market.get('instrumentType'), market.get('contractType'),
+        info.get('type'), info.get('category'), info.get('assetType'),
+        info.get('asset_type'), info.get('instrumentType'),
+        info.get('instrument_type'), info.get('securityType'),
+        info.get('security_type'), info.get('productType'), info.get('product_type'),
+    ]
+    if any(_text_looks_non_crypto(v) for v in metadata_values):
+        return False
+
+    # Explicit legacy/non-crypto symbols seen in old versions must never be
+    # reintroduced into the Owner/VIP scanner.
+    legacy_non_crypto_bases = {
+        'AAPL', 'AMZN', 'AMD', 'COIN', 'CMCSA', 'GOOG', 'GOOGL', 'META',
+        'MSFT', 'NFLX', 'NVDA', 'ORCL', 'TSLA', 'MSTR', 'QQQ', 'SPY',
+        'NDAQ', 'HOOD', 'PLTR', 'INTC', 'BA', 'DIS', 'PYPL', 'UBER',
+    }
+    if base in legacy_non_crypto_bases:
+        return False
+
+    # Fail closed when the exchange exposes currency metadata but this base
+    # currency is unknown. A tokenized stock can otherwise look exactly like a
+    # USDT perpetual to CCXT (contract/swap/USDT) while having no useful type.
+    if currencies and cur is None:
+        return False
+
+    # Extra symbol-level guard for common equity/tokenized-stock instruments.
+    # This is intentionally broader than the legacy list because exchanges may
+    # add new stock perpetuals without tagging them consistently in metadata.
+    non_crypto_bases = {
+        'AAPL','AMZN','AMD','COIN','CMCSA','GOOG','GOOGL','META','MSFT','NFLX',
+        'NVDA','ORCL','TSLA','MSTR','QQQ','SPY','NDAQ','HOOD','PLTR','INTC',
+        'BA','DIS','PYPL','UBER','JPM','BAC','WMT','COST','PEP','KO','XOM',
+        'CVX','PFE','MRK','JNJ','V','MA','CSCO','CRM','ADBE','AVGO','QCOM',
+        'T','VZ','GE','CAT','IBM','ABT','LLY','UNH','NFLX','SHOP','SNOW',
+    }
+    if base in non_crypto_bases:
+        return False
+
+    return True
+
+
+def _valid_usdt_swap_symbols(exchange_key, ex_id, ex):
+    """Return active USDT-settled *crypto* perpetual symbols only.
+
+    Tokenized-stock/equity perpetuals are deliberately excluded even when the
+    exchange exposes them as contract/swap/USDT markets. This is the final
+    scanner gate used by both Owner and VIP.
+    """
+    markets = EXCHANGE_MARKETS.get(exchange_key) or getattr(ex, 'markets', {}) or {}
     symbols = []
 
     for sym, m in markets.items():
@@ -1421,13 +1575,12 @@ def _valid_usdt_swap_symbols(ex_id, ex):
             continue
         if str(m.get('settle', '')).upper() != 'USDT':
             continue
-        # Skip obvious test/expired/legacy instruments.
         if any(x in sym.upper() for x in ('TEST', '1000', 'BULL', 'BEAR')):
+            continue
+        if not _is_crypto_usdt_perpetual_market(ex, sym, m):
             continue
         symbols.append(sym)
 
-    # Core pairs first, then deterministic order. We do not cap by the first
-    # 60 dictionary entries because that made some CEXs effectively invisible.
     core = [s for s in CORE_PAIRS if s in symbols]
     rest = sorted(s for s in symbols if s not in core)
     return core + rest
@@ -1465,8 +1618,17 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
     if now < EXCHANGE_SCAN_NEXT.get(exchange_key, 0):
         return 0
 
+    # Per-account gate: Owner DRY RUN is 24/7 research.
+    # REAL and VIP entries remain kill-zone/session gated.
+    user_is_owner = (str(user_id) == "OWNER")
+    if not (user_is_owner and get_owner_dry_run(ex_id)) and not is_kill_zone():
+        runtime["state"] = "WAITING"
+        runtime["last_reason"] = "Di luar kill zone (REAL/VIP)"
+        EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
+        return 0
+
     try:
-        symbols = _valid_usdt_swap_symbols(ex_id, ex)
+        symbols = _valid_usdt_swap_symbols(exchange_key, ex_id, ex)
         runtime['last_scan'] = datetime.now(WIB).strftime('%H:%M:%S')
         runtime['last_reason'] = f'{len(symbols)} valid USDT perpetual markets'
 
@@ -1501,6 +1663,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             # USDT perpetual pairs to discover future eligible candidates.
             # Turning the Owner filter OFF intentionally removes this VIP pair gate.
             scan_symbols = [sym for sym in scan_symbols if is_pair_owner_eligible(sym)]
+        user_cfg = get_user_settings(user_id) if not user_is_owner else None
         if not user_is_owner and not user_cfg['auto_trade']:
             runtime['last_reason'] = 'VIP Auto Trade OFF'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
@@ -1583,7 +1746,17 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             lev = int(risk_cfg['leverage'])
             margin = float(risk_cfg['margin'])
             dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
-            qty = (margin * lev) / en
+            # Market execution uses the live price for sizing. The retracement
+            # level from analyze_smc_retrace remains the strategy reference
+            # (and is retained for SL/TP calculation/public signal context).
+            try:
+                live_price = float(ex.fetch_ticker(sym).get('last') or en)
+            except Exception:
+                live_price = float(en)
+            if live_price <= 0:
+                runtime['last_reason'] = f'{sym}: invalid live price'
+                continue
+            qty = (margin * lev) / live_price
             mode = "[DRY RUN]" if dry_run else "[REAL TRADE]"
             ord_id = f"sim_{int(time.time()*1000)}"
 
@@ -1593,18 +1766,62 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 except Exception:
                     pass
 
+                ok_mode, mode_msg = ensure_one_way_mode(ex, ex_id, sym)
+                if not ok_mode:
+                    send_error_alert(f"Order Fails {ex_id}/{sym}: One-Way Mode wajib aktif: {mode_msg}")
+                    continue
+
+                order_params = {
+                    'stopLoss': {
+                        'triggerPrice': float(sl),
+                        'stopPrice': float(sl),
+                        'type': 'mark_price',
+                    },
+                    'takeProfit': {
+                        'triggerPrice': float(tp),
+                        'stopPrice': float(tp),
+                        'type': 'mark_price',
+                    },
+                }
+                # Bitget explicitly requires oneWayMode=True when the account
+                # is in one-way position mode. Do not send hedge/tradeSide.
+                if ex_id == 'bitget':
+                    order_params['oneWayMode'] = True
+                    order_params['hedged'] = False
+
+            actual_entry = float(live_price)
+            trade_status = 'OPEN'
+            order_type = 'MARKET'
+
+            if not dry_run:
                 try:
-                    ord_id = str(ex.create_order(
+                    result = ex.create_order(
                         sym,
-                        'limit',
+                        'market',
                         'buy' if sig == 'BUY' else 'sell',
                         qty,
-                        en,
-                        params={
-                            'stopLoss': {'price': sl},
-                            'takeProfit': {'price': tp}
-                        }
-                    )['id'])
+                        None,
+                        params=order_params
+                    )
+                    ord_id = str(result.get('id') or '')
+                    if not ord_id:
+                        raise RuntimeError('Exchange tidak mengembalikan order ID.')
+                    avg = result.get('average')
+                    filled = result.get('filled')
+                    if avg not in (None, '', 0):
+                        actual_entry = float(avg)
+                    elif filled and result.get('cost'):
+                        actual_entry = float(result['cost']) / float(filled)
+
+                    # A MARKET order is considered OPEN only after the exchange
+                    # confirms the entry order is actually closed/filled. If the
+                    # exchange reports it as still open/unknown, keep it PENDING.
+                    exchange_status = str(result.get('status') or '').lower()
+                    if exchange_status in ('closed', 'filled'):
+                        trade_status = 'OPEN'
+                    else:
+                        confirmed = _real_exchange_order_state(ex, sym, ord_id)
+                        trade_status = 'OPEN' if confirmed == 'FILLED' else 'PENDING'
                 except Exception as e:
                     send_error_alert(f"Order Fails {ex_id}/{sym}: {e}")
                     continue
@@ -1615,8 +1832,8 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     "INSERT INTO trades "
                     "(user_id, exchange_id, symbol, order_type, side, entry_price, "
                     "sl_price, tp_price, order_id, status) "
-                    "VALUES (?, ?, ?, 'LIMIT', ?, ?, ?, ?, ?, 'PENDING')",
-                    (user_id, ex_id, sym, sig, en, sl, tp, ord_id)
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (user_id, ex_id, sym, order_type, sig, actual_entry, sl, tp, ord_id, trade_status)
                 )
                 conn.commit()
             finally:
@@ -1626,7 +1843,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 user_id,
                 f"🎯 <b>{mode}</b>\n"
                 f"CEX: {ex_id.upper()} | {sym} | {sig}\n"
-                f"Entry: {en:.5f}"
+                f"Entry: {actual_entry:.5f}"
             )
             try:
                 # Public channel is broadcast-only; this never opens or changes a trade.
@@ -1765,36 +1982,18 @@ def require_owner(obj):
 
 
 def get_owner_eligible_pairs():
-    return sorted(set(OWNER_PAIR_FILTER.get('eligible_pairs') or DEFAULT_OWNER_ELIGIBLE_PAIRS))
-def is_pair_owner_eligible(symbol):
-    return (not OWNER_PAIR_FILTER.get('enabled',True)) or str(symbol).upper() in {p.upper() for p in get_owner_eligible_pairs()}
-def scanner_session_allowed(user_id, ex_id):
-    """DRY RUN research is 24/7; REAL follows the existing kill-zone filter."""
-    if str(user_id) == "OWNER" and get_owner_dry_run(ex_id) and DRY_RUN_BYPASS_SESSION:
-        return True
-    return is_kill_zone()
+    pairs = OWNER_PAIR_FILTER.get('eligible_pairs') or DEFAULT_OWNER_ELIGIBLE_PAIRS
+    return sorted({canonical_pair(x) for x in pairs if is_valid_crypto_pair_for_vip(x)})
 
+def is_pair_owner_eligible(symbol):
+    pair = canonical_pair(symbol)
+    if not is_valid_crypto_pair_for_vip(pair):
+        return False
+    return (not OWNER_PAIR_FILTER.get('enabled', True)) or pair in set(get_owner_eligible_pairs())
 def get_owner_dry_run(ex_id):
     return bool(CONFIG.get('DRY_RUN_CEX',{}).get(ex_id,CONFIG.get('DRY_RUN',True)))
 def set_owner_dry_run(ex_id,value):
     CONFIG.setdefault('DRY_RUN_CEX',{})[ex_id]=bool(value); update_db_setting(f'dry_run_{ex_id}',1.0 if value else 0.0)
-
-def calculate_pair_research_tier(wins, losses, gross_profit=0.0, gross_loss=0.0):
-    total = int(wins) + int(losses)
-    wr = (float(wins) / total * 100.0) if total else 0.0
-    if gross_loss:
-        pf = float(gross_profit) / abs(float(gross_loss))
-    else:
-        pf = float("inf") if gross_profit > 0 else 0.0
-    if total < PAIR_TIER_MIN_TRADES:
-        return "EVALUASI", wr, pf
-    if wr >= PAIR_TIER_S_WR and pf >= PAIR_TIER_MIN_PF:
-        return "S", wr, pf
-    if wr >= PAIR_TIER_A_WR and pf >= PAIR_TIER_MIN_PF:
-        return "A", wr, pf
-    if wr >= PAIR_TIER_B_WR:
-        return "B", wr, pf
-    return "BLACKLIST", wr, pf
 
 def owner_pair_filter_text():
     pairs = get_owner_eligible_pairs()
@@ -1806,10 +2005,28 @@ def owner_pair_filter_text():
         + "\n\n⚠️ Filter ini global. Semua VIP mengikuti daftar pair Owner."
     )
 
+def pair_filter_settings_text():
+    return (
+        "⚙️ <b>PAIR PERFORMANCE FILTER</b>\n\n"
+        f"🎯 Minimum Win Rate: <b>{float(CONFIG.get('MIN_WR', 60.0)):.1f}%</b>\n"
+        f"📊 Minimum Trades: <b>{int(CONFIG.get('MIN_TRADES', 20))}</b>\n\n"
+        "Non-core masuk eligible VIP hanya jika kedua syarat terpenuhi.\n"
+        "BTC/USDT + ETH/USDT tetap CORE."
+    )
+
+def pair_filter_settings_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 MIN WR", callback_data="pair_filter_set:min_wr")],
+        [InlineKeyboardButton(text="📊 MIN TRADES", callback_data="pair_filter_set:min_trades")],
+        [InlineKeyboardButton(text="🔄 REFRESH ELIGIBLE", callback_data="owner_pair_refresh")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="owner_pair_filter")]
+    ])
+
 def owner_pair_filter_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ ATUR KRITERIA", callback_data="pair_filter_settings")],
         [InlineKeyboardButton(text="🟢 FILTER ON/OFF", callback_data="owner_pair_toggle")],
-        [InlineKeyboardButton(text="🔄 DEFAULT PAIRS", callback_data="owner_pair_default")],
+        [InlineKeyboardButton(text="🔄 REFRESH ELIGIBLE", callback_data="owner_pair_refresh")],
         [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
     ])
 
@@ -1877,6 +2094,18 @@ PENDING_VIP_SETTING = {}
 DEFAULT_OWNER_ELIGIBLE_PAIRS = list(CORE_PAIRS)
 OWNER_PAIR_FILTER = {'enabled': True, 'eligible_pairs': list(DEFAULT_OWNER_ELIGIBLE_PAIRS), 'updated_at': None}
 
+def canonical_pair(symbol):
+    """Normalize exchange symbols for Owner/VIP performance matching.
+
+    CCXT perpetual symbols are commonly returned as BTC/USDT:USDT while the
+    bot's CORE_PAIRS and historical records may use BTC/USDT.  Eligibility
+    must compare the same canonical pair, otherwise valid pairs never match.
+    """
+    text = str(symbol or '').strip().upper()
+    if ':' in text:
+        text = text.split(':', 1)[0]
+    return text
+
 def _refresh_owner_pair_state_from_db():
     enabled, pairs = _load_owner_pair_filter_state()
     # Core pair is always present; all non-core eligibility is recalculated
@@ -1889,57 +2118,65 @@ def _refresh_owner_pair_state_from_db():
     )
 
 def _pair_performance_snapshot():
-    """Read Owner performance without discarding legacy result labels.
-
-    Older Alchemist builds used several closed-result spellings (for example
-    CLOSED (TP), TP, WIN, CLOSED (SL), SL and LOSS).  Treat only clear TP/WIN
-    or SL/LOSS results as closed outcomes so old test history remains visible.
-    Pending/open/cancelled orders are never counted.
-    """
+    """Build Owner-only closed-trade performance by canonical crypto pair."""
     out = {}
     rows = db_read(
         "SELECT symbol, status FROM trades WHERE UPPER(COALESCE(user_id,'OWNER'))='OWNER'"
     )
     for sym, stat in rows:
-        sym = normalize_crypto_symbol(sym) if 'normalize_crypto_symbol' in globals() else str(sym).upper()
+        pair = canonical_pair(sym)
+        if not pair or pair in {'', 'N/A'}:
+            continue
         st = str(stat or '').strip().upper()
         is_win = ('TP' in st) or st in {'WIN', 'WON', 'PROFIT', 'CLOSED WIN'}
         is_loss = ('SL' in st) or st in {'LOSS', 'LOSE', 'LOST', 'CLOSED LOSS'}
         if not (is_win or is_loss):
             continue
-        out.setdefault(sym, {'w': 0, 'l': 0})
+        out.setdefault(pair, {'w': 0, 'l': 0})
         if is_win:
-            out[sym]['w'] += 1
+            out[pair]['w'] += 1
         else:
-            out[sym]['l'] += 1
+            out[pair]['l'] += 1
     return out
 
 def refresh_owner_eligible_pairs():
-    """Rebuild the global VIP pair universe from Owner history.
+    """Rebuild VIP eligibility from Owner closed performance.
 
-    BTC/USDT and ETH/USDT are permanent core pairs. Every other pair must
-    meet MIN_TRADES + MIN_WR using Owner's closed trade history. A pair that
-    later falls below either threshold is automatically removed.
+    BTC/USDT and ETH/USDT are permanent core pairs. Every other crypto pair
+    needs MIN_TRADES and MIN_WR. Symbols are canonicalized so BTC/USDT and
+    BTC/USDT:USDT are treated as the same pair.
     """
     enabled = bool(OWNER_PAIR_FILTER.get('enabled', True))
     perf = _pair_performance_snapshot()
-    eligible = set(CORE_PAIRS)
+    eligible = {canonical_pair(x) for x in CORE_PAIRS}
+    # Never let legacy/non-crypto history leak back into the VIP universe.
+    non_crypto_bases = {
+        'AAPL','AMZN','AMD','COIN','CMCSA','GOOG','GOOGL','META','MSFT','NFLX',
+        'NVDA','ORCL','TSLA','MSTR','QQQ','SPY','NDAQ','HOOD','PLTR','INTC',
+        'BA','DIS','PYPL','UBER','JPM','BAC','WMT','COST','PEP','KO','XOM',
+        'CVX','PFE','MRK','JNJ','V','MA','CSCO','CRM','ADBE','AVGO','QCOM',
+        'T','VZ','GE','CAT','IBM','ABT','LLY','SHOP','SNOW',
+    }
+    def _eligible_crypto_history(pair):
+        base = canonical_pair(pair).split('/')[0].upper()
+        return base not in non_crypto_bases and canonical_pair(pair).endswith('/USDT')
+    min_trades = int(CONFIG.get('MIN_TRADES', 20))
+    min_wr = float(CONFIG.get('MIN_WR', 50.0))
 
     if enabled:
-        min_trades = int(CONFIG.get('MIN_TRADES', 20))
-        min_wr = float(CONFIG.get('MIN_WR', 60.0))
         for sym, data in perf.items():
-            sym = str(sym).upper()
-            if sym in CORE_PAIRS:
+            pair = canonical_pair(sym)
+            if not _eligible_crypto_history(pair):
+                continue
+            if pair in eligible:
                 continue
             total = int(data.get('w', 0)) + int(data.get('l', 0))
             wr = (float(data.get('w', 0)) / total * 100.0) if total else 0.0
             if total >= min_trades and wr >= min_wr:
-                eligible.add(sym)
+                eligible.add(pair)
     else:
-        # Filter OFF means VIP may use all symbols the Owner scanner can see.
-        # The core pair still remains explicitly eligible.
-        eligible.update(perf.keys())
+        # Filter OFF means VIP can use all crypto pairs known from Owner history.
+        eligible.update(canonical_pair(x) for x in perf.keys() if _eligible_crypto_history(x))
 
     _save_owner_pair_filter(enabled, eligible)
     OWNER_PAIR_FILTER['eligible_pairs'] = sorted(eligible)
@@ -1947,12 +2184,13 @@ def refresh_owner_eligible_pairs():
     return eligible
 
 def get_owner_eligible_pairs():
-    return sorted(set(str(x).upper() for x in (OWNER_PAIR_FILTER.get('eligible_pairs') or CORE_PAIRS)))
+    return sorted(set(canonical_pair(x) for x in (OWNER_PAIR_FILTER.get('eligible_pairs') or CORE_PAIRS)))
 
 def is_pair_owner_eligible(symbol):
     if not OWNER_PAIR_FILTER.get('enabled', True):
         return True
-    return str(symbol).upper() in set(get_owner_eligible_pairs())
+    return canonical_pair(symbol) in set(get_owner_eligible_pairs())
+
 
 def get_owner_dry_run(ex_id):
     return bool(CONFIG.get('DRY_RUN_CEX', {}).get(ex_id, CONFIG.get('DRY_RUN', True)))
@@ -1985,6 +2223,7 @@ def owner_pair_filter_text():
 
 def owner_pair_filter_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ ATUR KRITERIA", callback_data="pair_filter_settings")],
         [InlineKeyboardButton(text="🟢 FILTER ON/OFF", callback_data="owner_pair_toggle")],
         [InlineKeyboardButton(text="🔄 REFRESH ELIGIBLE", callback_data="owner_pair_refresh")],
         [InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]
@@ -2224,36 +2463,82 @@ def build_stats_text(user_id='OWNER'):
     )
 
 
-def build_pairperf_text():
+def _pairperf_rows():
     rows = db_read(
-        "SELECT symbol, status FROM trades WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')"
+        "SELECT symbol, status FROM trades WHERE user_id='OWNER' "
+        "AND status IN ('CLOSED (TP)', 'CLOSED (SL)')"
     )
     pair_perf = {}
     for sym, stat in rows:
-        pair_perf.setdefault(sym, {'w': 0, 'l': 0})
+        pair = canonical_pair(sym)
+        # Never let legacy/non-crypto symbols enter this performance screen.
+        if not is_valid_crypto_pair_for_vip(pair):
+            continue
+        pair_perf.setdefault(pair, {'w': 0, 'l': 0})
         if 'TP' in stat:
-            pair_perf[sym]['w'] += 1
+            pair_perf[pair]['w'] += 1
         else:
-            pair_perf[sym]['l'] += 1
+            pair_perf[pair]['l'] += 1
 
     active, wait, black = [], [], []
-    for sym, data in pair_perf.items():
+    for sym, data in sorted(pair_perf.items()):
         total = data['w'] + data['l']
         wr = data['w'] / total * 100 if total else 0
         core = sym in CORE_PAIRS
         line = f"• {sym}{' [CORE]' if core else ''}: {data['w']}W/{data['l']}L (WR: {wr:.1f}%)"
-        if total < CONFIG['MIN_TRADES']:
+        if total < int(CONFIG.get('MIN_TRADES', 20)):
             wait.append(line)
-        elif core or wr >= CONFIG['MIN_WR']:
+        elif core or wr >= float(CONFIG.get('MIN_WR', 60.0)):
             active.append(line)
         else:
             black.append(line)
+    return active, wait, black
+
+
+def pairperf_keyboard(page=0, total_pages=1):
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ PREV", callback_data=f"pairperf_page:{page-1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="NEXT ➡️", callback_data=f"pairperf_page:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔄 REFRESH", callback_data=f"pairperf_page:{page}")])
+    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_pairperf_text(page=0, page_size=35):
+    active, wait, black = _pairperf_rows()
+    all_lines = (
+        [("🔥 AKTIF", x) for x in active]
+        + [("⏳ EVALUASI", x) for x in wait]
+        + [("🗑️ BLACKLIST", x) for x in black]
+    )
+    total = len(all_lines)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(int(page), total_pages - 1))
+    chunk = all_lines[page * page_size:(page + 1) * page_size]
+
+    buckets = {"🔥 AKTIF": [], "⏳ EVALUASI": [], "🗑️ BLACKLIST": []}
+    for bucket, line in chunk:
+        buckets[bucket].append(line)
+
+    shown = []
+    for title in ("🔥 AKTIF", "⏳ EVALUASI", "🗑️ BLACKLIST"):
+        if buckets[title]:
+            shown.append(f"<b>{title}</b>\n" + "\n".join(buckets[title]))
+
+    if not shown:
+        shown = ["Belum ada closed trade Owner untuk dinilai."]
 
     return (
         "🏆 <b>PERFORMA KOIN</b>\n\n"
-        "🔥 <b>AKTIF</b>\n" + ("\n".join(active) or "Belum ada") + "\n\n"
-        "⏳ <b>EVALUASI</b>\n" + ("\n".join(wait) or "Belum ada") + "\n\n"
-        "🗑️ <b>BLACKLIST</b>\n" + ("\n".join(black) or "Belum ada")
+        f"📄 Halaman <b>{page + 1}/{total_pages}</b> • Total pair: <b>{total}</b>\n"
+        f"🎯 Filter: ≥ {float(CONFIG.get('MIN_WR', 60.0)):.1f}% WR + "
+        f"≥ {int(CONFIG.get('MIN_TRADES', 20))} trade\n\n"
+        + "\n\n".join(shown)
     )
 
 
@@ -2750,6 +3035,24 @@ async def handle_restore_document(message: Message):
             except Exception: pass
 
 
+@dp.message(Command("runtime"))
+async def cmd_runtime_alias(message: Message):
+    if not is_allowed_chat(message):
+        return
+    await message.answer(build_runtime_status_text(), reply_markup=role_keyboard(message))
+
+@dp.message(Command("cex"))
+async def cmd_cex_alias(message: Message):
+    if not is_allowed_chat(message):
+        return
+    await message.answer(build_cex_status_text(_account_user_id(message.chat.id)), reply_markup=role_keyboard(message))
+
+@dp.message(Command("pairperformance"))
+async def cmd_pairperformance_alias(message: Message):
+    if not is_allowed_chat(message):
+        return
+    await message.answer(build_pairperf_text(), reply_markup=role_keyboard(message))
+
 @dp.message(Command("menu"))
 async def cmd_menu(message: Message):
     await send_main_menu(message, delete_trigger=True)
@@ -2790,7 +3093,6 @@ async def cmd_restore(message: Message):
 async def cmd_settings(message: Message):
     if not require_owner(message):
         return
-        return
     await message.answer(build_settings_text(), reply_markup=role_keyboard(message))
 
 
@@ -2812,7 +3114,6 @@ async def cmd_stat(message: Message):
 async def cmd_pairperf(message: Message):
     if not require_owner(message):
         return
-        return
     await message.answer(build_pairperf_text(), reply_markup=role_keyboard(message))
 
 
@@ -2820,7 +3121,6 @@ async def cmd_pairperf(message: Message):
 async def cmd_pause(message: Message):
     global IS_BOT_PAUSED
     if not require_owner(message):
-        return
         return
     IS_BOT_PAUSED = True
     await message.answer("⏸️ <b>Bot PAUSED</b>", reply_markup=role_keyboard(message))
@@ -2830,7 +3130,6 @@ async def cmd_pause(message: Message):
 async def cmd_resume(message: Message):
     global IS_BOT_PAUSED
     if not require_owner(message):
-        return
         return
     IS_BOT_PAUSED = False
     await message.answer("▶️ <b>Bot RESUMED</b>", reply_markup=role_keyboard(message))
@@ -2847,7 +3146,6 @@ async def cmd_cancelall(message: Message):
 @dp.message(Command("dryrun"))
 async def cmd_dryrun(message: Message):
     if not require_owner(message):
-        return
         return
     parts = (message.text or '').split()
     if len(parts) != 2 or parts[1].lower() not in ('on', 'off'):
@@ -3268,6 +3566,65 @@ async def cb_vip_maxtrades(callback: CallbackQuery):
     await callback.message.edit_text(vip_recommended_settings_text(_chat_id(callback)), reply_markup=vip_settings_keyboard())
 
 
+@dp.callback_query(F.data == "pair_filter_settings")
+async def cb_pair_filter_settings(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        pair_filter_settings_text(),
+        reply_markup=pair_filter_settings_keyboard()
+    )
+
+@dp.callback_query(F.data.startswith("pair_filter_set:"))
+async def cb_pair_filter_set(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    field = callback.data.split(":", 1)[1]
+    if field not in ("min_wr", "min_trades"):
+        await safe_answer(callback, "Field tidak valid.", True)
+        return
+    PENDING_VIP_SETTING[str(callback.message.chat.id)] = {
+        "type": "owner_pair_filter",
+        "field": field
+    }
+    await safe_answer(callback)
+    label = "Minimum WR (%)" if field == "min_wr" else "Minimum Trades"
+    await callback.message.answer(f"✏️ Kirim nilai baru untuk <b>{label}</b>.")
+
+@dp.callback_query(F.data == "file_update_apply")
+async def cb_file_update_apply(callback: CallbackQuery):
+    global AUTO_UPDATE_PENDING
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    pending = AUTO_UPDATE_PENDING
+    if not pending:
+        await safe_answer(callback, "Tidak ada update pending.", True)
+        return
+    ok, detail = _apply_alche_only(pending["source"])
+    if not ok:
+        await safe_answer(callback, "Update gagal.", True)
+        await callback.message.answer(f"❌ <b>UPDATE GAGAL</b>\n<code>{html.escape(str(detail))}</code>")
+        return
+    AUTO_UPDATE_PENDING = None
+    await safe_answer(callback, "Update diterapkan.")
+    await callback.message.answer("✅ <b>UPDATE SIAP</b>\nHanya Alche.py diganti.\nconfig.py + trades.db aman.\nRestart...")
+    await asyncio.sleep(1)
+    os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
+
+@dp.callback_query(F.data == "file_update_dismiss")
+async def cb_file_update_dismiss(callback: CallbackQuery):
+    global AUTO_UPDATE_PENDING
+    if not is_owner(callback):
+        await safe_answer(callback, "Owner saja.", True)
+        return
+    AUTO_UPDATE_PENDING = None
+    await safe_answer(callback, "Update ditunda.")
+    await callback.message.answer("⏳ <b>UPDATE DITUNDA</b>")
+
 @dp.callback_query(F.data == "owner_pair_filter")
 async def cb_owner_pair_filter(callback: CallbackQuery):
     if not is_owner(callback):
@@ -3558,6 +3915,36 @@ async def handle_text(message: Message):
             "Tidak ada manual whitelist/blacklist.\n\n" + owner_pair_filter_text(),
             reply_markup=owner_pair_filter_keyboard()
         )
+        return
+
+    pair_pending = PENDING_VIP_SETTING.get(chat_id)
+    if pair_pending and is_owner(message):
+        value_text = (message.text or "").strip().replace(",", ".")
+        try:
+            if pair_pending["field"] == "min_wr":
+                value = float(value_text)
+                if not 0 <= value <= 100:
+                    raise ValueError("Minimum WR harus 0–100%.")
+                CONFIG["MIN_WR"] = value
+                update_db_setting("min_wr", value)
+            elif pair_pending["field"] == "min_trades":
+                if not value_text.isdigit():
+                    raise ValueError("Minimum Trades harus angka.")
+                value = int(value_text)
+                if not 1 <= value <= 10000:
+                    raise ValueError("Minimum Trades harus 1–10000.")
+                CONFIG["MIN_TRADES"] = value
+                update_db_setting("min_trades", value)
+            else:
+                raise ValueError("Field pair filter tidak valid.")
+            PENDING_VIP_SETTING.pop(chat_id, None)
+            refresh_owner_eligible_pairs()
+            await message.answer(
+                "✅ <b>KRITERIA DIPERBARUI</b>\n\n" + owner_pair_filter_text(),
+                reply_markup=owner_pair_filter_keyboard()
+            )
+        except Exception as exc:
+            await message.answer(f"❌ {html.escape(str(exc))}")
         return
 
     risk_pending = PENDING_RISK_SETTING.get(chat_id)
@@ -3954,7 +4341,29 @@ async def cb_pairperf(callback: CallbackQuery):
         await safe_answer(callback, "Akses Owner saja.", True)
         return
     await safe_answer(callback)
-    await callback.message.edit_text(build_pairperf_text(), reply_markup=role_keyboard(callback))
+    await callback.message.edit_text(
+        build_pairperf_text(0),
+        reply_markup=pairperf_keyboard(0, max(1, (len(_pairperf_rows()[0]) + len(_pairperf_rows()[1]) + len(_pairperf_rows()[2]) + 34) // 35))
+    )
+
+
+@dp.callback_query(F.data.startswith("pairperf_page:"))
+async def cb_pairperf_page(callback: CallbackQuery):
+    if not require_owner(callback):
+        await safe_answer(callback, "Akses Owner saja.", True)
+        return
+    try:
+        page = max(0, int(callback.data.split(":", 1)[1]))
+    except Exception:
+        page = 0
+    total = sum(len(x) for x in _pairperf_rows())
+    total_pages = max(1, (total + 34) // 35)
+    page = min(page, total_pages - 1)
+    await safe_answer(callback)
+    await callback.message.edit_text(
+        build_pairperf_text(page),
+        reply_markup=pairperf_keyboard(page, total_pages)
+    )
 
 
 @dp.callback_query(F.data == "cex_status")
@@ -4573,24 +4982,19 @@ def main_loop():
                     'PAUSED',
                     "⏸️ <b>TRADING PAUSED</b>\nPembukaan trade baru dihentikan. Monitoring posisi tetap berjalan."
                 )
-            elif is_kill_zone():
-                if not exchanges:
-                    notify_runtime_status(
-                        'NO_CEX',
-                        "⚠️ <b>SCAN TIDAK BERJALAN</b>\nTidak ada CEX yang sedang ON. Aktifkan CEX setelah API valid."
-                    )
-                else:
-                    notify_runtime_status(
-                        'SCANNING',
-                        "🔎 <b>SCANNING MARKET</b>\nBot sedang mencari setup sesuai logic SMC yang ada."
-                    )
-                    scan_markets()
-                    set_runtime_event('Scanning selesai / menunggu candle berikutnya')
+            elif not exchanges:
+                notify_runtime_status(
+                    'NO_CEX',
+                    "⚠️ <b>SCAN TIDAK BERJALAN</b>\nTidak ada CEX yang sedang ON/loaded."
+                )
             else:
                 notify_runtime_status(
-                    'WAITING',
-                    "⏹️ <b>STOP TRADE / WAITING</b>\nDi luar kill zone. Bot tidak membuka trade baru dan menunggu sesi berikutnya."
+                    'SCANNING',
+                    "🔎 <b>SCANNING MARKET</b>\n"
+                    "🧪 Owner DRY RUN: 24/7 | 💰 REAL/VIP: mengikuti kill zone."
                 )
+                scan_markets()
+                set_runtime_event('Scanning selesai / menunggu candle berikutnya')
 
         except Exception as e:
             send_error_alert(str(e))
@@ -4609,6 +5013,7 @@ async def app_main():
     # This preserves prior test/performance results instead of showing only CORE pairs until the next scan.
     refresh_owner_eligible_pairs()
     reload_exchanges()
+    asyncio.create_task(file_only_update_monitor(), name='file-only-update-monitor')
 
     # Trading engine runs in a worker thread.
     threading.Thread(
