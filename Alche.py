@@ -1509,12 +1509,6 @@ def _real_exchange_order_state(ex_instance, symbol, order_id):
             return None
         status = str(result.get("status") or "").lower()
         if status in ("closed", "filled"):
-            # Binance: ensure protective SL/TP exists after a filled entry.
-            if str(getattr(ex_instance, 'id', '')).lower() == 'binance' and sl is not None and tp is not None:
-                try:
-                    _binance_attach_protection(ex_instance, symbol, side, sl, tp, amount)
-                except Exception as _protect_err:
-                    send_error_alert(f"Binance SL/TP attach failed for {symbol}: {_protect_err}")
             return "FILLED"
         if status in ("open", "new", "partially_filled", "partially-filled", "pending"):
             return "PENDING"
@@ -1752,6 +1746,16 @@ def update_orders_and_positions():
                         if not is_sim:
                             real_state = _real_exchange_order_state(ex, sym, ord_id)
                             if real_state == 'FILLED':
+                                if ex_id == 'binance':
+                                    try:
+                                        qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                        _binance_attach_protection(ex, sym, side, sl, tp, qty_f)
+                                    except Exception as _protect_err:
+                                        # Do not silently mark the position protected.
+                                        send_error_alert(
+                                            f"Binance SL/TP attach gagal setelah LIMIT FILLED "
+                                            f"{sym}: {_protect_err}"
+                                        )
                                 n_stat = 'OPEN'
                                 qty_f, notional_f = _trade_qty_notional(t_id, en)
                                 send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN'))
@@ -2296,88 +2300,68 @@ def _build_sl_tp_params(ex_id, sl, tp):
 
 
 def _binance_attach_protection(ex_instance, symbol, side, sl, tp, amount=None):
-    """Attach and verify Binance futures SL/TP after an entry is filled."""
+    """Attach Binance Futures protective SL/TP only after entry is filled, then verify."""
     last_error = None
+    qty = float(amount or 0)
+    position_side = 'SELL' if str(side).upper() == 'BUY' else 'BUY'
+
     for attempt in range(3):
         try:
-            # Prefer native CCXT unified params first.
-            params = _build_sl_tp_params('binance', sl, tp)
-            position_side = 'SELL' if str(side).lower() == 'buy' else 'BUY'
-            qty = float(amount or 0)
-
-            # Binance Futures supports separate STOP_MARKET / TAKE_PROFIT_MARKET
-            # protective orders. These are reduce-only/close-position orders.
-            if qty > 0:
+            # Use Binance Futures conditional close orders. closePosition=True
+            # protects the whole currently-open position and avoids opening a
+            # new position if the entry is no longer present.
+            for order_type, trigger in (
+                ('STOP_MARKET', float(sl)),
+                ('TAKE_PROFIT_MARKET', float(tp)),
+            ):
+                params = {
+                    'stopPrice': trigger,
+                    'workingType': 'MARK_PRICE',
+                    'closePosition': True,
+                }
                 ex_instance.create_order(
-                    symbol, 'STOP_MARKET', position_side, qty, None,
-                    {
-                        'stopPrice': float(sl),
-                        'reduceOnly': True,
-                        'workingType': 'MARK_PRICE',
-                    }
-                )
-                ex_instance.create_order(
-                    symbol, 'TAKE_PROFIT_MARKET', position_side, qty, None,
-                    {
-                        'stopPrice': float(tp),
-                        'reduceOnly': True,
-                        'workingType': 'MARK_PRICE',
-                    }
-                )
-            else:
-                ex_instance.create_order(
-                    symbol, 'STOP_MARKET', position_side, None, None,
-                    {
-                        'stopPrice': float(sl),
-                        'closePosition': True,
-                        'workingType': 'MARK_PRICE',
-                    }
-                )
-                ex_instance.create_order(
-                    symbol, 'TAKE_PROFIT_MARKET', position_side, None, None,
-                    {
-                        'stopPrice': float(tp),
-                        'closePosition': True,
-                        'workingType': 'MARK_PRICE',
-                    }
+                    symbol, order_type, position_side, None, None, params
                 )
 
-            # Verification: protective orders must be visible on the exchange.
-            try:
-                open_orders = ex_instance.fetch_open_orders(symbol)
-                stop_ok = False
-                tp_ok = False
-                for o in open_orders or []:
-                    typ = str(o.get('type') or '').upper()
-                    info = o.get('info') or {}
-                    raw_type = str(info.get('type') or typ).upper()
-                    stop_price = info.get('stopPrice') or info.get('price')
-                    try:
-                        stop_price = float(stop_price) if stop_price is not None else None
-                    except Exception:
-                        stop_price = None
+            # Verify that both protective orders are visible.
+            open_orders = ex_instance.fetch_open_orders(symbol)
+            stop_ok = False
+            tp_ok = False
 
-                    if raw_type in ('STOP_MARKET', 'STOP', 'STOP_LOSS'):
-                        if stop_price is None or abs(stop_price - float(sl)) <= max(abs(float(sl))*0.0005, 1e-12):
-                            stop_ok = True
-                    if raw_type in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT', 'TAKE_PROFIT_LIMIT'):
-                        if stop_price is None or abs(stop_price - float(tp)) <= max(abs(float(tp))*0.0005, 1e-12):
-                            tp_ok = True
+            for order in open_orders or []:
+                info = order.get('info') or {}
+                raw_type = str(info.get('type') or order.get('type') or '').upper()
+                raw_stop = info.get('stopPrice')
+                if raw_stop is None:
+                    raw_stop = info.get('triggerPrice')
+                try:
+                    raw_stop = float(raw_stop) if raw_stop is not None else None
+                except Exception:
+                    raw_stop = None
 
-                if stop_ok and tp_ok:
-                    return True
-                last_error = RuntimeError(
-                    f"Binance SL/TP verification failed: SL={stop_ok}, TP={tp_ok}"
-                )
-            except Exception as verify_err:
-                last_error = verify_err
+                if raw_type in ('STOP_MARKET', 'STOP'):
+                    if raw_stop is None or abs(raw_stop - float(sl)) <= max(abs(float(sl)) * 0.0005, 1e-12):
+                        stop_ok = True
+
+                if raw_type in ('TAKE_PROFIT_MARKET', 'TAKE_PROFIT'):
+                    if raw_stop is None or abs(raw_stop - float(tp)) <= max(abs(float(tp)) * 0.0005, 1e-12):
+                        tp_ok = True
+
+            if stop_ok and tp_ok:
+                return True
+
+            last_error = RuntimeError(
+                f"Binance SL/TP verification failed: SL={stop_ok}, TP={tp_ok}"
+            )
 
         except Exception as e:
             last_error = e
 
         time.sleep(1.5)
 
-    raise RuntimeError(f"Binance protective SL/TP failed after 3 attempts: {last_error}")
+    raise RuntimeError(
+        f"Binance protective SL/TP failed after 3 attempts: {last_error}"
+    )
 
 def _reserve_active_trade(user_id, ex_id, symbol, side, entry, sl, tp, qty, notional):
     """Atomic DB reservation so concurrent scanner workers cannot double-submit."""
@@ -2727,6 +2711,20 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                     except Exception: pass
                 exchange_status = str(result.get('status') or '').lower()
                 if exchange_status in ('closed','filled'):
+                    if ex_id == 'binance':
+                        try:
+                            _binance_attach_protection(ex, sym, sig, sl, tp, qty)
+                        except Exception as _protect_err:
+                            try:
+                                ex.cancel_order(ord_id, sym)
+                            except Exception:
+                                pass
+                            _cancel_reserved_trade(trade_id, "BINANCE_SLTP_FAILED")
+                            send_error_alert(
+                                f"Binance SL/TP attach gagal {sym}: {_protect_err}. "
+                                f"Entry dibatalkan/ditandai gagal agar posisi tidak tanpa proteksi."
+                            )
+                            continue
                     trade_status='OPEN'
 
             if not _activate_reserved_trade(trade_id, ord_id, trade_status):
