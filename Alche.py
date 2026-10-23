@@ -27,11 +27,586 @@ from aiogram.exceptions import TelegramBadRequest
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, jsonify
 
+# Custom CEX UI warning text
+CUSTOMIZE_WARNING_TEXT = (
+    "⚠️ <b>PER-CEX SETTING</b>: perubahan hanya berlaku untuk CEX yang dipilih. "
+    "Pastikan nilai sesuai akun dan risiko yang digunakan."
+)
+
 # =================================================================
 # CONFIGURATION & PARAMETERS
 # =================================================================
 from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-ALCHE_BUILD_VERSION = 'V14-FULL-FIXED'
+
+# ===== Restored production dependency layer from complete baseline =====
+def _backup_alche_only():
+    root=Path(__file__).resolve().parent
+    backup_dir=root/AUTO_UPDATE_BACKUP_DIR
+    backup_dir.mkdir(exist_ok=True)
+    stamp=datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup=backup_dir/f"Alche_preupdate_{stamp}.py"
+    backup.write_text(Path(__file__).read_text(encoding="utf-8"),encoding="utf-8")
+    backups=sorted(backup_dir.glob("Alche_preupdate_*.py"),key=lambda p:p.stat().st_mtime,reverse=True)
+    for old in backups[5:]:
+        try: old.unlink()
+        except Exception: pass
+    return backup
+
+def _backup_current_revision():
+    root = Path(__file__).resolve().parent
+    backup_dir = root / AUTO_UPDATE_BACKUP_DIR
+    backup_dir.mkdir(exist_ok=True)
+    head = _git_head() or "unknown"
+    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    backup = backup_dir / f"preupdate_{stamp}_{head[:12]}"
+    backup.mkdir(exist_ok=True)
+    for name in ("*.py", "*.json", "*.yaml", "*.yml"):
+        for src_file in root.glob(name):
+            if src_file.is_file():
+                (backup / src_file.name).write_bytes(src_file.read_bytes())
+    return backup
+
+def _count_today_trades(user_id, ex_id=None):
+    """Count trades created today in WIB."""
+    uid = str(user_id)
+    if ex_id is None:
+        rows = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? "
+            "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
+            (uid,)
+        )
+    else:
+        rows = db_read(
+            "SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? "
+            "AND DATE(created_at, '+7 hours')=DATE('now', '+7 hours')",
+            (uid, str(ex_id).lower())
+        )
+    return int(rows[0][0]) if rows else 0
+
+def _exchange_key(user_id, ex_id):
+    return f"{str(user_id)}::{ex_id}"
+
+# Persistent in-memory news calendar cache. Must exist before scanner calls is_news_time().
+NEWS_CACHE = {'last_fetch': 0.0, 'events': []}
+
+def _fetch_news_calendar():
+    now = time.time()
+    if now - NEWS_CACHE['last_fetch'] < 3600 and NEWS_CACHE['events']: return
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            events = []
+            for item in data:
+                if item.get('impact') == 'High' and item.get('country') == 'USD':
+                    dt_str = item.get('date')
+                    if dt_str:
+                        dt_str = dt_str.replace('Z', '+00:00')
+                        try:
+                            dt = datetime.fromisoformat(dt_str)
+                            events.append(dt)
+                        except: pass
+            NEWS_CACHE['events'] = events
+            NEWS_CACHE['last_fetch'] = now
+    except Exception: pass
+
+def _git_worktree_blob(filename="Alche.py"):
+    """Return the Git blob SHA for the actual local working-tree file."""
+    try:
+        path = Path(__file__).resolve().parent / filename
+        if not path.is_file():
+            return None
+        r = _run_git("hash-object", str(path))
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+def _git_remote_head():
+    r = _run_git("rev-parse", f"origin/{AUTO_UPDATE_BRANCH}")
+    return r.stdout.strip() if r.returncode == 0 else None
+
+def _git_show_remote_file(remote, filename="Alche.py"):
+    r = _run_git("show", f"{remote}:{filename}")
+    if r.returncode != 0: return None, r.stderr.strip()
+    return r.stdout, None
+
+def _load_owner_pair_filter_state():
+    rows=db_read('SELECT enabled FROM owner_pair_filter WHERE id=1'); enabled=bool(rows[0][0]) if rows else True
+    pairs=[r[0] for r in db_read('SELECT symbol FROM owner_pair_eligible WHERE enabled=1 ORDER BY symbol')]
+    return enabled, pairs or list(CORE_PAIRS)
+
+def _pairperf_snapshot():
+    rows = db_read(
+        "SELECT symbol, status FROM trades "
+        "WHERE user_id='OWNER' AND status IN ('CLOSED (TP)', 'CLOSED (SL)')"
+    )
+    pair_perf = {}
+    for sym, stat in rows:
+        pair = canonical_pair(sym)
+        if not is_valid_crypto_pair_for_vip(pair):
+            continue
+        d = pair_perf.setdefault(pair, {'w': 0, 'l': 0})
+        if 'TP' in stat: d['w'] += 1
+        else: d['l'] += 1
+    return pair_perf
+
+def _rollback_to_revision(revision):
+    if not revision:
+        return False, "No previous revision available."
+    r = _run_git("reset", "--hard", revision)
+    if r.returncode != 0:
+        return False, r.stderr.strip()
+    return True, "Rollback completed."
+
+def _save_owner_pair_filter(enabled,pairs):
+    now=datetime.now(WIB).isoformat(timespec='seconds')
+    with DB_LOCK:
+        conn=sqlite3.connect(DB_FILE,timeout=10)
+        try:
+            conn.execute('UPDATE owner_pair_filter SET enabled=?, updated_at=? WHERE id=1',(1 if enabled else 0,now))
+            conn.execute('UPDATE owner_pair_eligible SET enabled=0, updated_at=?',(now,))
+            for pair in sorted(set(pairs)):
+                conn.execute('INSERT INTO owner_pair_eligible(symbol,enabled,updated_at) VALUES (?,?,?) ON CONFLICT(symbol) DO UPDATE SET enabled=excluded.enabled, updated_at=excluded.updated_at',(pair,1,now))
+            conn.commit()
+        finally: conn.close()
+
+def _split_exchange_key(key):
+    return str(key).split("::", 1)
+
+def _sync_global_max_pos_to_cex(value):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            for ex_id in DEFAULT_CEX:
+                conn.execute(
+                    "INSERT INTO cex_risk_settings (user_id, ex_id, max_pos) VALUES ('OWNER', ?, ?) "
+                    "ON CONFLICT(user_id, ex_id) DO UPDATE SET max_pos=excluded.max_pos",
+                    (ex_id, value)
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+def _table_columns(conn, table):
+    return {row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()}
+
+def _trade_is_active(status):
+    return str(status) in ('PENDING', 'OPEN')
+
+def _validate_single_python_source(source, filename="Alche.py"):
+    try:
+        ast.parse(source, filename=filename); compile(source, filename, "exec")
+        return True, "OK"
+    except Exception as exc: return False, str(exc)
+
+
+def get_cex_max_positions(user_id, exchange_id):
+    """Return configured maximum active positions for one account/CEX."""
+    try:
+        ensure_cex_risk_settings(user_id, exchange_id)
+        rows = db_read(
+            "SELECT max_pos FROM cex_risk_settings WHERE user_id=? AND ex_id=?",
+            (str(user_id), str(exchange_id).lower())
+        )
+        if rows:
+            return max(1, int(rows[0][0]))
+    except Exception:
+        pass
+    try:
+        cfg = get_user_settings(user_id)
+        return max(1, int(cfg.get(
+            'max_pos', CONFIG.get('MAX_CONCURRENT_POSITIONS', 2)
+        )))
+    except Exception:
+        return max(1, int(CONFIG.get('MAX_CONCURRENT_POSITIONS', 2)))
+
+
+def is_valid_crypto_pair_for_vip(symbol):
+    """Hard filter for crypto pairs used by the VIP eligible-pair pipeline."""
+    try:
+        s = str(symbol or '').upper().strip()
+        if not s or '/' not in s:
+            return False
+        clean = s.split(':', 1)[0]
+        parts = clean.split('/')
+        if len(parts) != 2:
+            return False
+        base, quote = parts[0].strip(), parts[1].strip()
+        if not base or not quote:
+            return False
+
+        crypto_quotes = {
+            'USDT', 'USDC', 'BUSD', 'FDUSD', 'USDE', 'DAI',
+            'TUSD', 'USD1', 'EUR', 'BTC', 'ETH'
+        }
+        blocked_bases = {
+            'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF',
+            'HKD', 'SGD', 'CNY', 'CNH', 'INR', 'KRW', 'TRY',
+            'XAU', 'XAG', 'WTI', 'BRENT'
+        }
+        blocked_tokens = ('STOCK', 'INDEX', 'SPX', 'NDX', 'DAX', 'OIL', 'GOLD')
+
+        if quote not in crypto_quotes or base in blocked_bases:
+            return False
+        if any(token in base for token in blocked_tokens):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def send_public_signal(message):
+    """Publish a signal to the owner/public channel without replacing private trade alerts."""
+    try:
+        send_telegram(str(message))
+        return True
+    except Exception:
+        return False
+
+def atomic_reserve_trade_slot(user_id, exchange_id, symbol):
+    """Atomically reserve a PENDING slot before any REAL order is submitted."""
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            active_cex = conn.execute(
+                "SELECT COUNT(*) FROM trades "
+                "WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')",
+                (str(user_id), str(exchange_id))
+            ).fetchone()[0]
+            active_global = conn.execute(
+                "SELECT COUNT(*) FROM trades "
+                "WHERE user_id=? AND status IN ('PENDING','OPEN')",
+                (str(user_id),)
+            ).fetchone()[0]
+            max_cex = int(get_cex_max_positions(user_id, exchange_id))
+            max_global = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', max_cex))
+
+            if active_cex >= max_cex or active_global >= max_global:
+                conn.rollback()
+                return False, "MAX_POSITION"
+
+            duplicate = conn.execute(
+                "SELECT 1 FROM trades WHERE user_id=? AND exchange_id=? AND symbol=? "
+                "AND status IN ('PENDING','OPEN') LIMIT 1",
+                (str(user_id), str(exchange_id), str(symbol))
+            ).fetchone()
+            if duplicate:
+                conn.rollback()
+                return False, "DUPLICATE_ACTIVE"
+
+            # Reservation is represented by a short-lived DB row. The caller
+            # must immediately convert this row into the actual trade row.
+            conn.commit()
+            return True, "RESERVED"
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+def cex_risk_cex_keyboard(user_id):
+    rows=[]
+    for ex in DEFAULT_CEX:
+        c=get_cex_risk_settings(user_id,ex)
+        rows.append([InlineKeyboardButton(text=f"{ex.upper()} • {c['leverage']}x / {c['max_pos']}P / {c['max_trades_day']}E / ${c['max_loss']:.0f} RL / CROSS",callback_data=f"risk_cex:{ex}")])
+    rows.append([InlineKeyboardButton(text="⬅️ KEMBALI",callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def cex_risk_field_keyboard(ex_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💵 MARGIN",callback_data=f"risk_field:{ex_id}:margin")],
+        [InlineKeyboardButton(text="⚡ LEVERAGE",callback_data=f"risk_field:{ex_id}:leverage")],
+        [InlineKeyboardButton(text="📊 MAX POSISI",callback_data=f"risk_field:{ex_id}:max_pos")],
+        [InlineKeyboardButton(text="📅 MAX ENTRY/TRADE",callback_data=f"risk_field:{ex_id}:max_trades_day")],
+        [InlineKeyboardButton(text="🛑 DAILY REALIZED LOSS",callback_data=f"risk_field:{ex_id}:max_loss")],
+        [InlineKeyboardButton(text="🔄 DEFAULT",callback_data=f"risk_default:{ex_id}")],
+        [InlineKeyboardButton(text="⬅️ KEMBALI",callback_data="risk_settings")]])
+
+def cex_risk_text(user_id, ex_id):
+    c=get_cex_risk_settings(user_id,ex_id)
+    return (f"⚙️ <b>CUSTOM TRADING — {str(ex_id).upper()}</b>\n\n"
+            f"💵 Margin: <b>${c['margin']:.2f}</b>\n⚡ Leverage: <b>{c['leverage']}x</b>\n"
+            f"🌐 Mode: <b>CROSS</b> (auto-adjust per pair)\n"
+            f"📊 Max Posisi: <b>{c['max_pos']}</b>\n📅 Max Entry/Trade: <b>{c['max_trades_day']}</b>\n"
+            f"🛑 Daily Realized Loss: <b>${c['max_loss']:.2f}</b>\n\n⚠️ CEX berhenti membuka trade baru jika total realized loss hari ini mencapai batas ini.")
+
+def ensure_cex_risk_settings(user_id, ex_id):
+    with DB_LOCK:
+        conn=sqlite3.connect(DB_FILE,timeout=10)
+        try:
+            conn.execute("INSERT OR IGNORE INTO cex_risk_settings(user_id,ex_id,margin,leverage,max_pos,max_trades_day,max_loss) VALUES (?,?,?,?,?,?,?)",
+                         (str(user_id),str(ex_id).lower(),2.0,20,2,10,5))
+            conn.commit()
+        finally: conn.close()
+
+def ensure_user_settings(user_id):
+    uid = str(user_id)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO user_settings "
+            "(user_id, margin, max_pos, max_trades_day, leverage, auto_trade) "
+            "VALUES (?, 2.0, 3, 10, 20, 1)",
+            (uid,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_cex_risk_settings(user_id, ex_id):
+    ensure_cex_risk_settings(user_id,ex_id)
+    rows=db_read("SELECT margin,leverage,max_pos,max_trades_day,max_loss FROM cex_risk_settings WHERE user_id=? AND ex_id=?",(str(user_id),str(ex_id).lower()))
+    if not rows: return dict(DEFAULT_CEX_RISK)
+    r=rows[0]
+    return {'margin':float(r[0]),'leverage':int(r[1]),'max_pos':int(r[2]),'max_trades_day':int(r[3]),'max_loss':float(r[4])}
+
+def get_user_settings(user_id):
+    uid = str(user_id)
+    ensure_user_settings(uid)
+    rows = db_read(
+        "SELECT margin, max_pos, max_trades_day, leverage, auto_trade "
+        "FROM user_settings WHERE user_id=?",
+        (uid,)
+    )
+    if not rows:
+        return {'margin': 2.0, 'max_pos': 3, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1}
+    r = rows[0]
+    return {
+        'margin': float(r[0]),
+        'max_pos': int(r[1]),
+        'max_trades_day': int(r[2]),
+        'leverage': int(r[3]),
+        'auto_trade': int(r[4]),
+    }
+
+def init_db():
+    Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=15)
+        try:
+            c = conn.cursor()
+            c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id TEXT PRIMARY KEY, margin REAL NOT NULL DEFAULT 2.0, max_pos INTEGER NOT NULL DEFAULT 3, max_trades_day INTEGER NOT NULL DEFAULT 10, leverage INTEGER NOT NULL DEFAULT 20, auto_trade INTEGER NOT NULL DEFAULT 1)")
+            c.execute("CREATE TABLE IF NOT EXISTS user_cex_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, api_key TEXT DEFAULT '', secret TEXT DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, password TEXT DEFAULT '', account_label TEXT DEFAULT '', account_info TEXT DEFAULT '', PRIMARY KEY (user_id, ex_id))")
+            c.execute("CREATE TABLE IF NOT EXISTS cex_risk_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, margin REAL NOT NULL DEFAULT 2.0, leverage INTEGER NOT NULL DEFAULT 20, max_pos INTEGER NOT NULL DEFAULT 2, max_trades_day INTEGER NOT NULL DEFAULT 10, max_loss REAL NOT NULL DEFAULT 5.0, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, ex_id))")
+            c.execute("CREATE TABLE IF NOT EXISTS vip_members (telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', status TEXT DEFAULT 'ACTIVE', expires_at TEXT, added_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'OWNER', exchange_id TEXT NOT NULL, symbol TEXT NOT NULL, order_type TEXT DEFAULT 'LIMIT', side TEXT NOT NULL, entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL, order_id TEXT DEFAULT '', bars_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_eligible (symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_filter (id INTEGER PRIMARY KEY CHECK (id=1), enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            for col, definition in {
+                'user_id': "TEXT NOT NULL DEFAULT 'OWNER'",
+                'bars_count': 'INTEGER NOT NULL DEFAULT 0',
+                'created_at': 'TEXT DEFAULT CURRENT_TIMESTAMP',
+                'realized_pnl': 'REAL DEFAULT 0',
+                'exit_price': 'REAL',
+                'close_reason': 'TEXT',
+                'qty': 'REAL DEFAULT 0',
+                'notional_usd': 'REAL DEFAULT 0',
+                'closed_at': 'TEXT',
+            }.items():
+                if col not in _table_columns(conn, 'trades'): c.execute(f'ALTER TABLE trades ADD COLUMN {col} {definition}')
+            for col, definition in {'secret': "TEXT DEFAULT ''", 'password': "TEXT DEFAULT ''", 'account_label': "TEXT DEFAULT ''", 'account_info': "TEXT DEFAULT ''"}.items():
+                if col not in _table_columns(conn, 'user_cex_settings'): c.execute(f'ALTER TABLE user_cex_settings ADD COLUMN {col} {definition}')
+            # Migrate legacy cex_risk_settings tables before any Custom CEX button is used.
+            # Older databases may have the table but miss one or more newer columns.
+            for col, definition in {
+                'margin': 'REAL NOT NULL DEFAULT 2.0',
+                'leverage': 'INTEGER NOT NULL DEFAULT 20',
+                'max_pos': 'INTEGER NOT NULL DEFAULT 2',
+                'max_trades_day': 'INTEGER NOT NULL DEFAULT 10',
+                'max_loss': 'REAL NOT NULL DEFAULT 5.0',
+                'updated_at': 'TEXT DEFAULT CURRENT_TIMESTAMP',
+            }.items():
+                if col not in _table_columns(conn, 'cex_risk_settings'):
+                    c.execute(f'ALTER TABLE cex_risk_settings ADD COLUMN {col} {definition}')
+            for k,v in {'margin':'2.0','max_pos':'3','dry_run':'1','min_trades':'20','min_wr':'50','daily_loss_limit':'1'}.items(): c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(k,v))
+            for ex_id in DEFAULT_CEX:
+                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'lev_{ex_id}','20'))
+                c.execute("INSERT OR IGNORE INTO cex_risk_settings(user_id,ex_id,margin,leverage,max_pos,max_trades_day,max_loss) VALUES (?,?,?,?,?,?,?)", ('OWNER',ex_id,2.0,20,2,10,5.0))
+                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'dry_run_{ex_id}','1'))
+            c.execute('INSERT OR IGNORE INTO owner_pair_filter(id,enabled) VALUES (1,1)')
+            for pair in CORE_PAIRS: c.execute('INSERT OR IGNORE INTO owner_pair_eligible(symbol,enabled,updated_at) VALUES (?,?,?)',(pair,1,datetime.now(WIB).isoformat(timespec='seconds')))
+            conn.commit()
+        finally: conn.close()
+
+def is_dry_run_mode():
+    """This build intentionally keeps simulation mode ON 24/7 until disabled in code."""
+    return bool(DRY_RUN_ALWAYS_ON)
+
+def is_news_time():
+    _fetch_news_calendar()
+    now = datetime.now(timezone.utc)
+    for event_dt in NEWS_CACHE['events']:
+        diff = abs((now - event_dt).total_seconds())
+        if diff <= 1800: # 30 minutes before/after
+            return True, event_dt.astimezone(WIB).strftime('%H:%M')
+    return False, None
+
+def load_settings():
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    c = conn.cursor()
+    for row in c.execute("SELECT key, value FROM settings").fetchall():
+        if row[0] == 'margin': CONFIG['MARGIN_PER_TRADE'] = float(row[1])
+        elif row[0] == 'max_pos': CONFIG['MAX_CONCURRENT_POSITIONS'] = int(row[1])
+        elif row[0] == 'dry_run': CONFIG['DRY_RUN'] = bool(float(row[1]))
+        elif row[0] == 'min_trades': CONFIG['MIN_TRADES'] = int(row[1])
+        elif row[0] == 'min_wr': CONFIG['MIN_WR'] = float(row[1])
+        elif row[0] == 'daily_loss_limit': CONFIG['DAILY_LOSS_LIMIT'] = bool(float(row[1]))
+        elif row[0].startswith('lev_'): CONFIG['LEVERAGE'][row[0].split('_', 1)[1]] = int(row[1])
+        elif row[0].startswith('dry_run_'): CONFIG.setdefault('DRY_RUN_CEX', {})[row[0].split('_', 2)[2]] = bool(float(row[1]))
+    conn.close()
+
+def record_realized_pnl(trade_id, realized_pnl, exit_price=None, close_reason=None):
+    """Persist exchange-realized PnL instead of estimating from margin."""
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=10)
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            if 'realized_pnl' not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl REAL DEFAULT 0")
+            if 'exit_price' not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN exit_price REAL")
+            if 'close_reason' not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN close_reason TEXT")
+            conn.execute(
+                "UPDATE trades SET realized_pnl=?, exit_price=COALESCE(?, exit_price), "
+                "close_reason=COALESCE(?, close_reason) WHERE id=?",
+                (float(realized_pnl or 0), exit_price, close_reason, int(trade_id))
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+def reload_exchanges():
+    global exchanges, EXCHANGE_MARKETS, EXCHANGE_SCAN_NEXT, EXCHANGE_LAST_CANDLE, EXCHANGE_SCAN_CURSOR, EXCHANGE_REQUEST_NEXT
+    rows = db_read(
+        "SELECT user_id, ex_id, api_key, secret, enabled, password "
+        "FROM user_cex_settings"
+    )
+    EXCHANGE_SCAN_CURSOR = {}
+    EXCHANGE_REQUEST_NEXT = {}
+    exchanges.clear()
+    EXCHANGE_MARKETS.clear()
+    EXCHANGE_SCAN_NEXT.clear()
+    EXCHANGE_LAST_CANDLE.clear()
+
+    for user_id, ex_id, api, sec, en, password in rows:
+        if ex_id not in DEFAULT_CEX or en != 1:
+            continue
+
+        user_is_owner = str(user_id) == 'OWNER'
+        if not user_is_owner:
+            if get_vip_member(user_id) is None:
+                continue
+            try:
+                ucfg = get_user_settings(user_id)
+                if not ucfg['auto_trade']:
+                    continue
+            except Exception:
+                continue
+
+        dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
+        base_params = {
+            'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
+            'enableRateLimit': True,
+            'timeout': 8000
+        }
+        if ex_id == 'bingx':
+            base_params['rateLimit'] = 350
+        if ex_id == 'bitget':
+            base_params['password'] = password or ''
+
+        try:
+            params = dict(base_params)
+            params.update({'apiKey': api or '', 'secret': sec or ''})
+            ex = getattr(ccxt, ex_id)(params)
+            ex.load_markets()
+        except Exception as auth_exc:
+            if not (user_is_owner and dry_run):
+                send_error_alert(f"Load Ex [{ex_id}] user={user_id}: {auth_exc}")
+                continue
+            try:
+                public_params = dict(base_params)
+                public_params.pop('password', None)
+                public_params['apiKey'] = ''
+                public_params['secret'] = ''
+                ex = getattr(ccxt, ex_id)(public_params)
+                ex.load_markets()
+                send_telegram(
+                    f"🧪 <b>DRY RUN PUBLIC SCANNER</b>\n"
+                    f"{ex_id.upper()}: private API gagal, scanner memakai market data publik."
+                )
+            except Exception as public_exc:
+                send_error_alert(f"Load Public Ex [{ex_id}] user={user_id}: {public_exc}")
+                continue
+
+        key = _exchange_key(user_id, ex_id)
+        exchanges[key] = ex
+        EXCHANGE_MARKETS[key] = ex.markets
+
+    for stale in [k for k in list(EXCHANGE_RUNTIME) if k not in exchanges]:
+        EXCHANGE_RUNTIME.pop(stale, None)
+
+def set_cex_risk_setting(user_id, ex_id, field, value):
+    if field not in DEFAULT_CEX_RISK: raise ValueError('Setting risiko tidak valid.')
+    ensure_cex_risk_settings(user_id,ex_id)
+    with DB_LOCK:
+        conn=sqlite3.connect(DB_FILE,timeout=10)
+        try:
+            conn.execute(f"UPDATE cex_risk_settings SET {field}=?,updated_at=? WHERE user_id=? AND ex_id=?",(value,datetime.now(WIB).isoformat(timespec='seconds'),str(user_id),str(ex_id).lower()))
+            conn.commit()
+        finally: conn.close()
+
+def set_user_setting(user_id, field, value):
+    allowed = {'margin', 'max_pos', 'max_trades_day', 'leverage', 'auto_trade'}
+    if field not in allowed:
+        raise ValueError('Setting tidak valid')
+    ensure_user_settings(user_id)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    try:
+        conn.execute(f"UPDATE user_settings SET {field}=? WHERE user_id=?", (value, str(user_id)))
+        if field in ('margin', 'leverage', 'max_pos', 'max_trades_day'):
+            for ex_id in DEFAULT_CEX:
+                conn.execute(
+                    f"INSERT INTO cex_risk_settings (user_id, ex_id, {field}) VALUES (?, ?, ?) "
+                    f"ON CONFLICT(user_id, ex_id) DO UPDATE SET {field}=excluded.{field}, "
+                    f"updated_at=datetime('now')",
+                    (str(user_id), ex_id, value)
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+def update_db_setting(key, value):
+    conn = sqlite3.connect(DB_FILE, timeout=10)
+    conn.cursor().execute(
+        "INSERT INTO settings(key,value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value))
+    )
+    conn.commit()
+    conn.close()
+
+def vip_recommended_settings_text(user_id=None):
+    uid = str(user_id or '')
+    cfg = get_user_settings(uid) if uid and uid != 'OWNER' else {
+        'margin': 2.0, 'max_pos': 3, 'max_trades_day': 10, 'leverage': 20, 'auto_trade': 1
+    }
+    return (
+        "💎 <b>VIP SETTINGS</b>\n\n"
+        f"💵 Margin / Trade: <b>${cfg['margin']:.2f}</b>\n"
+        f"⚡ Leverage: <b>{cfg['leverage']}x</b>\n"
+        f"📊 Max Posisi: <b>{cfg['max_pos']}</b>\n"
+        f"📅 Max Trade / Hari: <b>{cfg['max_trades_day']}</b>\n"
+        f"🤖 Auto Trade: <b>{'🟢 ON' if cfg['auto_trade'] else '🔴 OFF'}</b>\n\n"
+        "ℹ️ Default rekomendasi: <b>$2 / 20x / 3 posisi / 10 trade per hari</b>.\n\n"
+        + VIP_WARNING_TEXT
+    )
+
+
+ALCHE_BUILD_VERSION = 'V18-TRADE-NOTIFY-PNL-FIXED'
 PUBLIC_CHANNEL_ID = getattr(__import__('config'), 'PUBLIC_CHANNEL_ID', '')
 VIP_JOIN_URL = getattr(__import__('config'), 'VIP_JOIN_URL', '')
 
@@ -110,44 +685,6 @@ POSITION_MODE_CACHE_TTL = 3600
 TRADE_TERMINAL_STATUSES = {
     'CLOSED (TP)', 'CLOSED (SL)', 'CLOSED (UNKNOWN)', 'CANCELLED', 'ERROR'
 }
-
-
-def _table_columns(conn, table):
-    return {row[1] for row in conn.execute(f'PRAGMA table_info({table})').fetchall()}
-
-
-def init_db():
-    Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
-    with DB_LOCK:
-        conn = sqlite3.connect(DB_FILE, timeout=15)
-        try:
-            c = conn.cursor()
-            c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-            c.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id TEXT PRIMARY KEY, margin REAL NOT NULL DEFAULT 2.0, max_pos INTEGER NOT NULL DEFAULT 3, max_trades_day INTEGER NOT NULL DEFAULT 10, leverage INTEGER NOT NULL DEFAULT 20, auto_trade INTEGER NOT NULL DEFAULT 1)")
-            c.execute("CREATE TABLE IF NOT EXISTS user_cex_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, api_key TEXT DEFAULT '', secret TEXT DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, password TEXT DEFAULT '', account_label TEXT DEFAULT '', account_info TEXT DEFAULT '', PRIMARY KEY (user_id, ex_id))")
-            c.execute("CREATE TABLE IF NOT EXISTS cex_risk_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, margin REAL NOT NULL DEFAULT 2.0, leverage INTEGER NOT NULL DEFAULT 20, max_pos INTEGER NOT NULL DEFAULT 2, max_trades_day INTEGER NOT NULL DEFAULT 10, max_loss INTEGER NOT NULL DEFAULT 5, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, ex_id))")
-            c.execute("CREATE TABLE IF NOT EXISTS vip_members (telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', status TEXT DEFAULT 'ACTIVE', expires_at TEXT, added_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'OWNER', exchange_id TEXT NOT NULL, symbol TEXT NOT NULL, order_type TEXT DEFAULT 'LIMIT', side TEXT NOT NULL, entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL, order_id TEXT DEFAULT '', bars_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_eligible (symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_filter (id INTEGER PRIMARY KEY CHECK (id=1), enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            for col, definition in {'user_id': "TEXT NOT NULL DEFAULT 'OWNER'", 'bars_count': 'INTEGER NOT NULL DEFAULT 0', 'created_at': 'TEXT DEFAULT CURRENT_TIMESTAMP'}.items():
-                if col not in _table_columns(conn, 'trades'):
-                    c.execute(f'ALTER TABLE trades ADD COLUMN {col} {definition}')
-            for col, definition in {'secret': "TEXT DEFAULT ''", 'password': "TEXT DEFAULT ''", 'account_label': "TEXT DEFAULT ''", 'account_info': "TEXT DEFAULT ''"}.items():
-                if col not in _table_columns(conn, 'user_cex_settings'):
-                    c.execute(f'ALTER TABLE user_cex_settings ADD COLUMN {col} {definition}')
-            for k, v in {'margin':'2.0','max_pos':'3','dry_run':'1','min_trades':'20','min_wr':'50','daily_loss_limit':'1'}.items():
-                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)', (k,v))
-            for ex_id in DEFAULT_CEX:
-                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)', (f'lev_{ex_id}','20'))
-                c.execute("INSERT OR IGNORE INTO cex_risk_settings(user_id,ex_id,margin,leverage,max_pos,max_trades_day,max_loss) VALUES (?,?,?,?,?,?,?)", ('OWNER',ex_id,2.0,20,2,10,5))
-                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)', (f'dry_run_{ex_id}','1'))
-            c.execute('INSERT OR IGNORE INTO owner_pair_filter(id,enabled) VALUES (1,1)')
-            for pair in CORE_PAIRS:
-                c.execute('INSERT OR IGNORE INTO owner_pair_eligible(symbol,enabled,updated_at) VALUES (?,?,?)', (pair,1,datetime.now(WIB).isoformat(timespec='seconds')))
-            conn.commit()
-        finally:
-            conn.close()
 
 
 def get_today_realized_loss(user_id, exchange_id=None):
@@ -424,6 +961,7 @@ def _apply_approved_update():
 
     # Backup ONLY Alche.py. config.py, .env, DB, state and other local files
     # are deliberately excluded from the update transaction.
+    previous_blob = _git_worktree_blob("Alche.py")
     backup = _backup_alche()
 
     # Atomic replacement. No git reset, merge, checkout or pull is performed.
@@ -441,7 +979,7 @@ def _apply_approved_update():
 
     expected_sha = _file_sha256(target)
     _mark_update_pending_restart(
-        previous_blob=_git_file_blob("HEAD", "Alche.py"),
+        previous_blob=previous_blob,
         new_blob=remote_blob,
         backup_name=backup.name
     )
@@ -470,7 +1008,7 @@ def auto_update_once():
             print(f"[AUTO-UPDATE] manual check fetch failed: {fetch.stderr.strip()}")
             return False
 
-        current_blob = _git_file_blob("HEAD", "Alche.py")
+        current_blob = _git_worktree_blob("Alche.py")
         remote_blob = _git_file_blob(f"origin/{AUTO_UPDATE_BRANCH}", "Alche.py")
 
         if not current_blob or not remote_blob:
@@ -506,7 +1044,7 @@ async def auto_update_monitor():
                         + (fetch.stderr.strip() or "git fetch failed")
                     )
                 else:
-                    current_blob = _git_file_blob("HEAD", "Alche.py")
+                    current_blob = _git_worktree_blob("Alche.py")
                     remote_blob = _git_file_blob(
                         f"origin/{AUTO_UPDATE_BRANCH}", "Alche.py"
                     )
@@ -602,6 +1140,50 @@ def send_user_telegram(user_id, message):
             payload.pop("parse_mode", None)
             requests.post(url, json=payload, timeout=5)
     except Exception: pass
+
+def _trade_qty_notional(trade_id, entry_price, fallback_margin=None, fallback_leverage=None):
+    try:
+        row = db_read("SELECT qty, notional_usd FROM trades WHERE id=?", (int(trade_id),))
+        qty = float(row[0][0] or 0.0) if row else 0.0
+        notional = float(row[0][1] or 0.0) if row else 0.0
+    except Exception:
+        qty, notional = 0.0, 0.0
+    try: entry = float(entry_price or 0.0)
+    except Exception: entry = 0.0
+    if qty <= 0 and notional > 0 and entry > 0: qty = notional / entry
+    if notional <= 0 and qty > 0 and entry > 0: notional = qty * entry
+    if qty <= 0 and fallback_margin and fallback_leverage and entry > 0:
+        try:
+            notional = float(fallback_margin) * float(fallback_leverage); qty = notional / entry
+        except Exception: pass
+    return max(0.0, qty), max(0.0, notional)
+
+def _gross_trade_pnl(side, entry_price, exit_price, qty):
+    try:
+        entry=float(entry_price); exit_=float(exit_price); q=float(qty)
+        if q <= 0 or entry <= 0 or exit_ <= 0: return 0.0
+        return (exit_-entry)*q if str(side).upper()=='BUY' else (entry-exit_)*q
+    except Exception: return 0.0
+
+def _format_pnl_usd(value):
+    try:
+        v=float(value or 0.0)
+        if abs(v)<0.0000005: v=0.0
+        return f"${v:+.4f}"
+    except Exception: return "$+0.0000"
+
+def format_trade_notification(kind, ex_id, symbol, side, entry=None, sl=None, tp=None, leverage=None, qty=None, notional=None, status=None, exit_price=None, pnl=None, dry_run=False, reason=None, auto_adjusted=False):
+    prefix='🧪 ' if dry_run else ''
+    lines=[f"{prefix}<b>{html.escape(str(kind).upper())}</b>", f"CEX: {html.escape(str(ex_id).upper())} | {html.escape(str(symbol))} | {html.escape(str(side).upper())}"]
+    if entry is not None: lines.append(f"{'Entry LIMIT' if str(kind).upper()=='NEW TRADE' else 'Entry'}: {float(entry):.8g}")
+    if sl is not None and tp is not None: lines.append(f"SL: {float(sl):.8g} | TP: {float(tp):.8g}")
+    if leverage is not None: lines.append(f"Leverage: <b>{int(leverage)}x</b>{' (auto-adjusted)' if auto_adjusted else ''}")
+    if qty is not None or notional is not None: lines.append(f"Qty: {float(qty):g} | Notional: ${float(notional):.4f}")
+    if exit_price is not None: lines.append(f"Exit: {float(exit_price):.8g}")
+    if pnl is not None: lines.append(f"PnL: <b>{_format_pnl_usd(pnl)}</b>")
+    if reason: lines.append(f"Reason: {html.escape(str(reason))}")
+    if status: lines.append(f"Status: <b>{html.escape(str(status))}</b>")
+    return "\n".join(lines)
 
 def send_error_alert(err_msg):
     global last_error_time, ERROR_HISTORY
@@ -1093,17 +1675,20 @@ def update_orders_and_positions():
                                 c.execute("UPDATE trades SET status='CANCELLED (Timeout)', closed_at=?, close_reason='CANCELLED (Timeout)' WHERE id=? AND status='PENDING'",
                                           (datetime.now(WIB).isoformat(timespec='seconds'), t_id))
                                 if c.rowcount:
-                                    send_user_telegram(user_id, f"⏱️ <b>PENDING TIMEOUT</b> {sym} ({ex_id.upper()})\nTidak fill dalam {MAX_PENDING_MINUTES} menit — dibatalkan.")
+                                    qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                    send_user_telegram(user_id, format_trade_notification('LIMIT CANCELLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='CANCELLED', dry_run=is_sim, reason=f'Timeout {MAX_PENDING_MINUTES} menit'))
                             continue
 
                         if not is_sim:
                             real_state = _real_exchange_order_state(ex, sym, ord_id)
                             if real_state == 'FILLED':
                                 n_stat = 'OPEN'
-                                send_user_telegram(user_id, f"🔔 <b>ORDER FILLED — CONFIRMED{tag}</b> {sym} di {ex_id.upper()}!")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN'))
                             elif real_state == 'CANCELLED':
                                 n_stat = 'CANCELLED'
-                                send_user_telegram(user_id, f"⚪ <b>ORDER CANCELLED</b> {sym} di {ex_id.upper()}")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                send_user_telegram(user_id, format_trade_notification('LIMIT CANCELLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='CANCELLED', reason='Exchange cancelled the pending order'))
                             elif real_state == 'FILLED_OR_CANCELLED':
                                 try:
                                     live_positions = ex.fetch_positions([sym])
@@ -1111,18 +1696,22 @@ def update_orders_and_positions():
                                 except Exception: has_pos = False
                                 if has_pos:
                                     n_stat = 'OPEN'
-                                    send_user_telegram(user_id, f"🔔 <b>ORDER FILLED (confirmed via position){tag}</b> {sym} di {ex_id.upper()}!")
+                                    qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                    send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN', reason='Confirmed via live position'))
                                 else:
                                     n_stat = 'CANCELLED'
-                                    send_user_telegram(user_id, f"⚪ <b>ORDER CANCELLED (not found){tag}</b> {sym} di {ex_id.upper()}")
+                                    qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                    send_user_telegram(user_id, format_trade_notification('LIMIT CANCELLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='CANCELLED', reason='Order missing and no live position found'))
                             else:
                                 n_stat = 'PENDING'
                         else:
                             n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
                             if n_stat == 'OPEN':
-                                send_user_telegram(user_id, f"🔔 <b>ORDER FILLED (DRY RUN)</b> {sym} di {ex_id.upper()}!")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN', dry_run=True))
                             elif n_stat != 'PENDING':
-                                send_user_telegram(user_id, f"⚪ <b>AUTO-CANCEL (DRY RUN)</b> {sym}\nAlasan: {n_stat}")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                send_user_telegram(user_id, format_trade_notification('LIMIT CANCELLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='CANCELLED', dry_run=True, reason=n_stat))
 
                         if n_stat != 'PENDING':
                             c.execute("UPDATE trades SET status=?, closed_at=CASE WHEN ?='OPEN' THEN closed_at ELSE COALESCE(closed_at,?) END, close_reason=CASE WHEN ?='OPEN' THEN close_reason ELSE ? END WHERE id=? AND status='PENDING'",
@@ -1156,14 +1745,8 @@ def update_orders_and_positions():
                                     if ex_exit is not None:
                                         exit_price = ex_exit
                                 if realized is None and exit_price is not None:
-                                    try:
-                                        qty_row = c.execute("SELECT qty FROM trades WHERE id=?", (t_id,)).fetchone()
-                                        qty_f = float(qty_row[0] or 0.0) if qty_row else 0.0
-                                        realized = ((float(exit_price)-float(en))*qty_f
-                                                    if side == 'BUY'
-                                                    else (float(en)-float(exit_price))*qty_f)
-                                    except Exception:
-                                        realized = 0.0
+                                    qty_f, _notional_f = _trade_qty_notional(t_id, en)
+                                    realized = _gross_trade_pnl(side, en, exit_price, qty_f)
                                 c.execute(
                                     "UPDATE trades SET status=?, exit_price=?, realized_pnl=?, "
                                     "closed_at=?, close_reason=? WHERE id=? AND status='OPEN'",
@@ -1172,31 +1755,24 @@ def update_orders_and_positions():
                                      new_status, t_id)
                                 )
                                 if c.rowcount:
-                                    emoji = '🎉' if 'TP' in new_status else ('❌' if 'SL' in new_status else '❔')
-                                    send_user_telegram(user_id, f"{emoji} <b>{new_status}</b> {sym} ({ex_id.upper()}) terdeteksi dari posisi exchange.")
+                                    qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                    kind = 'TAKE PROFIT' if 'TP' in new_status else ('STOP LOSS' if 'SL' in new_status else 'POSITION CLOSED')
+                                    send_user_telegram(user_id, format_trade_notification(kind, ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=exit_price, pnl=float(realized or 0.0), status='CLOSED', reason='Exchange position closed'))
                         else:
                             ticker = tickers_by_ex.get(ex_key, {}).get(sym)
                             curr_price = float(ticker['last']) if ticker and ticker.get('last') else ex.fetch_ticker(sym)['last']
                             if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
-                                qrow=c.execute("SELECT qty FROM trades WHERE id=?",(t_id,)).fetchone()
-                                qty_f=float(qrow[0] or 0.0) if qrow else 0.0
-                                pnl=((float(curr_price)-float(en))*qty_f if side=='BUY' else (float(en)-float(curr_price))*qty_f)
-                                c.execute(
-                                    "UPDATE trades SET status='CLOSED (TP)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (TP)' WHERE id=? AND status='OPEN'",
-                                    (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id)
-                                )
-                                if c.rowcount:
-                                    send_user_telegram(user_id, f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | PnL ${pnl:.4f} 🚀")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                pnl = _gross_trade_pnl(side, en, curr_price, qty_f)
+                                if qty_f > 0: c.execute("UPDATE trades SET qty=?, notional_usd=? WHERE id=? AND (qty IS NULL OR qty<=0)", (qty_f, notional_f, t_id))
+                                c.execute("UPDATE trades SET status='CLOSED (TP)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (TP)' WHERE id=? AND status='OPEN'", (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id))
+                                if c.rowcount: send_user_telegram(user_id, format_trade_notification('TAKE PROFIT', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=curr_price, pnl=pnl, status='CLOSED', dry_run=True)+'\n🚀')
                             elif (side == 'BUY' and curr_price <= sl) or (side == 'SELL' and curr_price >= sl):
-                                qrow=c.execute("SELECT qty FROM trades WHERE id=?",(t_id,)).fetchone()
-                                qty_f=float(qrow[0] or 0.0) if qrow else 0.0
-                                pnl=((float(curr_price)-float(en))*qty_f if side=='BUY' else (float(en)-float(curr_price))*qty_f)
-                                c.execute(
-                                    "UPDATE trades SET status='CLOSED (SL)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (SL)' WHERE id=? AND status='OPEN'",
-                                    (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id)
-                                )
-                                if c.rowcount:
-                                    send_user_telegram(user_id, f"❌ <b>STOP LOSS{tag}</b> {sym} | PnL ${pnl:.4f} 🔻")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                pnl = _gross_trade_pnl(side, en, curr_price, qty_f)
+                                if qty_f > 0: c.execute("UPDATE trades SET qty=?, notional_usd=? WHERE id=? AND (qty IS NULL OR qty<=0)", (qty_f, notional_f, t_id))
+                                c.execute("UPDATE trades SET status='CLOSED (SL)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (SL)' WHERE id=? AND status='OPEN'", (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id))
+                                if c.rowcount: send_user_telegram(user_id, format_trade_notification('STOP LOSS', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=curr_price, pnl=pnl, status='CLOSED', dry_run=True)+'\n🔻')
                 except Exception as e:
                     send_error_alert(f"Position monitor [{ex_id}:{sym}]: {e}")
             conn.commit()
@@ -2010,18 +2586,8 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 _cancel_reserved_trade(trade_id, "RESERVATION_ACTIVATION_FAILED")
                 continue
 
-            status_text = 'FILLED' if trade_status == 'OPEN' else 'PENDING LIMIT'
-            status_text = 'FILLED' if trade_status == 'OPEN' else 'PENDING LIMIT'
-            send_user_telegram(
-                user_id,
-                f"🎯 <b>{mode}</b>\n"
-                f"CEX: {ex_id.upper()} | {sym} | {sig}\n"
-                f"Entry LIMIT: {float(en):.8g}\n"
-                f"SL: {float(sl):.8g} | TP: {float(tp):.8g}\n"
-                f"Leverage: <b>{lev_to_set}x</b>{(' (auto-adjusted)' if lev_to_set != lev else '')}\n"
-                f"Qty: {qty:g} | Notional: ${notional:.4f}\n"
-                f"Status: <b>{status_text}</b>"
-            )
+            status_text = 'OPEN' if trade_status == 'OPEN' else 'PENDING LIMIT'
+            send_user_telegram(user_id, format_trade_notification('NEW TRADE', ex_id, sym, sig, entry=en, sl=sl, tp=tp, leverage=lev_to_set, qty=qty, notional=notional, status=status_text, dry_run=dry_run, auto_adjusted=(lev_to_set != lev)))
             created += 1
             cycle_created_symbols.add(sym)
             runtime['signals'] = runtime.get('signals', 0) + 1
@@ -2159,7 +2725,7 @@ def vip_settings_keyboard():
 def vip_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"), InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
-        [InlineKeyboardButton(text="💎 VIP SETTINGS", callback_data="vip_settings")],
+        [InlineKeyboardButton(text="👤 VIP INFO", callback_data="vip_info")],
         [InlineKeyboardButton(text="⚙️ CUSTOM TRADING PER CEX", callback_data="risk_settings")],
         [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status"), InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
         [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
@@ -2398,6 +2964,8 @@ def ensure_trade_accounting_columns():
             for name, decl in additions:
                 if name not in cols:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {decl}")
+            conn.execute("UPDATE trades SET notional_usd=qty*entry_price WHERE (notional_usd IS NULL OR notional_usd<=0) AND qty>0 AND entry_price>0")
+            conn.execute("UPDATE trades SET qty=notional_usd/entry_price WHERE (qty IS NULL OR qty<=0) AND notional_usd>0 AND entry_price>0")
             conn.commit()
         finally:
             conn.close()
@@ -3350,19 +3918,73 @@ async def cb_owner_pair_remove(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "risk_settings")
 async def cb_risk_settings(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
-    uid=_account_user_id(callback.message.chat.id)
-    await safe_answer(callback)
-    await callback.message.edit_text("⚙️ <b>CUSTOM TRADING PER CEX</b>\n\nPilih CEX. Setting setiap CEX berdiri sendiri.\n\nDefault: <b>20x • 2 posisi • 10 entry • $5 realized loss • CROSS mode</b>\n\n"+CUSTOMIZE_WARNING_TEXT,reply_markup=cex_risk_cex_keyboard(uid))
+    """Open Custom Trading per CEX for Owner or VIP.
+    Robust against stale Telegram messages and missing legacy DB rows.
+    """
+    if not is_allowed_chat(callback):
+        await safe_answer(callback, "Akses hanya untuk Owner/VIP.", True)
+        return
+
+    uid = _account_user_id(callback.message.chat.id)
+
+    try:
+        # Guarantee the per-CEX table/rows exist before rendering the keyboard.
+        for ex_id in DEFAULT_CEX:
+            ensure_cex_risk_settings(uid, ex_id)
+
+        markup = cex_risk_cex_keyboard(uid)
+        text = (
+            "⚙️ <b>CUSTOM TRADING PER CEX</b>\n\n"
+            "Pilih CEX. Setting setiap CEX berdiri sendiri.\n\n"
+            "Default: <b>20x • 2 posisi • 10 entry • $5 realized loss • CROSS mode</b>\n\n"
+            + CUSTOMIZE_WARNING_TEXT
+        )
+
+        await safe_answer(callback, "Membuka Custom Trading...")
+        try:
+            await callback.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest as exc:
+            # Telegram raises this when the message is already identical.
+            if "message is not modified" in str(exc).lower():
+                return
+            # If the old callback message cannot be edited, send a fresh menu.
+            await callback.message.answer(text, reply_markup=markup)
+
+    except Exception as exc:
+        # Show a short diagnostic so a DB/schema issue is actionable instead of
+        # looking like a dead Telegram button.
+        msg = str(exc).replace("\n", " ")[:180]
+        await safe_answer(callback, f"Custom CEX gagal dibuka: {msg}", True)
+        print(f"[CUSTOM-CEX] open error uid={uid}: {exc}")
 
 @dp.callback_query(F.data.startswith("risk_cex:"))
 async def cb_risk_cex(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
-    ex=callback.data.split(":",1)[1]
-    if ex not in DEFAULT_CEX: await safe_answer(callback,"CEX tidak valid.",True); return
-    uid=_account_user_id(callback.message.chat.id)
-    await safe_answer(callback)
-    await callback.message.edit_text(cex_risk_text(uid,ex),reply_markup=cex_risk_field_keyboard(ex))
+    if not is_allowed_chat(callback):
+        await safe_answer(callback, "Akses hanya untuk Owner/VIP.", True)
+        return
+
+    ex = callback.data.split(":", 1)[1].lower()
+    if ex not in DEFAULT_CEX:
+        await safe_answer(callback, "CEX tidak valid.", True)
+        return
+
+    uid = _account_user_id(callback.message.chat.id)
+
+    try:
+        ensure_cex_risk_settings(uid, ex)
+        await safe_answer(callback)
+        markup = cex_risk_field_keyboard(ex)
+        text = cex_risk_text(uid, ex)
+        try:
+            await callback.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            await callback.message.answer(text, reply_markup=markup)
+    except Exception as exc:
+        msg = str(exc).replace("\n", " ")[:180]
+        await safe_answer(callback, f"Setting CEX gagal: {msg}", True)
+        print(f"[CUSTOM-CEX] detail error uid={uid} ex={ex}: {exc}")
 
 @dp.callback_query(F.data.startswith("risk_field:"))
 async def cb_risk_field(callback: CallbackQuery):
@@ -3426,6 +4048,19 @@ async def cb_vip_reset_settings(callback: CallbackQuery):
     PENDING_VIP_SETTING.pop(str(uid), None)
     await safe_answer(callback, "Default dikembalikan.")
     await callback.message.edit_text(vip_recommended_settings_text(uid), reply_markup=vip_settings_keyboard())
+
+@dp.callback_query(F.data == "vip_info")
+async def cb_vip_info(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    uid=_chat_id(callback)
+    rows=db_read("SELECT ex_id, margin, leverage, max_pos, max_trades_day, max_loss FROM cex_risk_settings WHERE user_id=? ORDER BY ex_id", (uid,))
+    lines=["👤 <b>VIP INFO</b>","","Setting trading dikelola terpisah per CEX:"]
+    for ex_id,margin,lev,max_pos,max_trades,max_loss in rows:
+        lines.append(f"• <b>{str(ex_id).upper()}</b> — ${float(margin):.2f} / {int(lev)}x / {int(max_pos)}P / {int(max_trades)}E / ${float(max_loss):.2f} RL")
+    lines += ["","⚙️ Gunakan <b>CUSTOM TRADING PER CEX</b> untuk mengubah setting akun."]
+    await safe_answer(callback)
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ CUSTOM TRADING PER CEX", callback_data="risk_settings")],[InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]]))
 
 @dp.callback_query(F.data == "vip_settings")
 async def cb_vip_settings(callback: CallbackQuery):
@@ -4073,30 +4708,6 @@ async def aiogram_polling():
 # =================================================================
 # WEB DASHBOARD & FLASK SERVER
 # =================================================================
-def run_flask_dashboard():
-    """Run the dashboard through Werkzeug's server object.
-
-    This isolates HTTP serving from the bot's asyncio/trading threads and
-    automatically recreates the server if the serving loop exits unexpectedly.
-    """
-    from werkzeug.serving import make_server
-
-    while True:
-        server = None
-        try:
-            server = make_server('0.0.0.0', 5000, app, threaded=True)
-            print('[WEB] Dashboard listening on 0.0.0.0:5000', flush=True)
-            server.serve_forever()
-        except Exception as exc:
-            print(f'[WEB] Dashboard server error: {exc}', flush=True)
-            time.sleep(2)
-        finally:
-            if server is not None:
-                try:
-                    server.server_close()
-                except Exception:
-                    pass
-
 app = Flask(__name__, template_folder='templates')
 
 @app.route('/')
@@ -4323,18 +4934,14 @@ async def app_main():
     global MAIN_ASYNC_LOOP
     MAIN_ASYNC_LOOP = asyncio.get_running_loop()
     asyncio.create_task(auto_update_monitor(), name='github-update-monitor')
-    init_db(); load_settings(); _refresh_owner_pair_state_from_db(); refresh_owner_eligible_pairs(); reload_exchanges(); set_runtime_event(f'DRY RUN public scanners: {sum(1 for x in DEFAULT_CEX if get_owner_dry_run(x))}/{len(DEFAULT_CEX)} CEX initialized')
+    init_db(); ensure_trade_accounting_columns(); load_settings(); _refresh_owner_pair_state_from_db(); refresh_owner_eligible_pairs(); reload_exchanges(); set_runtime_event(f'DRY RUN public scanners: {sum(1 for x in DEFAULT_CEX if get_owner_dry_run(x))}/{len(DEFAULT_CEX)} CEX initialized')
     
     # Start Fast Monitor Thread (3 detik)
     threading.Thread(target=fast_trade_monitor, name='fast-monitor', daemon=True).start()
     # Start Scanner Thread (5 detik loop)
     threading.Thread(target=main_loop, name='trading-engine', daemon=True).start()
-    # Start Flask Web Dashboard in an isolated Werkzeug server thread.
-    # Do not use Flask's app.run() wrapper here: if the dev-server thread
-    # exits while the main bot keeps running, port 5000 can remain misleadingly
-    # reachable without actually serving requests. The dedicated server loop
-    # keeps the dashboard independent from the trading/asyncio threads.
-    threading.Thread(target=run_flask_dashboard, name='flask-dashboard', daemon=True).start()
+    # Start Flask Web Dashboard
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, use_reloader=False), name='flask-dashboard', daemon=True).start()
     
     try:
         await aiogram_polling()
