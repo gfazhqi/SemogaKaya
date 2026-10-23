@@ -588,7 +588,7 @@ def vip_recommended_settings_text(user_id=None):
     )
 
 
-ALCHE_BUILD_VERSION = 'V14-FULL-FIXED'
+ALCHE_BUILD_VERSION = 'V18-TRADE-NOTIFY-PNL-FIXED'
 PUBLIC_CHANNEL_ID = getattr(__import__('config'), 'PUBLIC_CHANNEL_ID', '')
 VIP_JOIN_URL = getattr(__import__('config'), 'VIP_JOIN_URL', '')
 
@@ -943,6 +943,7 @@ def _apply_approved_update():
 
     # Backup ONLY Alche.py. config.py, .env, DB, state and other local files
     # are deliberately excluded from the update transaction.
+    previous_blob = _git_worktree_blob("Alche.py")
     backup = _backup_alche()
 
     # Atomic replacement. No git reset, merge, checkout or pull is performed.
@@ -960,7 +961,7 @@ def _apply_approved_update():
 
     expected_sha = _file_sha256(target)
     _mark_update_pending_restart(
-        previous_blob=_git_worktree_blob("Alche.py"),
+        previous_blob=previous_blob,
         new_blob=remote_blob,
         backup_name=backup.name
     )
@@ -1121,6 +1122,50 @@ def send_user_telegram(user_id, message):
             payload.pop("parse_mode", None)
             requests.post(url, json=payload, timeout=5)
     except Exception: pass
+
+def _trade_qty_notional(trade_id, entry_price, fallback_margin=None, fallback_leverage=None):
+    try:
+        row = db_read("SELECT qty, notional_usd FROM trades WHERE id=?", (int(trade_id),))
+        qty = float(row[0][0] or 0.0) if row else 0.0
+        notional = float(row[0][1] or 0.0) if row else 0.0
+    except Exception:
+        qty, notional = 0.0, 0.0
+    try: entry = float(entry_price or 0.0)
+    except Exception: entry = 0.0
+    if qty <= 0 and notional > 0 and entry > 0: qty = notional / entry
+    if notional <= 0 and qty > 0 and entry > 0: notional = qty * entry
+    if qty <= 0 and fallback_margin and fallback_leverage and entry > 0:
+        try:
+            notional = float(fallback_margin) * float(fallback_leverage); qty = notional / entry
+        except Exception: pass
+    return max(0.0, qty), max(0.0, notional)
+
+def _gross_trade_pnl(side, entry_price, exit_price, qty):
+    try:
+        entry=float(entry_price); exit_=float(exit_price); q=float(qty)
+        if q <= 0 or entry <= 0 or exit_ <= 0: return 0.0
+        return (exit_-entry)*q if str(side).upper()=='BUY' else (entry-exit_)*q
+    except Exception: return 0.0
+
+def _format_pnl_usd(value):
+    try:
+        v=float(value or 0.0)
+        if abs(v)<0.0000005: v=0.0
+        return f"${v:+.4f}"
+    except Exception: return "$+0.0000"
+
+def format_trade_notification(kind, ex_id, symbol, side, entry=None, sl=None, tp=None, leverage=None, qty=None, notional=None, status=None, exit_price=None, pnl=None, dry_run=False, reason=None, auto_adjusted=False):
+    prefix='🧪 ' if dry_run else ''
+    lines=[f"{prefix}<b>{html.escape(str(kind).upper())}</b>", f"CEX: {html.escape(str(ex_id).upper())} | {html.escape(str(symbol))} | {html.escape(str(side).upper())}"]
+    if entry is not None: lines.append(f"{'Entry LIMIT' if str(kind).upper()=='NEW TRADE' else 'Entry'}: {float(entry):.8g}")
+    if sl is not None and tp is not None: lines.append(f"SL: {float(sl):.8g} | TP: {float(tp):.8g}")
+    if leverage is not None: lines.append(f"Leverage: <b>{int(leverage)}x</b>{' (auto-adjusted)' if auto_adjusted else ''}")
+    if qty is not None or notional is not None: lines.append(f"Qty: {float(qty):g} | Notional: ${float(notional):.4f}")
+    if exit_price is not None: lines.append(f"Exit: {float(exit_price):.8g}")
+    if pnl is not None: lines.append(f"PnL: <b>{_format_pnl_usd(pnl)}</b>")
+    if reason: lines.append(f"Reason: {html.escape(str(reason))}")
+    if status: lines.append(f"Status: <b>{html.escape(str(status))}</b>")
+    return "\n".join(lines)
 
 def send_error_alert(err_msg):
     global last_error_time, ERROR_HISTORY
@@ -1612,17 +1657,20 @@ def update_orders_and_positions():
                                 c.execute("UPDATE trades SET status='CANCELLED (Timeout)', closed_at=?, close_reason='CANCELLED (Timeout)' WHERE id=? AND status='PENDING'",
                                           (datetime.now(WIB).isoformat(timespec='seconds'), t_id))
                                 if c.rowcount:
-                                    send_user_telegram(user_id, f"⏱️ <b>PENDING TIMEOUT</b> {sym} ({ex_id.upper()})\nTidak fill dalam {MAX_PENDING_MINUTES} menit — dibatalkan.")
+                                    qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                    send_user_telegram(user_id, format_trade_notification('LIMIT CANCELLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='CANCELLED', dry_run=is_sim, reason=f'Timeout {MAX_PENDING_MINUTES} menit'))
                             continue
 
                         if not is_sim:
                             real_state = _real_exchange_order_state(ex, sym, ord_id)
                             if real_state == 'FILLED':
                                 n_stat = 'OPEN'
-                                send_user_telegram(user_id, f"🔔 <b>ORDER FILLED — CONFIRMED{tag}</b> {sym} di {ex_id.upper()}!")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN'))
                             elif real_state == 'CANCELLED':
                                 n_stat = 'CANCELLED'
-                                send_user_telegram(user_id, f"⚪ <b>ORDER CANCELLED</b> {sym} di {ex_id.upper()}")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                send_user_telegram(user_id, format_trade_notification('LIMIT CANCELLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='CANCELLED', reason='Exchange cancelled the pending order'))
                             elif real_state == 'FILLED_OR_CANCELLED':
                                 try:
                                     live_positions = ex.fetch_positions([sym])
@@ -1630,18 +1678,22 @@ def update_orders_and_positions():
                                 except Exception: has_pos = False
                                 if has_pos:
                                     n_stat = 'OPEN'
-                                    send_user_telegram(user_id, f"🔔 <b>ORDER FILLED (confirmed via position){tag}</b> {sym} di {ex_id.upper()}!")
+                                    qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                    send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN', reason='Confirmed via live position'))
                                 else:
                                     n_stat = 'CANCELLED'
-                                    send_user_telegram(user_id, f"⚪ <b>ORDER CANCELLED (not found){tag}</b> {sym} di {ex_id.upper()}")
+                                    qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                    send_user_telegram(user_id, format_trade_notification('LIMIT CANCELLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='CANCELLED', reason='Order missing and no live position found'))
                             else:
                                 n_stat = 'PENDING'
                         else:
                             n_stat = _pending_price_state(ex, sym, side, en, sl, tp)
                             if n_stat == 'OPEN':
-                                send_user_telegram(user_id, f"🔔 <b>ORDER FILLED (DRY RUN)</b> {sym} di {ex_id.upper()}!")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                send_user_telegram(user_id, format_trade_notification('LIMIT FILLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='OPEN', dry_run=True))
                             elif n_stat != 'PENDING':
-                                send_user_telegram(user_id, f"⚪ <b>AUTO-CANCEL (DRY RUN)</b> {sym}\nAlasan: {n_stat}")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                send_user_telegram(user_id, format_trade_notification('LIMIT CANCELLED', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, status='CANCELLED', dry_run=True, reason=n_stat))
 
                         if n_stat != 'PENDING':
                             c.execute("UPDATE trades SET status=?, closed_at=CASE WHEN ?='OPEN' THEN closed_at ELSE COALESCE(closed_at,?) END, close_reason=CASE WHEN ?='OPEN' THEN close_reason ELSE ? END WHERE id=? AND status='PENDING'",
@@ -1675,14 +1727,8 @@ def update_orders_and_positions():
                                     if ex_exit is not None:
                                         exit_price = ex_exit
                                 if realized is None and exit_price is not None:
-                                    try:
-                                        qty_row = c.execute("SELECT qty FROM trades WHERE id=?", (t_id,)).fetchone()
-                                        qty_f = float(qty_row[0] or 0.0) if qty_row else 0.0
-                                        realized = ((float(exit_price)-float(en))*qty_f
-                                                    if side == 'BUY'
-                                                    else (float(en)-float(exit_price))*qty_f)
-                                    except Exception:
-                                        realized = 0.0
+                                    qty_f, _notional_f = _trade_qty_notional(t_id, en)
+                                    realized = _gross_trade_pnl(side, en, exit_price, qty_f)
                                 c.execute(
                                     "UPDATE trades SET status=?, exit_price=?, realized_pnl=?, "
                                     "closed_at=?, close_reason=? WHERE id=? AND status='OPEN'",
@@ -1691,31 +1737,24 @@ def update_orders_and_positions():
                                      new_status, t_id)
                                 )
                                 if c.rowcount:
-                                    emoji = '🎉' if 'TP' in new_status else ('❌' if 'SL' in new_status else '❔')
-                                    send_user_telegram(user_id, f"{emoji} <b>{new_status}</b> {sym} ({ex_id.upper()}) terdeteksi dari posisi exchange.")
+                                    qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                    kind = 'TAKE PROFIT' if 'TP' in new_status else ('STOP LOSS' if 'SL' in new_status else 'POSITION CLOSED')
+                                    send_user_telegram(user_id, format_trade_notification(kind, ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=exit_price, pnl=float(realized or 0.0), status='CLOSED', reason='Exchange position closed'))
                         else:
                             ticker = tickers_by_ex.get(ex_key, {}).get(sym)
                             curr_price = float(ticker['last']) if ticker and ticker.get('last') else ex.fetch_ticker(sym)['last']
                             if (side == 'BUY' and curr_price >= tp) or (side == 'SELL' and curr_price <= tp):
-                                qrow=c.execute("SELECT qty FROM trades WHERE id=?",(t_id,)).fetchone()
-                                qty_f=float(qrow[0] or 0.0) if qrow else 0.0
-                                pnl=((float(curr_price)-float(en))*qty_f if side=='BUY' else (float(en)-float(curr_price))*qty_f)
-                                c.execute(
-                                    "UPDATE trades SET status='CLOSED (TP)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (TP)' WHERE id=? AND status='OPEN'",
-                                    (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id)
-                                )
-                                if c.rowcount:
-                                    send_user_telegram(user_id, f"🎉 <b>TAKE PROFIT{tag}</b> {sym} | PnL ${pnl:.4f} 🚀")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                pnl = _gross_trade_pnl(side, en, curr_price, qty_f)
+                                if qty_f > 0: c.execute("UPDATE trades SET qty=?, notional_usd=? WHERE id=? AND (qty IS NULL OR qty<=0)", (qty_f, notional_f, t_id))
+                                c.execute("UPDATE trades SET status='CLOSED (TP)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (TP)' WHERE id=? AND status='OPEN'", (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id))
+                                if c.rowcount: send_user_telegram(user_id, format_trade_notification('TAKE PROFIT', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=curr_price, pnl=pnl, status='CLOSED', dry_run=True)+'\n🚀')
                             elif (side == 'BUY' and curr_price <= sl) or (side == 'SELL' and curr_price >= sl):
-                                qrow=c.execute("SELECT qty FROM trades WHERE id=?",(t_id,)).fetchone()
-                                qty_f=float(qrow[0] or 0.0) if qrow else 0.0
-                                pnl=((float(curr_price)-float(en))*qty_f if side=='BUY' else (float(en)-float(curr_price))*qty_f)
-                                c.execute(
-                                    "UPDATE trades SET status='CLOSED (SL)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (SL)' WHERE id=? AND status='OPEN'",
-                                    (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id)
-                                )
-                                if c.rowcount:
-                                    send_user_telegram(user_id, f"❌ <b>STOP LOSS{tag}</b> {sym} | PnL ${pnl:.4f} 🔻")
+                                qty_f, notional_f = _trade_qty_notional(t_id, en)
+                                pnl = _gross_trade_pnl(side, en, curr_price, qty_f)
+                                if qty_f > 0: c.execute("UPDATE trades SET qty=?, notional_usd=? WHERE id=? AND (qty IS NULL OR qty<=0)", (qty_f, notional_f, t_id))
+                                c.execute("UPDATE trades SET status='CLOSED (SL)',exit_price=?,realized_pnl=?,closed_at=?,close_reason='CLOSED (SL)' WHERE id=? AND status='OPEN'", (float(curr_price),float(pnl),datetime.now(WIB).isoformat(timespec='seconds'),t_id))
+                                if c.rowcount: send_user_telegram(user_id, format_trade_notification('STOP LOSS', ex_id, sym, side, entry=en, sl=sl, tp=tp, qty=qty_f, notional=notional_f, exit_price=curr_price, pnl=pnl, status='CLOSED', dry_run=True)+'\n🔻')
                 except Exception as e:
                     send_error_alert(f"Position monitor [{ex_id}:{sym}]: {e}")
             conn.commit()
@@ -2529,18 +2568,8 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
                 _cancel_reserved_trade(trade_id, "RESERVATION_ACTIVATION_FAILED")
                 continue
 
-            status_text = 'FILLED' if trade_status == 'OPEN' else 'PENDING LIMIT'
-            status_text = 'FILLED' if trade_status == 'OPEN' else 'PENDING LIMIT'
-            send_user_telegram(
-                user_id,
-                f"🎯 <b>{mode}</b>\n"
-                f"CEX: {ex_id.upper()} | {sym} | {sig}\n"
-                f"Entry LIMIT: {float(en):.8g}\n"
-                f"SL: {float(sl):.8g} | TP: {float(tp):.8g}\n"
-                f"Leverage: <b>{lev_to_set}x</b>{(' (auto-adjusted)' if lev_to_set != lev else '')}\n"
-                f"Qty: {qty:g} | Notional: ${notional:.4f}\n"
-                f"Status: <b>{status_text}</b>"
-            )
+            status_text = 'OPEN' if trade_status == 'OPEN' else 'PENDING LIMIT'
+            send_user_telegram(user_id, format_trade_notification('NEW TRADE', ex_id, sym, sig, entry=en, sl=sl, tp=tp, leverage=lev_to_set, qty=qty, notional=notional, status=status_text, dry_run=dry_run, auto_adjusted=(lev_to_set != lev)))
             created += 1
             cycle_created_symbols.add(sym)
             runtime['signals'] = runtime.get('signals', 0) + 1
@@ -2678,7 +2707,7 @@ def vip_settings_keyboard():
 def vip_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 POSISI", callback_data="positions"), InlineKeyboardButton(text="📈 STATISTIK", callback_data="stats")],
-        [InlineKeyboardButton(text="💎 VIP SETTINGS", callback_data="vip_settings")],
+        [InlineKeyboardButton(text="👤 VIP INFO", callback_data="vip_info")],
         [InlineKeyboardButton(text="⚙️ CUSTOM TRADING PER CEX", callback_data="risk_settings")],
         [InlineKeyboardButton(text="🏦 CEX STATUS", callback_data="cex_status"), InlineKeyboardButton(text="🛰️ RUNTIME STATUS", callback_data="runtime_status")],
         [InlineKeyboardButton(text="🔐 API & AKUN", callback_data="api_menu")],
@@ -2917,6 +2946,8 @@ def ensure_trade_accounting_columns():
             for name, decl in additions:
                 if name not in cols:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {name} {decl}")
+            conn.execute("UPDATE trades SET notional_usd=qty*entry_price WHERE (notional_usd IS NULL OR notional_usd<=0) AND qty>0 AND entry_price>0")
+            conn.execute("UPDATE trades SET qty=notional_usd/entry_price WHERE (qty IS NULL OR qty<=0) AND notional_usd>0 AND entry_price>0")
             conn.commit()
         finally:
             conn.close()
@@ -3946,6 +3977,19 @@ async def cb_vip_reset_settings(callback: CallbackQuery):
     await safe_answer(callback, "Default dikembalikan.")
     await callback.message.edit_text(vip_recommended_settings_text(uid), reply_markup=vip_settings_keyboard())
 
+@dp.callback_query(F.data == "vip_info")
+async def cb_vip_info(callback: CallbackQuery):
+    if not is_vip(callback):
+        await safe_answer(callback, "Fitur VIP saja.", True); return
+    uid=_chat_id(callback)
+    rows=db_read("SELECT ex_id, margin, leverage, max_pos, max_trades_day, max_loss FROM cex_risk_settings WHERE user_id=? ORDER BY ex_id", (uid,))
+    lines=["👤 <b>VIP INFO</b>","","Setting trading dikelola terpisah per CEX:"]
+    for ex_id,margin,lev,max_pos,max_trades,max_loss in rows:
+        lines.append(f"• <b>{str(ex_id).upper()}</b> — ${float(margin):.2f} / {int(lev)}x / {int(max_pos)}P / {int(max_trades)}E / ${float(max_loss):.2f} RL")
+    lines += ["","⚙️ Gunakan <b>CUSTOM TRADING PER CEX</b> untuk mengubah setting akun."]
+    await safe_answer(callback)
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ CUSTOM TRADING PER CEX", callback_data="risk_settings")],[InlineKeyboardButton(text="⬅️ KEMBALI", callback_data="menu")]]))
+
 @dp.callback_query(F.data == "vip_settings")
 async def cb_vip_settings(callback: CallbackQuery):
     if not is_vip(callback): await safe_answer(callback, "Fitur VIP saja.", True); return
@@ -4818,7 +4862,7 @@ async def app_main():
     global MAIN_ASYNC_LOOP
     MAIN_ASYNC_LOOP = asyncio.get_running_loop()
     asyncio.create_task(auto_update_monitor(), name='github-update-monitor')
-    init_db(); load_settings(); _refresh_owner_pair_state_from_db(); refresh_owner_eligible_pairs(); reload_exchanges(); set_runtime_event(f'DRY RUN public scanners: {sum(1 for x in DEFAULT_CEX if get_owner_dry_run(x))}/{len(DEFAULT_CEX)} CEX initialized')
+    init_db(); ensure_trade_accounting_columns(); load_settings(); _refresh_owner_pair_state_from_db(); refresh_owner_eligible_pairs(); reload_exchanges(); set_runtime_event(f'DRY RUN public scanners: {sum(1 for x in DEFAULT_CEX if get_owner_dry_run(x))}/{len(DEFAULT_CEX)} CEX initialized')
     
     # Start Fast Monitor Thread (3 detik)
     threading.Thread(target=fast_trade_monitor, name='fast-monitor', daemon=True).start()
