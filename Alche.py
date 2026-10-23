@@ -275,17 +275,13 @@ def atomic_reserve_trade_slot(user_id, exchange_id, symbol):
                 "WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')",
                 (str(user_id), str(exchange_id))
             ).fetchone()[0]
-            active_global = conn.execute(
-                "SELECT COUNT(*) FROM trades "
-                "WHERE user_id=? AND status IN ('PENDING','OPEN')",
-                (str(user_id),)
-            ).fetchone()[0]
+            # Position limits are independent per CEX. A full CEX allocation
+            # must never block another CEX.
             max_cex = int(get_cex_max_positions(user_id, exchange_id))
-            max_global = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', max_cex))
 
-            if active_cex >= max_cex or active_global >= max_global:
+            if active_cex >= max_cex:
                 conn.rollback()
-                return False, "MAX_POSITION"
+                return False, "MAX_POSITION_CEX"
 
             duplicate = conn.execute(
                 "SELECT 1 FROM trades WHERE user_id=? AND exchange_id=? AND symbol=? "
@@ -683,6 +679,7 @@ POSITION_MODE_CACHE = {}
 POSITION_MODE_CACHE_TTL = 3600
 LEVERAGE_TIERS_CACHE = {}
 LEVERAGE_TIERS_CACHE_TTL = 3600
+MARGIN_MODE_SET = set()
 
 TRADE_TERMINAL_STATUSES = {
     'CLOSED (TP)', 'CLOSED (SL)', 'CLOSED (UNKNOWN)', 'CANCELLED', 'ERROR'
@@ -2328,9 +2325,7 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
         
         active_count = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND exchange_id=? AND status IN ('PENDING','OPEN')", (user_id, ex_id))[0][0]
-        global_active = db_read("SELECT COUNT(*) FROM trades WHERE user_id=? AND status IN ('PENDING','OPEN')", (user_id,))[0][0]
         user_max_pos = int(risk_cfg['max_pos'])
-        global_max = int(CONFIG.get('MAX_CONCURRENT_POSITIONS', 2))
         
         today_realized_loss = get_today_realized_loss(user_id, ex_id)
         today_trades_cex = _count_today_trades(user_id, ex_id)
@@ -2344,9 +2339,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         if active_count >= user_max_pos:
             can_open_trade = False
             reason_cant_trade = f'Max Posisi CEX ({active_count}/{user_max_pos})'
-        elif global_active >= global_max:
-            can_open_trade = False
-            reason_cant_trade = f'Max Posisi Global ({global_active}/{global_max})'
         elif today_trades_cex >= max_trades_cex:
             can_open_trade = False
             reason_cant_trade = f"Max trade CEX/hari ({today_trades_cex}/{max_trades_cex})"
@@ -2599,11 +2591,11 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             
             if not dry_run:
                 active_count_after = active_count + created
-                global_active_after = global_active + created
-                if active_count_after >= user_max_pos or global_active_after >= global_max:
+                # Reaching this CEX's limit only stops this CEX.
+                if active_count_after >= user_max_pos:
                     can_open_trade = False
-                    reason_cant_trade = f'Max Posisi reached'
-                    runtime['last_reason'] = f'Max Posisi reached, Scan Only'
+                    reason_cant_trade = f'Max Posisi CEX reached'
+                    runtime['last_reason'] = f'Max Posisi CEX reached, Scan Only'
 
         if rate_limited:
             runtime['last_reason'] = (f'{rate_limited} symbol request kena 100410, skip lokal; scanner tetap jalan')
@@ -3573,8 +3565,7 @@ async def cmd_setmaxpos(message: Message):
         value = int((message.text or '').split()[1])
         CONFIG['MAX_CONCURRENT_POSITIONS'] = value
         update_db_setting('max_pos', value)
-        _sync_global_max_pos_to_cex(value)
-        await message.answer(f"✅ Max Posisi: {value} (Global & CEX)", reply_markup=role_keyboard(message))
+        await message.answer(f"✅ Max Posisi default: {value}. Limit trading tetap independen per CEX.", reply_markup=role_keyboard(message))
     except Exception: await message.answer("⚠️ Format: /setmaxpos 2")
 
 @dp.message(Command("setminwr"))
@@ -3795,7 +3786,7 @@ async def cb_vip_maxpos(callback: CallbackQuery):
     if not is_vip(callback): await safe_answer(callback, "Fitur VIP saja.", True); return
     value=int(callback.data.split(':',1)[1])
     set_user_setting(_chat_id(callback), 'max_pos', value)
-    await safe_answer(callback, f"Max posisi {value}")
+    await safe_answer(callback, f"Max posisi default {value}")
     await callback.message.edit_text(vip_recommended_settings_text(_chat_id(callback)), reply_markup=vip_settings_keyboard())
 
 @dp.callback_query(F.data == "vip_set_maxtrades")
@@ -4630,9 +4621,8 @@ async def cb_set_maxpos(callback: CallbackQuery):
     value=int(callback.data.split(':')[1])
     CONFIG['MAX_CONCURRENT_POSITIONS']=value
     update_db_setting('max_pos', value)
-    _sync_global_max_pos_to_cex(value)
-    await safe_answer(callback, f"Max posisi {value}")
-    await callback.message.edit_text(f"✅ <b>Max posisi:</b> {value}", reply_markup=settings_keyboard())
+    await safe_answer(callback, f"Max posisi default {value}")
+    await callback.message.edit_text(f"✅ <b>Max posisi default:</b> {value}\n\nLimit trading tetap independen per CEX.", reply_markup=settings_keyboard())
 
 @dp.callback_query(F.data == "set_minwr_menu")
 async def cb_set_minwr_menu(callback: CallbackQuery):
@@ -4936,14 +4926,21 @@ async def app_main():
     global MAIN_ASYNC_LOOP
     MAIN_ASYNC_LOOP = asyncio.get_running_loop()
     asyncio.create_task(auto_update_monitor(), name='github-update-monitor')
+
+    # Start Flask FIRST so the dashboard is reachable immediately after VPS restart.
+    # DB/exchange initialization may take time and must not block port 5000.
+    threading.Thread(
+        target=lambda: app.run(host='0.0.0.0', port=5000, use_reloader=False),
+        name='flask-dashboard',
+        daemon=True
+    ).start()
+
     init_db(); ensure_trade_accounting_columns(); load_settings(); _refresh_owner_pair_state_from_db(); refresh_owner_eligible_pairs(); reload_exchanges(); set_runtime_event(f'DRY RUN public scanners: {sum(1 for x in DEFAULT_CEX if get_owner_dry_run(x))}/{len(DEFAULT_CEX)} CEX initialized')
-    
+
     # Start Fast Monitor Thread (3 detik)
     threading.Thread(target=fast_trade_monitor, name='fast-monitor', daemon=True).start()
     # Start Scanner Thread (5 detik loop)
     threading.Thread(target=main_loop, name='trading-engine', daemon=True).start()
-    # Start Flask Web Dashboard
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, use_reloader=False), name='flask-dashboard', daemon=True).start()
     
     try:
         await aiogram_polling()
