@@ -3900,19 +3900,69 @@ async def cb_owner_pair_remove(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "risk_settings")
 async def cb_risk_settings(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
-    uid=_account_user_id(callback.message.chat.id)
-    await safe_answer(callback)
-    await callback.message.edit_text("⚙️ <b>CUSTOM TRADING PER CEX</b>\n\nPilih CEX. Setting setiap CEX berdiri sendiri.\n\nDefault: <b>20x • 2 posisi • 10 entry • $5 realized loss • CROSS mode</b>\n\n"+CUSTOMIZE_WARNING_TEXT,reply_markup=cex_risk_cex_keyboard(uid))
+    """Open Custom Trading per CEX for Owner or VIP.
+    Robust against stale Telegram messages and missing legacy DB rows.
+    """
+    if not is_allowed_chat(callback):
+        await safe_answer(callback, "Akses hanya untuk Owner/VIP.", True)
+        return
+
+    uid = _account_user_id(callback.message.chat.id)
+
+    try:
+        # Guarantee the per-CEX table/rows exist before rendering the keyboard.
+        for ex_id in DEFAULT_CEX:
+            ensure_cex_risk_settings(uid, ex_id)
+
+        markup = cex_risk_cex_keyboard(uid)
+        text = (
+            "⚙️ <b>CUSTOM TRADING PER CEX</b>\n\n"
+            "Pilih CEX. Setting setiap CEX berdiri sendiri.\n\n"
+            "Default: <b>20x • 2 posisi • 10 entry • $5 realized loss • CROSS mode</b>\n\n"
+            + CUSTOMIZE_WARNING_TEXT
+        )
+
+        await safe_answer(callback, "Membuka Custom Trading...")
+        try:
+            await callback.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest as exc:
+            # Telegram raises this when the message is already identical.
+            if "message is not modified" in str(exc).lower():
+                return
+            # If the old callback message cannot be edited, send a fresh menu.
+            await callback.message.answer(text, reply_markup=markup)
+
+    except Exception as exc:
+        await safe_answer(callback, "Custom CEX gagal dibuka.", True)
+        print(f"[CUSTOM-CEX] open error uid={uid}: {exc}")
 
 @dp.callback_query(F.data.startswith("risk_cex:"))
 async def cb_risk_cex(callback: CallbackQuery):
-    if not is_allowed_chat(callback): return
-    ex=callback.data.split(":",1)[1]
-    if ex not in DEFAULT_CEX: await safe_answer(callback,"CEX tidak valid.",True); return
-    uid=_account_user_id(callback.message.chat.id)
-    await safe_answer(callback)
-    await callback.message.edit_text(cex_risk_text(uid,ex),reply_markup=cex_risk_field_keyboard(ex))
+    if not is_allowed_chat(callback):
+        await safe_answer(callback, "Akses hanya untuk Owner/VIP.", True)
+        return
+
+    ex = callback.data.split(":", 1)[1].lower()
+    if ex not in DEFAULT_CEX:
+        await safe_answer(callback, "CEX tidak valid.", True)
+        return
+
+    uid = _account_user_id(callback.message.chat.id)
+
+    try:
+        ensure_cex_risk_settings(uid, ex)
+        await safe_answer(callback)
+        markup = cex_risk_field_keyboard(ex)
+        text = cex_risk_text(uid, ex)
+        try:
+            await callback.message.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            await callback.message.answer(text, reply_markup=markup)
+    except Exception as exc:
+        await safe_answer(callback, "Gagal membuka setting CEX.", True)
+        print(f"[CUSTOM-CEX] detail error uid={uid} ex={ex}: {exc}")
 
 @dp.callback_query(F.data.startswith("risk_field:"))
 async def cb_risk_field(callback: CallbackQuery):
