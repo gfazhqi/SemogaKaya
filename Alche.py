@@ -1353,26 +1353,211 @@ def check_and_update_daily_sl():
 # =================================================================
 # SMC STRATEGY
 # =================================================================
-def analyze_smc_retrace(df_m15, df_h1, daily_open):
-    if len(df_m15) < 7 or len(df_h1) < 2:
+def _mnsr_swings(df, lookback=3):
+    """Return confirmed swing highs/lows using closed candles only."""
+    d = df.iloc[:-1].copy() if len(df) > 1 else df.copy()
+    highs, lows = [], []
+    if len(d) < (lookback * 2 + 3):
+        return highs, lows
+    for i in range(lookback, len(d) - lookback):
+        h = float(d['high'].iloc[i]); l = float(d['low'].iloc[i])
+        if h >= float(d['high'].iloc[i-lookback:i+lookback+1].max()):
+            highs.append((i, h))
+        if l <= float(d['low'].iloc[i-lookback:i+lookback+1].min()):
+            lows.append((i, l))
+    return highs, lows
+
+
+def _mnsr_structure(df):
+    highs, lows = _mnsr_swings(df, 2)
+    if len(highs) < 2 or len(lows) < 2:
+        return {'bias': None, 'bos_bull': False, 'bos_bear': False,
+                'choch_bull': False, 'choch_bear': False,
+                'sweep_bull': False, 'sweep_bear': False,
+                'last_high': None, 'prev_high': None, 'last_low': None, 'prev_low': None}
+    d = df.iloc[:-1].copy()
+    last = d.iloc[-1]
+    ph_i, ph = highs[-2]; lh_i, lh = highs[-1]
+    pl_i, pl = lows[-2]; ll_i, ll = lows[-1]
+    close = float(last['close']); high = float(last['high']); low = float(last['low'])
+    bullish = lh > ph and ll > pl
+    bearish = lh < ph and ll < pl
+    # BOS = close through the latest confirmed swing.
+    bos_bull = close > lh
+    bos_bear = close < ll
+    # CHoCH = current candle breaks the opposite structural boundary.
+    prior_bull = float(d['close'].iloc[-2]) > ph if len(d) >= 2 else False
+    prior_bear = float(d['close'].iloc[-2]) < pl if len(d) >= 2 else False
+    choch_bull = close > ph and not prior_bull
+    choch_bear = close < pl and not prior_bear
+    # Liquidity sweep: wick through prior swing, close back inside.
+    sweep_bull = low < ll and close > ll
+    sweep_bear = high > lh and close < lh
+    return {
+        'bias': 'BULL' if bullish else 'BEAR' if bearish else None,
+        'bos_bull': bos_bull, 'bos_bear': bos_bear,
+        'choch_bull': choch_bull, 'choch_bear': choch_bear,
+        'sweep_bull': sweep_bull, 'sweep_bear': sweep_bear,
+        'last_high': lh, 'prev_high': ph, 'last_low': ll, 'prev_low': pl,
+    }
+
+
+def _mnsr_fvg_ob(df, bullish):
+    """Find recent FVG and simple order-block/displacement context."""
+    d = df.iloc[:-1].copy()
+    if len(d) < 8:
+        return None, None, False
+    atr = float((d['high'] - d['low']).rolling(14).mean().iloc[-1])
+    atr = atr if atr > 0 else float(d['high'].iloc[-1] - d['low'].iloc[-1])
+    fvg = None
+    ob = None
+    displacement = False
+    for i in range(len(d)-1, max(2, len(d)-10), -1):
+        a = d.iloc[i-2]; b = d.iloc[i-1]; c = d.iloc[i]
+        body = abs(float(c['close']) - float(c['open']))
+        if bullish and float(c['low']) > float(a['high']):
+            fvg = (float(a['high']), float(c['low']))
+            displacement = float(c['close']) > float(c['open']) and body >= atr * 0.8
+            # Last bearish candle before bullish displacement.
+            if float(b['close']) < float(b['open']):
+                ob = (float(b['low']), float(b['high']))
+            break
+        if not bullish and float(c['high']) < float(a['low']):
+            fvg = (float(c['high']), float(a['low']))
+            displacement = float(c['close']) < float(c['open']) and body >= atr * 0.8
+            if float(b['close']) > float(b['open']):
+                ob = (float(b['low']), float(b['high']))
+            break
+    return fvg, ob, displacement
+
+
+def _mnsr_smt_ssmt(symbol, df_a, df_b):
+    """SMT/SSMT context using two correlated crypto leaders (BTC/ETH).
+    SMT = one leader makes the liquidity extreme while the other fails to confirm.
+    SSMT = both leaders fail/confirm the same divergence around their recent extremes.
+    """
+    if df_a is None or df_b is None or len(df_a) < 10 or len(df_b) < 10:
+        return False, False, None
+    a = df_a.iloc[:-1].copy(); b = df_b.iloc[:-1].copy()
+    a_hi = float(a['high'].iloc[-1]); a_lo = float(a['low'].iloc[-1])
+    b_hi = float(b['high'].iloc[-1]); b_lo = float(b['low'].iloc[-1])
+    a_prev_hi = float(a['high'].iloc[-4:-1].max()); a_prev_lo = float(a['low'].iloc[-4:-1].min())
+    b_prev_hi = float(b['high'].iloc[-4:-1].max()); b_prev_lo = float(b['low'].iloc[-4:-1].min())
+    bull_a = a_lo < a_prev_lo
+    bull_b = b_lo < b_prev_lo
+    bear_a = a_hi > a_prev_hi
+    bear_b = b_hi > b_prev_hi
+    smt_bull = bull_a != bull_b
+    smt_bear = bear_a != bear_b
+    # Strong SMT: the two leaders disagree in both the extreme and the close direction.
+    a_close = float(a['close'].iloc[-1]); b_close = float(b['close'].iloc[-1])
+    a_prev_close = float(a['close'].iloc[-4]); b_prev_close = float(b['close'].iloc[-4])
+    ssmt_bull = smt_bull and ((a_close > a_prev_close) != (b_close > b_prev_close))
+    ssmt_bear = smt_bear and ((a_close < a_prev_close) != (b_close < b_prev_close))
+    if ssmt_bull:
+        return True, True, 'BULL'
+    if ssmt_bear:
+        return True, True, 'BEAR'
+    if smt_bull:
+        return True, False, 'BULL'
+    if smt_bear:
+        return True, False, 'BEAR'
+    return False, False, None
+
+
+def _mnsr_previous_liquidity(df):
+    d = df.iloc[:-1].copy()
+    if len(d) < 12:
+        return None
+    return float(d['high'].iloc[-12:].max()), float(d['low'].iloc[-12:].min())
+
+
+def analyze_mnsr_full(df_m15, df_h1, daily_open, smt_a=None, smt_b=None):
+    """Full MNSR technical engine. Infrastructure/execution stays untouched."""
+    if len(df_m15) < 30 or len(df_h1) < 30:
+        return None, 0.0, 0.0, 0.0
+    m15 = df_m15.copy(); h1 = df_h1.copy()
+    htf = _mnsr_structure(h1)
+    ltf = _mnsr_structure(m15)
+    h1_closed = h1.iloc[:-1]
+    m15_closed = m15.iloc[:-1]
+    if len(h1_closed) < 20 or len(m15_closed) < 20:
         return None, 0.0, 0.0, 0.0
 
-    ema50 = df_h1['close'].ewm(span=50, adjust=False).mean().iloc[-2]
-    h1_c, c_prev = df_h1['close'].iloc[-2], df_m15.iloc[-2]
-    sig, en, sl, tp = None, 0.0, 0.0, 0.0
-    if h1_c > ema50 and c_prev['close'] > daily_open:
-        if c_prev['low'] < df_m15['low'].iloc[-7:-2].min() and c_prev['close'] > c_prev['open']:
-            en = c_prev['high'] - (0.5 * (c_prev['high'] - c_prev['low']))
-            sl = c_prev['low'] * (1.0 - SL_BUFFER_PERCENT)
-            tp = en + (en - sl)
-            sig = 'BUY'
-    elif h1_c < ema50 and c_prev['close'] < daily_open:
-        if c_prev['high'] > df_m15['high'].iloc[-7:-2].max() and c_prev['close'] < c_prev['open']:
-            en = c_prev['low'] + (0.5 * (c_prev['high'] - c_prev['low']))
-            sl = c_prev['high'] * (1.0 + SL_BUFFER_PERCENT)
-            tp = en - (sl - en)
-            sig = 'SELL'
-    return sig, en, sl, tp
+    ema50 = float(h1_closed['close'].ewm(span=50, adjust=False).mean().iloc[-1])
+    htf_close = float(h1_closed['close'].iloc[-1])
+    daily_open = float(daily_open)
+    bull_bias = htf['bias'] == 'BULL' and htf_close > ema50 and htf_close > daily_open
+    bear_bias = htf['bias'] == 'BEAR' and htf_close < ema50 and htf_close < daily_open
+    smt_ok, ssmt_ok, smt_dir = _mnsr_smt_ssmt('PAIR', smt_a, smt_b) if smt_a is not None and smt_b is not None else (False, False, None)
+
+    # Range for premium/discount. Entry must be on the correct side of equilibrium.
+    range_hi = float(m15_closed['high'].iloc[-20:].max())
+    range_lo = float(m15_closed['low'].iloc[-20:].min())
+    eq = (range_hi + range_lo) / 2.0
+    last = m15_closed.iloc[-1]
+    candle_range = max(float(last['high']) - float(last['low']), 1e-12)
+    body = abs(float(last['close']) - float(last['open']))
+    body_ratio = body / candle_range
+
+    fvg_bull, ob_bull, disp_bull = _mnsr_fvg_ob(m15, True)
+    fvg_bear, ob_bear, disp_bear = _mnsr_fvg_ob(m15, False)
+    liq = _mnsr_previous_liquidity(m15)
+    if liq is None:
+        return None, 0.0, 0.0, 0.0
+    prev_hi, prev_lo = liq
+
+    # Core MNSR sequence: bias + liquidity event + structure shift + displacement
+    # + location + SMT/SSMT. This is deliberately selective to reduce noise.
+    buy_core = (
+        bull_bias and
+        (ltf['sweep_bull'] or ltf['choch_bull'] or ltf['bos_bull']) and
+        (ltf['choch_bull'] or ltf['bos_bull']) and
+        disp_bull and
+        float(last['close']) <= eq and
+        (fvg_bull is not None or ob_bull is not None) and
+        smt_ok and smt_dir == 'BULL'
+    )
+    sell_core = (
+        bear_bias and
+        (ltf['sweep_bear'] or ltf['choch_bear'] or ltf['bos_bear']) and
+        (ltf['choch_bear'] or ltf['bos_bear']) and
+        disp_bear and
+        float(last['close']) >= eq and
+        (fvg_bear is not None or ob_bear is not None) and
+        smt_ok and smt_dir == 'BEAR'
+    )
+    if not buy_core and not sell_core:
+        return None, 0.0, 0.0, 0.0
+
+    # 50% retracement of the displacement/trigger candle.
+    if buy_core:
+        sig = 'BUY'
+        en = float(last['low']) + 0.50 * candle_range
+        structural_sl = min(float(last['low']), float(ltf['last_low'] or last['low']))
+        sl = structural_sl * (1.0 - SL_BUFFER_PERCENT)
+        # Prefer nearby external liquidity as TP, otherwise minimum 2R.
+        target = prev_hi if prev_hi > en else en + 2.0 * (en - sl)
+        tp = max(target, en + 2.0 * (en - sl))
+    else:
+        sig = 'SELL'
+        en = float(last['high']) - 0.50 * candle_range
+        structural_sl = max(float(last['high']), float(ltf['last_high'] or last['high']))
+        sl = structural_sl * (1.0 + SL_BUFFER_PERCENT)
+        target = prev_lo if prev_lo < en else en - 2.0 * (sl - en)
+        tp = min(target, en - 2.0 * (sl - en))
+
+    if en <= 0 or sl <= 0 or tp <= 0:
+        return None, 0.0, 0.0, 0.0
+    rr = abs(tp - en) / max(abs(en - sl), 1e-12)
+    if rr < 2.0:
+        return None, 0.0, 0.0, 0.0
+    return sig, float(en), float(sl), float(tp)
+
+
+def analyze_smc_retrace(df_m15, df_h1, daily_open):
+    """Compatibility wrapper; technical engine is now full MNSR."""
+    return analyze_mnsr_full(df_m15, df_h1, daily_open)
 
 def ensure_one_way_mode(ex, ex_id, symbol):
     cache_key = f"{ex_id}::{id(ex)}"
@@ -2505,6 +2690,20 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         except Exception:
             pass
 
+        # MNSR SMT/SSMT leader context: fetch BTC/ETH once per scan cycle.
+        smt_btc = smt_eth = None
+        try:
+            market_symbols = list(EXCHANGE_MARKETS.get(exchange_key, {}).keys())
+            btc_sym = next((s for s in market_symbols if canonical_pair(s) == 'BTC/USDT'), None)
+            eth_sym = next((s for s in market_symbols if canonical_pair(s) == 'ETH/USDT'), None)
+            if btc_sym and eth_sym:
+                btc_raw = ex.fetch_ohlcv(btc_sym, '15m', limit=60)
+                eth_raw = ex.fetch_ohlcv(eth_sym, '15m', limit=60)
+                smt_btc = pd.DataFrame(btc_raw, columns=['time','open','high','low','close','vol']) if btc_raw else None
+                smt_eth = pd.DataFrame(eth_raw, columns=['time','open','high','low','close','vol']) if eth_raw else None
+        except Exception:
+            smt_btc = smt_eth = None
+
         created = 0
         rate_limited = 0
         cycle_created_symbols = set()
@@ -2563,10 +2762,10 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
             if not m15 or len(m15) < 7 or not h1 or len(h1) < 2 or not d1 or len(d1) < 1: continue
             
             try:
-                sig, en, sl, tp = analyze_smc_retrace(
-                    pd.DataFrame(m15, columns=['time','open','high','low','close','vol']),
-                    pd.DataFrame(h1, columns=['time','open','high','low','close','vol']),
-                    d1[-1][1]
+                m15_df = pd.DataFrame(m15, columns=['time','open','high','low','close','vol'])
+                h1_df = pd.DataFrame(h1, columns=['time','open','high','low','close','vol'])
+                sig, en, sl, tp = analyze_mnsr_full(
+                    m15_df, h1_df, d1[-1][1], smt_btc, smt_eth
                 )
             except Exception:
                 continue
