@@ -137,10 +137,9 @@ def _utc_now_sql():
 
 
 
-def session_filter_allowed(*args, **kwargs):
-    """Session gate is identical for DRY RUN and REAL unless explicitly changed."""
-    # DRY_RUN_BYPASS_SESSION is intentionally False in this build.
-    return not DRY_RUN_BYPASS_SESSION
+def session_filter_allowed(dry_run=False):
+    """Return whether the strategy may scan/open a new trade at this time."""
+    return True if dry_run and DRY_RUN_BYPASS_SESSION else is_kill_zone()
 
 
 def _run_git(*args):
@@ -780,32 +779,62 @@ def reload_exchanges():
     EXCHANGE_LAST_CANDLE.clear()
 
     for user_id, ex_id, api, sec, en, password in rows:
-        if ex_id not in DEFAULT_CEX or en != 1: continue
-        if str(user_id) != 'OWNER':
-            if get_vip_member(user_id) is None: continue
+        if ex_id not in DEFAULT_CEX or en != 1:
+            continue
+
+        user_is_owner = str(user_id) == 'OWNER'
+        if not user_is_owner:
+            if get_vip_member(user_id) is None:
+                continue
             try:
                 ucfg = get_user_settings(user_id)
-                if not ucfg['auto_trade']: continue
+                if not ucfg['auto_trade']:
+                    continue
             except Exception:
                 continue
+
+        dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
+        base_params = {
+            'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
+            'enableRateLimit': True,
+            'timeout': 8000
+        }
+        if ex_id == 'bingx':
+            base_params['rateLimit'] = 350
+        if ex_id == 'bitget':
+            base_params['password'] = password or ''
+
         try:
-            params = {
-                'apiKey': api or '', 'secret': sec or '',
-                'options': {'defaultType': DEFAULT_CEX[ex_id]['type']},
-                'enableRateLimit': True, 'timeout': 8000
-            }
-            if ex_id == 'bingx': params['rateLimit'] = 350
-            if ex_id == 'bitget': params['password'] = password or ''
+            params = dict(base_params)
+            params.update({'apiKey': api or '', 'secret': sec or ''})
             ex = getattr(ccxt, ex_id)(params)
             ex.load_markets()
-            key = _exchange_key(user_id, ex_id)
-            exchanges[key] = ex
-            EXCHANGE_MARKETS[key] = ex.markets
-        except Exception as e:
-            send_error_alert(f"Load Ex [{ex_id}] user={user_id}: {e}")
+        except Exception as auth_exc:
+            if not (user_is_owner and dry_run):
+                send_error_alert(f"Load Ex [{ex_id}] user={user_id}: {auth_exc}")
+                continue
+            try:
+                public_params = dict(base_params)
+                public_params.pop('password', None)
+                public_params['apiKey'] = ''
+                public_params['secret'] = ''
+                ex = getattr(ccxt, ex_id)(public_params)
+                ex.load_markets()
+                send_telegram(
+                    f"🧪 <b>DRY RUN PUBLIC SCANNER</b>\n"
+                    f"{ex_id.upper()}: private API gagal, scanner memakai market data publik."
+                )
+            except Exception as public_exc:
+                send_error_alert(f"Load Public Ex [{ex_id}] user={user_id}: {public_exc}")
+                continue
+
+        key = _exchange_key(user_id, ex_id)
+        exchanges[key] = ex
+        EXCHANGE_MARKETS[key] = ex.markets
 
     for stale in [k for k in list(EXCHANGE_RUNTIME) if k not in exchanges]:
         EXCHANGE_RUNTIME.pop(stale, None)
+
 
 def update_db_setting(key, value):
     conn = sqlite3.connect(DB_FILE, timeout=10)
@@ -1534,6 +1563,7 @@ def build_runtime_status_text(user_id='OWNER'):
     mode = ' | '.join(f"{x.upper()}: {'DRY' if get_owner_dry_run(x) else 'REAL'}" for x in DEFAULT_CEX) if str(user_id)=='OWNER' else ''
     engine = '⏸ PAUSED' if IS_BOT_PAUSED else '🟢 RUNNING'
     kill = '🟢 ACTIVE' if is_kill_zone() else '🔴 INACTIVE'
+    dry_label = 'DRY RUN RESEARCH: 24/7' if str(user_id) == 'OWNER' and any(get_owner_dry_run(x) for x in DEFAULT_CEX) else ''
     if str(user_id) == 'OWNER':
         pending = db_read("SELECT COUNT(*) FROM trades WHERE user_id='OWNER' AND status='PENDING'")[0][0]
         opened = db_read("SELECT COUNT(*) FROM trades WHERE user_id='OWNER' AND status='OPEN'")[0][0]
@@ -1547,7 +1577,8 @@ def build_runtime_status_text(user_id='OWNER'):
         f"{engine}{(' | ' + mode) if mode else ''}",
         f"⏱ Uptime: {_fmt_uptime(time.time() - BOT_STARTED_AT)}",
         *( [f"🧠 Strategy: SMC M15 + H1 EMA50 + Daily Open"] if str(user_id)=='OWNER' else [] ),
-        f"🕐 Kill Zone: {kill}", "",
+        f"🕐 Kill Zone REAL: {kill}",
+        *( [f"🧪 {dry_label}"] if dry_label else [] ), "",
         "🔎 <b>SCANNER PER CEX</b>",
     ]
     own_keys = sorted(k for k in EXCHANGE_RUNTIME if str(k).split('::', 1)[0] == str(user_id))
@@ -1928,6 +1959,16 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
     runtime = EXCHANGE_RUNTIME.setdefault(exchange_key, {'state': 'IDLE', 'last_scan': '-', 'last_reason': '', 'signals': 0, 'created': 0})
     runtime['state'] = 'SCANNING'
     if now < EXCHANGE_SCAN_NEXT.get(exchange_key, 0): return 0
+    user_is_owner = (str(user_id) == 'OWNER')
+    dry_run = get_owner_dry_run(ex_id) if user_is_owner else False
+
+    # DRY RUN = research mode 24/7. REAL = normal kill-zone/session gate.
+    if not dry_run and not is_kill_zone():
+        runtime['state'] = 'WAITING'
+        runtime['last_reason'] = 'REAL: di luar kill zone'
+        EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL
+        return 0
+
     try:
         symbols = _valid_usdt_swap_symbols(exchange_key, ex_id, ex)
         runtime['last_scan'] = datetime.now(WIB).strftime('%H:%M:%S')
@@ -1941,7 +1982,6 @@ def _scan_one_exchange(exchange_key, ex, pair_perf):
         scan_symbols = [symbols[(cursor + i) % len(symbols)] for i in range(min(batch_size, len(symbols)))]
         EXCHANGE_SCAN_CURSOR[exchange_key] = (cursor + len(scan_symbols)) % len(symbols)
 
-        user_is_owner = (str(user_id) == 'OWNER')
         if not user_is_owner and get_vip_member(user_id) is None:
             runtime['last_reason'] = 'VIP tidak aktif / expired'
             EXCHANGE_SCAN_NEXT[exchange_key] = now + SCANNER_MIN_INTERVAL; return 0
@@ -4293,7 +4333,7 @@ def api_cex_monitor():
             })
         return jsonify({
             'ok': True, 'bot_paused': bool(IS_BOT_PAUSED), 'dry_run': bool(CONFIG.get('DRY_RUN', True)),
-            'scanning': bool(exchanges) and not IS_BOT_PAUSED and is_kill_zone(),
+            'scanning': bool(exchanges) and not IS_BOT_PAUSED and any((str(k).split('::',1)[0]=='OWNER' and get_owner_dry_run(str(k).split('::',1)[1])) or is_kill_zone() for k in exchanges),
             'last_runtime_status': last_runtime_status or 'UNKNOWN',
             'updated': datetime.now(WIB).strftime('%d/%m/%Y, %H:%M:%S'), 'cex': items
         })
@@ -4436,6 +4476,7 @@ def main_loop():
 async def app_main():
     global MAIN_ASYNC_LOOP
     MAIN_ASYNC_LOOP = asyncio.get_running_loop()
+    asyncio.create_task(auto_update_monitor(), name='github-update-monitor')
     init_db(); load_settings(); _refresh_owner_pair_state_from_db(); refresh_owner_eligible_pairs(); reload_exchanges()
     
     # Start Fast Monitor Thread (3 detik)
