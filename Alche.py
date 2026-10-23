@@ -180,6 +180,70 @@ def _validate_single_python_source(source, filename="Alche.py"):
         return True, "OK"
     except Exception as exc: return False, str(exc)
 
+
+def get_cex_max_positions(user_id, exchange_id):
+    """Return configured maximum active positions for one account/CEX."""
+    try:
+        ensure_cex_risk_settings(user_id, exchange_id)
+        rows = db_read(
+            "SELECT max_pos FROM cex_risk_settings WHERE user_id=? AND ex_id=?",
+            (str(user_id), str(exchange_id).lower())
+        )
+        if rows:
+            return max(1, int(rows[0][0]))
+    except Exception:
+        pass
+    try:
+        cfg = get_user_settings(user_id)
+        return max(1, int(cfg.get(
+            'max_pos', CONFIG.get('MAX_CONCURRENT_POSITIONS', 2)
+        )))
+    except Exception:
+        return max(1, int(CONFIG.get('MAX_CONCURRENT_POSITIONS', 2)))
+
+
+def is_valid_crypto_pair_for_vip(symbol):
+    """Hard filter for crypto pairs used by the VIP eligible-pair pipeline."""
+    try:
+        s = str(symbol or '').upper().strip()
+        if not s or '/' not in s:
+            return False
+        clean = s.split(':', 1)[0]
+        parts = clean.split('/')
+        if len(parts) != 2:
+            return False
+        base, quote = parts[0].strip(), parts[1].strip()
+        if not base or not quote:
+            return False
+
+        crypto_quotes = {
+            'USDT', 'USDC', 'BUSD', 'FDUSD', 'USDE', 'DAI',
+            'TUSD', 'USD1', 'EUR', 'BTC', 'ETH'
+        }
+        blocked_bases = {
+            'USD', 'EUR', 'GBP', 'JPY', 'AUD', 'CAD', 'CHF',
+            'HKD', 'SGD', 'CNY', 'CNH', 'INR', 'KRW', 'TRY',
+            'XAU', 'XAG', 'WTI', 'BRENT'
+        }
+        blocked_tokens = ('STOCK', 'INDEX', 'SPX', 'NDX', 'DAX', 'OIL', 'GOLD')
+
+        if quote not in crypto_quotes or base in blocked_bases:
+            return False
+        if any(token in base for token in blocked_tokens):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def send_public_signal(message):
+    """Publish a signal to the owner/public channel without replacing private trade alerts."""
+    try:
+        send_telegram(str(message))
+        return True
+    except Exception:
+        return False
+
 def atomic_reserve_trade_slot(user_id, exchange_id, symbol):
     """Atomically reserve a PENDING slot before any REAL order is submitted."""
     with DB_LOCK:
