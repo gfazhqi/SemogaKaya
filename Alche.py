@@ -112,6 +112,56 @@ TRADE_TERMINAL_STATUSES = {
 }
 
 
+def init_db():
+    Path(DB_FILE).parent.mkdir(parents=True, exist_ok=True)
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_FILE, timeout=15)
+        try:
+            c = conn.cursor()
+            c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS user_settings (user_id TEXT PRIMARY KEY, margin REAL NOT NULL DEFAULT 2.0, max_pos INTEGER NOT NULL DEFAULT 3, max_trades_day INTEGER NOT NULL DEFAULT 10, leverage INTEGER NOT NULL DEFAULT 20, auto_trade INTEGER NOT NULL DEFAULT 1)")
+            c.execute("CREATE TABLE IF NOT EXISTS user_cex_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, api_key TEXT DEFAULT '', secret TEXT DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, password TEXT DEFAULT '', account_label TEXT DEFAULT '', account_info TEXT DEFAULT '', PRIMARY KEY (user_id, ex_id))")
+            c.execute("CREATE TABLE IF NOT EXISTS cex_risk_settings (user_id TEXT NOT NULL, ex_id TEXT NOT NULL, margin REAL NOT NULL DEFAULT 2.0, leverage INTEGER NOT NULL DEFAULT 20, max_pos INTEGER NOT NULL DEFAULT 2, max_trades_day INTEGER NOT NULL DEFAULT 10, max_loss REAL NOT NULL DEFAULT 5.0, updated_at TEXT DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, ex_id))")
+            c.execute("CREATE TABLE IF NOT EXISTS vip_members (telegram_id TEXT PRIMARY KEY, username TEXT DEFAULT '', status TEXT DEFAULT 'ACTIVE', expires_at TEXT, added_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'OWNER', exchange_id TEXT NOT NULL, symbol TEXT NOT NULL, order_type TEXT DEFAULT 'LIMIT', side TEXT NOT NULL, entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL, order_id TEXT DEFAULT '', bars_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_eligible (symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            c.execute("CREATE TABLE IF NOT EXISTS owner_pair_filter (id INTEGER PRIMARY KEY CHECK (id=1), enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+            for col, definition in {
+                'user_id': "TEXT NOT NULL DEFAULT 'OWNER'",
+                'bars_count': 'INTEGER NOT NULL DEFAULT 0',
+                'created_at': 'TEXT DEFAULT CURRENT_TIMESTAMP',
+                'realized_pnl': 'REAL DEFAULT 0',
+                'exit_price': 'REAL',
+                'close_reason': 'TEXT',
+                'qty': 'REAL DEFAULT 0',
+                'notional_usd': 'REAL DEFAULT 0',
+                'closed_at': 'TEXT',
+            }.items():
+                if col not in _table_columns(conn, 'trades'): c.execute(f'ALTER TABLE trades ADD COLUMN {col} {definition}')
+            for col, definition in {'secret': "TEXT DEFAULT ''", 'password': "TEXT DEFAULT ''", 'account_label': "TEXT DEFAULT ''", 'account_info': "TEXT DEFAULT ''"}.items():
+                if col not in _table_columns(conn, 'user_cex_settings'): c.execute(f'ALTER TABLE user_cex_settings ADD COLUMN {col} {definition}')
+            # Migrate legacy cex_risk_settings tables before any Custom CEX button is used.
+            # Older databases may have the table but miss one or more newer columns.
+            for col, definition in {
+                'margin': 'REAL NOT NULL DEFAULT 2.0',
+                'leverage': 'INTEGER NOT NULL DEFAULT 20',
+                'max_pos': 'INTEGER NOT NULL DEFAULT 2',
+                'max_trades_day': 'INTEGER NOT NULL DEFAULT 10',
+                'max_loss': 'REAL NOT NULL DEFAULT 5.0',
+                'updated_at': 'TEXT DEFAULT CURRENT_TIMESTAMP',
+            }.items():
+                if col not in _table_columns(conn, 'cex_risk_settings'):
+                    c.execute(f'ALTER TABLE cex_risk_settings ADD COLUMN {col} {definition}')
+            for k,v in {'margin':'2.0','max_pos':'3','dry_run':'1','min_trades':'20','min_wr':'50','daily_loss_limit':'1'}.items(): c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(k,v))
+            for ex_id in DEFAULT_CEX:
+                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'lev_{ex_id}','20'))
+                c.execute("INSERT OR IGNORE INTO cex_risk_settings(user_id,ex_id,margin,leverage,max_pos,max_trades_day,max_loss) VALUES (?,?,?,?,?,?,?)", ('OWNER',ex_id,2.0,20,2,10,5.0))
+                c.execute('INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)',(f'dry_run_{ex_id}','1'))
+            c.execute('INSERT OR IGNORE INTO owner_pair_filter(id,enabled) VALUES (1,1)')
+            for pair in CORE_PAIRS: c.execute('INSERT OR IGNORE INTO owner_pair_eligible(symbol,enabled,updated_at) VALUES (?,?,?)',(pair,1,datetime.now(WIB).isoformat(timespec='seconds')))
+            conn.commit()
+        finally: conn.close()
+
 def get_today_realized_loss(user_id, exchange_id=None):
     """Return actual realized loss for the current WIB day."""
     with DB_LOCK:
