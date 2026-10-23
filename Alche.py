@@ -389,7 +389,17 @@ def init_db():
             c.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'OWNER', exchange_id TEXT NOT NULL, symbol TEXT NOT NULL, order_type TEXT DEFAULT 'LIMIT', side TEXT NOT NULL, entry_price REAL NOT NULL, sl_price REAL NOT NULL, tp_price REAL NOT NULL, order_id TEXT DEFAULT '', bars_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'PENDING', created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
             c.execute("CREATE TABLE IF NOT EXISTS owner_pair_eligible (symbol TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
             c.execute("CREATE TABLE IF NOT EXISTS owner_pair_filter (id INTEGER PRIMARY KEY CHECK (id=1), enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-            for col, definition in {'user_id': "TEXT NOT NULL DEFAULT 'OWNER'", 'bars_count': 'INTEGER NOT NULL DEFAULT 0', 'created_at': 'TEXT DEFAULT CURRENT_TIMESTAMP'}.items():
+            for col, definition in {
+                'user_id': "TEXT NOT NULL DEFAULT 'OWNER'",
+                'bars_count': 'INTEGER NOT NULL DEFAULT 0',
+                'created_at': 'TEXT DEFAULT CURRENT_TIMESTAMP',
+                'realized_pnl': 'REAL DEFAULT 0',
+                'exit_price': 'REAL',
+                'close_reason': 'TEXT',
+                'qty': 'REAL DEFAULT 0',
+                'notional_usd': 'REAL DEFAULT 0',
+                'closed_at': 'TEXT',
+            }.items():
                 if col not in _table_columns(conn, 'trades'): c.execute(f'ALTER TABLE trades ADD COLUMN {col} {definition}')
             for col, definition in {'secret': "TEXT DEFAULT ''", 'password': "TEXT DEFAULT ''", 'account_label': "TEXT DEFAULT ''", 'account_info': "TEXT DEFAULT ''"}.items():
                 if col not in _table_columns(conn, 'user_cex_settings'): c.execute(f'ALTER TABLE user_cex_settings ADD COLUMN {col} {definition}')
